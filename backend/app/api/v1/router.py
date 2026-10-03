@@ -7,6 +7,7 @@ from app.api.v1.erasure import router as erasure_router
 from app.api.v1.health import router as health_router
 from app.api.v1.imports import router as imports_router
 from app.api.v1.inbox import router as inbox_router
+from app.api.v1.integrations import router as integrations_router
 from app.api.v1.invitations import router as invitations_router
 from app.api.v1.leads import router as leads_router
 from app.api.v1.mailboxes import (
@@ -101,4 +102,9 @@ api_router.include_router(
     erasure_router,
     prefix="/workspaces/{workspace_id}",
     tags=["erasure"],
+)
+api_router.include_router(
+    integrations_router,
+    prefix="/workspaces/{workspace_id}",
+    tags=["integrations"],
 )

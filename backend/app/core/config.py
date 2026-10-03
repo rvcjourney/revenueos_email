@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -163,6 +164,12 @@ class Settings(BaseSettings):
     gmail_webhook_secret: str = ""
     microsoft_webhook_client_state: str = ""
 
+    # RevenueOS campaign intake (ADR-0019). The key is the caller's only
+    # credential; the route acts as the configured user (a workspace member with
+    # the Member role). The route is disabled (503) unless both are set.
+    revenueos_intake_key: SecretStr = SecretStr("")
+    revenueos_actor_user_id: str = ""
+
     supabase_url: str = Field(default="", min_length=1)
     supabase_jwt_secret: str = ""
     supabase_jwt_audience: str = "authenticated"
@@ -237,6 +244,23 @@ class Settings(BaseSettings):
         # the key still serves everything else.
         if self.personalization_enabled and not self.personalization_model.strip():
             raise ValueError("PERSONALIZATION_ENABLED requires PERSONALIZATION_MODEL")
+        return self
+
+    @model_validator(mode="after")
+    def validate_revenueos_intake(self) -> Settings:
+        # The key is the only credential on that route, so a weak one or a
+        # malformed acting user must stop the process at boot, not at first use.
+        key = self.revenueos_intake_key.get_secret_value()
+        if key and len(key) < 32:
+            raise ValueError("REVENUEOS_INTAKE_KEY must be at least 32 characters")
+        self.revenueos_actor_user_id = self.revenueos_actor_user_id.strip()
+        if self.revenueos_actor_user_id:
+            try:
+                UUID(self.revenueos_actor_user_id)
+            except ValueError as exc:
+                raise ValueError(
+                    "REVENUEOS_ACTOR_USER_ID must be a user id (UUID)"
+                ) from exc
         return self
 
     def require_personalization_worker_ready(self) -> None:
