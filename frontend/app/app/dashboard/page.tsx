@@ -1,5 +1,6 @@
 import { PageHeader } from "@/components/ui/page-header";
 
+import { ApiEndpoints } from "./api-endpoints";
 import { DashboardOverview } from "./dashboard-overview";
 import { WorkspaceSettings } from "./workspace-settings";
 
@@ -12,6 +13,8 @@ export default function DashboardPage() {
       />
 
       <DashboardOverview />
+
+      <ApiEndpoints />
 
       <section aria-labelledby="workspace-heading" className="space-y-4">
         <h2 id="workspace-heading" className="text-base font-semibold text-slate-900">
