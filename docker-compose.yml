@@ -6,16 +6,18 @@
 #   controller runs (it owns the rate_control READY state the send worker needs).
 # - Ports bind to 127.0.0.1 only; the reverse proxy (Caddy) terminates TLS.
 #   Host ports are configurable (BACKEND_HOST_PORT / FRONTEND_HOST_PORT in .env,
-#   defaults 8000 / 3000) because this stack may share a server with other
-#   projects. On the production server they are 4130 / 4131.
+#   defaults 4140 / 4141) because this stack shares a server with other
+#   projects: 8000 / 3000 are taken there, and the original Outly install
+#   uses 4130 / 4131.
 # - Fixed project name, so containers/networks cannot collide with other
-#   Compose projects on the same host.
+#   Compose projects on the same host. It must not be "outly": the original
+#   product runs under that name on the same server.
 # - Restart policies, and Redis is never published outside the Docker network.
 # - Worker groups follow docs/architecture/WORKERS.md: imports cannot starve
 #   safety (webhooks) or send capacity.
 # See docs/operations/DEPLOYMENT.md.
 
-name: outly
+name: revenueos-email
 
 x-app-env: &app-env
   env_file:
@@ -93,7 +95,7 @@ services:
     restart: unless-stopped
     logging: *default-logging
     ports:
-      - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:${BACKEND_HOST_PORT:-4140}:8000"
     depends_on:
       redis:
         condition: service_healthy
@@ -184,7 +186,7 @@ services:
       HOSTNAME: 0.0.0.0
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
     ports:
-      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:3000"
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-4141}:3000"
     depends_on:
       backend:
         condition: service_healthy
