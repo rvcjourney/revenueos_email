@@ -59,14 +59,24 @@ class SupabaseAuthAdminClient:
         A new account is confirmed (it never receives a confirmation email) and
         gets a random password that is not stored, logged or returned: the
         person sets their own through the password-reset flow.
+
+        With REVENUEOS_INITIAL_PASSWORD_IS_EMAIL the first password is the
+        email address instead (owner decision, ADR-0020): the person can log
+        in at once, and so can anyone who knows the address until they change
+        it. An account that already exists is never given a new password.
         """
+        password = (
+            email
+            if self._settings.revenueos_initial_password_is_email
+            else secrets.token_urlsafe(32)
+        )
         try:
             response = httpx.post(
                 f"{self._base_url()}/users",
                 headers=self._headers(),
                 json={
                     "email": email,
-                    "password": secrets.token_urlsafe(32),
+                    "password": password,
                     "email_confirm": True,
                 },
                 timeout=10.0,

@@ -172,6 +172,10 @@ class Settings(BaseSettings):
     # RevenueOS user provisioning (ADR-0020): lets the same key create accounts
     # and workspaces. Off by default; also needs SUPABASE_SERVICE_ROLE_KEY.
     revenueos_provisioning_enabled: bool = False
+    # A provisioned account's first password is its email address, not a
+    # random one. Anyone who knows the address can then log in until the
+    # person changes it. Off by default.
+    revenueos_initial_password_is_email: bool = False
     # RevenueOS campaign start (ADR-0021): lets the same key activate a
     # campaign it stored, so real email is sent with no person reviewing
     # it. Off by default.

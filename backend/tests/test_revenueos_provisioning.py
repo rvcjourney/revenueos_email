@@ -270,8 +270,9 @@ def test_account_service_failures_stop_before_the_database(
 # ---------------------------------------------------------------------------
 
 
-def _admin() -> SupabaseAuthAdminClient:
+def _admin(*, password_is_email: bool = False) -> SupabaseAuthAdminClient:
     settings = MagicMock()
+    settings.revenueos_initial_password_is_email = password_is_email
     settings.supabase_url = "https://project.supabase.co/"
     settings.supabase_service_role_key = SERVICE_KEY
     return SupabaseAuthAdminClient(settings)
@@ -434,3 +435,28 @@ def test_route_reports_the_mailbox_without_echoing_the_smtp_password(
     assert "app-password" not in response.text
     sent = service.return_value.provision.call_args.kwargs["payload"]
     assert sent.smtp.password == "app-password"
+
+
+def test_initial_password_is_the_email_only_when_switched_on() -> None:
+    assert Settings.model_fields["revenueos_initial_password_is_email"].default is False
+    with patch("httpx.post", return_value=_response(200, {"id": str(PERSON)})) as post:
+        _admin(password_is_email=True).ensure_user("cam@motm.tech")
+
+    assert post.call_args.kwargs["json"]["password"] == "cam@motm.tech"
+
+
+def test_an_existing_account_never_gets_a_new_password() -> None:
+    page = {"users": [{"id": str(PERSON), "email": "cam@motm.tech"}]}
+    with (
+        patch(
+            "httpx.post", return_value=_response(422, {"error_code": "email_exists"})
+        ),
+        patch("httpx.get", return_value=_response(200, page)),
+        patch("httpx.put") as put,
+        patch("httpx.patch") as patch_call,
+    ):
+        user = _admin(password_is_email=True).ensure_user("cam@motm.tech")
+
+    assert user == EnsuredUser(user_id=PERSON, created=False)
+    put.assert_not_called()
+    patch_call.assert_not_called()
