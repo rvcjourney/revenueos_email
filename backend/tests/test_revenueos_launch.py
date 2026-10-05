@@ -66,6 +66,7 @@ def _payload(**overrides: Any) -> RevenueOSLaunchIn:
 def _result(**overrides: Any) -> RevenueOSLaunchOut:
     values: dict[str, Any] = {
         "reference": "LAUNCH-0001",
+        "client_reference": "LAUNCH-0001",
         "duplicate": False,
         "user_id": PERSON,
         "email": "cam@motm.tech",
@@ -418,3 +419,42 @@ def test_an_invalid_body_creates_no_account(
 
     assert response.status_code == 422
     collaborators[0].return_value.ensure_user.assert_not_called()
+
+
+def test_client_reference_defaults_to_the_campaign_reference() -> None:
+    assert _payload().resolved_client_reference == "LAUNCH-0001"
+    grouped = _payload(client_reference=" CLIENT-7 ")
+    assert grouped.resolved_client_reference == "CLIENT-7"
+    assert grouped.reference == "LAUNCH-0001"
+    with pytest.raises(ValidationError):
+        _payload(client_reference="   ")
+    # The client is not part of the campaign's identity.
+    assert _payload_hash(_payload()) == _payload_hash(grouped)
+
+
+def test_the_workspace_is_provisioned_under_the_client_reference() -> None:
+    service = RevenueOSLaunchService(MagicMock())
+    with (
+        patch.object(revenueos_launch, "RevenueOSProvisioningService") as provisioning,
+        patch.object(service, "_store"),
+    ):
+        provisioning.return_value.provision.return_value = MagicMock(
+            user_id=PERSON,
+            email="cam@motm.tech",
+            user_created=False,
+            workspace_id=WORKSPACE,
+            workspace_name="Acme",
+            role="ADMIN",
+            mailbox_id=None,
+            mailbox_status=None,
+            mailbox_error=None,
+        )
+        result = service.launch(
+            actor_id=ACTOR,
+            payload=_payload(client_reference="CLIENT-7", reference="CAMPAIGN-2"),
+            user=EnsuredUser(user_id=PERSON, created=False),
+        )
+
+    sent = provisioning.return_value.provision.call_args.kwargs["payload"]
+    assert sent.reference == "CLIENT-7"
+    assert result.reference == "CAMPAIGN-2" and result.client_reference == "CLIENT-7"

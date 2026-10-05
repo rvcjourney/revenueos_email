@@ -85,9 +85,13 @@ class LaunchRecipientIn(BaseModel):
 class RevenueOSLaunchIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # RevenueOS's own id for this launch. One reference is one workspace and
-    # one campaign; repeating it never creates a second of either.
+    # RevenueOS's own id for this campaign; repeating it never creates a
+    # second one.
     reference: str = Field(min_length=1, max_length=200)
+    # RevenueOS's own id for the client. Launches that share it share one
+    # workspace, user and mailbox, so a client can have many campaigns.
+    # Omitted: the campaign reference is used, one workspace per launch.
+    client_reference: str | None = Field(default=None, min_length=1, max_length=200)
     user: LaunchUserIn
     # Omitted: the workspace's existing connected mailbox is used.
     smtp: SmtpConnectRequest | None = None
@@ -100,13 +104,19 @@ class RevenueOSLaunchIn(BaseModel):
     # False stores a draft for a person to start.
     auto_start: bool = True
 
-    @field_validator("reference")
+    @field_validator("reference", "client_reference")
     @classmethod
-    def _reference(cls, value: str) -> str:
+    def _reference(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("reference must not be blank")
         return cleaned
+
+    @property
+    def resolved_client_reference(self) -> str:
+        return self.client_reference or self.reference
 
     @model_validator(mode="after")
     def _waits_match_sequence_rules(self) -> RevenueOSLaunchIn:
@@ -122,6 +132,7 @@ class LaunchRejectedRecipient(BaseModel):
 class RevenueOSLaunchOut(BaseModel):
     status: Literal["launched"] = "launched"
     reference: str
+    client_reference: str
     # True when this reference was already launched and nothing new was created.
     duplicate: bool
 
@@ -184,7 +195,8 @@ class RevenueOSLaunchService:
         provisioned = RevenueOSProvisioningService(self.session).provision(
             actor_id=actor_id,
             payload=RevenueOSUserProvisionIn(
-                reference=payload.reference,
+                # The client, not the campaign, is what a workspace belongs to.
+                reference=payload.resolved_client_reference,
                 email=payload.user.email,
                 workspace_name=payload.user.workspace_name,
                 role=payload.user.role,
@@ -194,6 +206,7 @@ class RevenueOSLaunchService:
         )
         result = RevenueOSLaunchOut(
             reference=payload.reference,
+            client_reference=payload.resolved_client_reference,
             duplicate=False,
             user_id=provisioned.user_id,
             email=provisioned.email,

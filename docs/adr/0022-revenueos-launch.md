@@ -16,7 +16,7 @@ After ADR-0019 to 0021, RevenueOS could register a user with a workspace and a m
 4. **Mailbox.** With an `smtp` block the mailbox is connected or updated as in ADR-0020. Without one, or when an update was refused, the workspace's existing connected mailbox is used. With no usable mailbox the account and workspace are kept, no campaign is stored, and the response says `start_status: "blocked"` with the reason.
 5. **Two transactions.** Everything up to the stored campaign is one transaction and is committed before the start is attempted, because the capture worker cannot see an uncommitted audience. A failed start therefore never undoes a stored campaign.
 6. **The request waits briefly for capture.** It retries the start for up to 15 seconds. Running: `started`. Still capturing: `pending`, and RevenueOS calls the start route (ADR-0021) or repeats the same payload. Refused (for example by preflight): `failed` with the reason.
-7. **Idempotent on `reference`.** One reference is one workspace and one campaign. A `command_receipts` row (`operation = 'revenueos.launch'`) records the campaign, emails, schedule and recipient addresses. A repeat with the same content creates nothing (`200`, `duplicate: true`) and tries the start again; different content is `409`. The `smtp` block and `auto_start` are not part of that identity.
+7. **Idempotent on `reference`, grouped by `client_reference`.** `reference` identifies the campaign. The optional `client_reference` identifies the client: launches that share it share one workspace, user and mailbox, so a client can have many campaigns, each with its own recipients and list. When it is omitted the campaign reference is used for both, which is one workspace per launch. A different user email, role or workspace name under an existing `client_reference` is `409` (ADR-0020). One reference is one campaign. A `command_receipts` row (`operation = 'revenueos.launch'`) records the campaign, emails, schedule and recipient addresses. A repeat with the same content creates nothing (`200`, `duplicate: true`) and tries the start again; different content is `409`. The `smtp` block and `auto_start` are not part of that identity.
 8. **Both switches.** The route needs `REVENUEOS_PROVISIONING_ENABLED`. With `auto_start: true` it also needs `REVENUEOS_AUTO_START_ENABLED`; if that is off the request is refused whole (`503`) before anything is created, not silently stored as a draft.
 
 ## Alternatives Considered
@@ -25,7 +25,8 @@ After ADR-0019 to 0021, RevenueOS could register a user with a workspace and a m
 
 ## Consequences
 
-- One reference creates one workspace, so a second campaign for the same client through this route would create a second workspace. For that, RevenueOS uses the campaign route of ADR-0019 with the workspace it already has. A lead-intake route for an existing workspace is the piece still missing for that path.
+- A second campaign for the same client needs the same `client_reference`. Without it, a new `reference` creates a second workspace, whose mailbox is then refused because the SMTP login already belongs to the first.
+- A workspace created before `client_reference` existed is keyed by its launch reference; that value is its `client_reference` from then on.
 - A request can hold a worker thread for up to about 15 seconds while it waits for capture.
 - Everything in ADR-0021's consequences applies: with both switches on, the key causes real email to be sent with no person reviewing it.
 - A launch leaves a list per reference in the workspace.

@@ -205,6 +205,7 @@ def test_existing_lead_in_the_same_workspace_joins_the_new_list(
         )
         result = RevenueOSLaunchOut(
             reference="x",
+            client_reference="x",
             duplicate=False,
             user_id=person,
             email="x@example.test",
@@ -340,3 +341,100 @@ def test_start_phase_reports_pending_while_the_audience_is_captured(
         )
         == "DRAFT"
     )
+
+
+def test_one_client_can_have_several_campaigns(engine, su, actor, smtp_ok) -> None:
+    person = auth_user(su)
+    user = {"email": unique_email("cam"), "workspace_name": "Acme Industries"}
+    smtp = smtp_block()
+    shared = unique_email("shared")
+    first = launch(
+        engine,
+        actor,
+        person,
+        body(
+            "CAMPAIGN-A",
+            client_reference="CLIENT-9",
+            user=user,
+            smtp=smtp,
+            recipients=[{"email": shared}, {"email": unique_email("only-first")}],
+        ),
+    )
+
+    second = launch(
+        engine,
+        actor,
+        person,
+        body(
+            "CAMPAIGN-B",
+            client_reference="CLIENT-9",
+            user=user,
+            smtp=smtp,
+            recipients=[{"email": shared}, {"email": unique_email("only-second")}],
+        ),
+    )
+
+    assert second.duplicate is False
+    assert second.workspace_id == first.workspace_id
+    assert second.campaign_id != first.campaign_id
+    assert second.list_id != first.list_id
+    # The same mailbox, updated in place rather than connected twice.
+    assert second.mailbox_id == first.mailbox_id and second.mailbox_status == "updated"
+    assert len(mailbox_rows(su, first.workspace_id)) == 1
+    # The shared address is one lead in two lists; each list is its own audience.
+    assert second.recipients_existing == 1 and second.recipients_created == 1
+    assert (
+        scalar(
+            su,
+            "SELECT count(*) FROM public.leads WHERE workspace_id = %s",
+            first.workspace_id,
+        )
+        == 3
+    )
+    assert len(list_emails(su, first.list_id)) == 2
+    assert len(list_emails(su, second.list_id)) == 2
+    assert (
+        scalar(
+            su,
+            "SELECT count(*) FROM public.campaigns WHERE workspace_id = %s",
+            first.workspace_id,
+        )
+        == 2
+    )
+
+
+def test_a_second_campaign_can_reuse_the_mailbox_without_sending_smtp(
+    engine, su, actor, smtp_ok
+) -> None:
+    person = auth_user(su)
+    user = {"email": unique_email("cam")}
+    first = launch(
+        engine,
+        actor,
+        person,
+        body("CAMPAIGN-C", client_reference="CLIENT-10", user=user),
+    )
+    follow = body("CAMPAIGN-D", client_reference="CLIENT-10", user=user)
+    del follow["smtp"]
+
+    second = launch(engine, actor, person, follow)
+
+    assert second.mailbox_id == first.mailbox_id and second.mailbox_status is None
+    assert second.campaign_id is not None and second.campaign_id != first.campaign_id
+
+
+def test_a_client_reference_cannot_be_taken_over_by_another_user(
+    engine, su, actor, smtp_ok
+) -> None:
+    person = auth_user(su)
+    launch(engine, actor, person, body("CAMPAIGN-E", client_reference="CLIENT-11"))
+
+    with pytest.raises(AppError) as excinfo:
+        launch(
+            engine,
+            actor,
+            auth_user(su),
+            body("CAMPAIGN-F", client_reference="CLIENT-11"),
+        )
+
+    assert excinfo.value.status_code == 409
