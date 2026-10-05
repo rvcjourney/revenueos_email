@@ -23,6 +23,10 @@ from app.modules.integrations.revenueos_provisioning import (
     RevenueOSUserProvisionIn,
     RevenueOSUserProvisionOut,
 )
+from app.modules.integrations.revenueos_start import (
+    RevenueOSCampaignStartOut,
+    RevenueOSStartService,
+)
 from app.modules.integrations.supabase_auth_admin import (
     AuthAdminError,
     AuthAdminRejectedError,
@@ -182,3 +186,41 @@ def provision_revenueos_user(
     if result.duplicate:
         response.status_code = status.HTTP_200_OK
     return result
+
+
+def require_revenueos_auto_start(
+    _actor_id: UUID = Depends(require_revenueos_actor),
+) -> None:
+    """The start route is a separate decision from intake (ADR-0021): a
+    deployment where a person starts every campaign leaves this off."""
+    if not Settings.current().revenueos_auto_start_enabled:
+        raise AppError(
+            "integration_not_configured",
+            "Starting campaigns from RevenueOS is not enabled",
+            status_code=503,
+        )
+
+
+@router.post(
+    "/integrations/revenueos/campaigns/{campaign_id}/start",
+    response_model=RevenueOSCampaignStartOut,
+    # Runs before the workspace context is resolved, so a disabled route
+    # touches no database.
+    dependencies=[Depends(require_revenueos_auto_start)],
+)
+def start_revenueos_campaign(
+    campaign_id: UUID,
+    context: WorkspaceContext = Depends(get_revenueos_context),
+    db: Session = Depends(get_db),
+) -> RevenueOSCampaignStartOut:
+    """Commit the captured audience and activate the campaign, as the acting
+    user. Emails are then sent on the campaign's own schedule."""
+    # Same rule as POST /campaigns/{id}/activate: starting needs
+    # campaigns.execute, which a Member-role acting user does not have.
+    if not has_permission(context.role_code, "campaigns.execute"):
+        raise AppError(
+            "forbidden",
+            "You do not have permission to perform this action",
+            status_code=403,
+        )
+    return RevenueOSStartService(db).start(context, campaign_id)

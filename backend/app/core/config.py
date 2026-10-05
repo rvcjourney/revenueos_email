@@ -172,6 +172,10 @@ class Settings(BaseSettings):
     # RevenueOS user provisioning (ADR-0020): lets the same key create accounts
     # and workspaces. Off by default; also needs SUPABASE_SERVICE_ROLE_KEY.
     revenueos_provisioning_enabled: bool = False
+    # RevenueOS campaign start (ADR-0021): lets the same key activate a
+    # campaign it stored, so real email is sent with no person reviewing
+    # it. Off by default.
+    revenueos_auto_start_enabled: bool = False
 
     supabase_url: str = Field(default="", min_length=1)
     supabase_jwt_secret: str = ""
