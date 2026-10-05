@@ -61,6 +61,15 @@ class IntakeEmailIn(BaseModel):
     wait_days_before: int = Field(default=0, ge=0, le=365)
 
 
+def validate_email_waits(emails: list[IntakeEmailIn]) -> None:
+    # A sequence must alternate EMAIL and WAIT and start with an EMAIL
+    # (preflight), so only follow-ups carry a wait, and they must have one.
+    if emails[0].wait_days_before != 0:
+        raise ValueError("the first email must have wait_days_before = 0")
+    if any(email.wait_days_before < 1 for email in emails[1:]):
+        raise ValueError("every follow-up email needs wait_days_before >= 1")
+
+
 class RevenueOSCampaignIntakeIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -83,12 +92,7 @@ class RevenueOSCampaignIntakeIn(BaseModel):
 
     @model_validator(mode="after")
     def _waits_match_sequence_rules(self) -> RevenueOSCampaignIntakeIn:
-        # A sequence must alternate EMAIL and WAIT and start with an EMAIL
-        # (preflight), so only follow-ups carry a wait, and they must have one.
-        if self.emails[0].wait_days_before != 0:
-            raise ValueError("the first email must have wait_days_before = 0")
-        if any(email.wait_days_before < 1 for email in self.emails[1:]):
-            raise ValueError("every follow-up email needs wait_days_before >= 1")
+        validate_email_waits(self.emails)
         return self
 
 

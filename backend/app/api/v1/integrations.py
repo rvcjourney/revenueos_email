@@ -18,6 +18,11 @@ from app.modules.integrations.revenueos_intake import (
     RevenueOSCampaignIntakeOut,
     RevenueOSIntakeService,
 )
+from app.modules.integrations.revenueos_launch import (
+    RevenueOSLaunchIn,
+    RevenueOSLaunchOut,
+    RevenueOSLaunchService,
+)
 from app.modules.integrations.revenueos_provisioning import (
     RevenueOSProvisioningService,
     RevenueOSUserProvisionIn,
@@ -135,6 +140,11 @@ def prepare_revenueos_user(
     it by email.
     """
     settings = Settings.current()
+    user = _ensure_account(settings, payload.email)
+    return ProvisionRequest(actor_id=actor_id, payload=payload, user=user)
+
+
+def _ensure_account(settings: Settings, email: str) -> EnsuredUser:
     if (
         not settings.revenueos_provisioning_enabled
         or not settings.supabase_service_role_key
@@ -145,7 +155,7 @@ def prepare_revenueos_user(
             status_code=503,
         )
     try:
-        user = SupabaseAuthAdminClient(settings).ensure_user(payload.email)
+        return SupabaseAuthAdminClient(settings).ensure_user(email)
     except AuthAdminUnavailableError as exc:
         raise AppError(
             "service_unavailable",
@@ -164,7 +174,6 @@ def prepare_revenueos_user(
             "The account service returned an unexpected response",
             status_code=502,
         ) from exc
-    return ProvisionRequest(actor_id=actor_id, payload=payload, user=user)
 
 
 @provisioning_router.post(
@@ -224,3 +233,51 @@ def start_revenueos_campaign(
             status_code=403,
         )
     return RevenueOSStartService(db).start(context, campaign_id)
+
+
+@dataclass(frozen=True)
+class LaunchRequest:
+    actor_id: UUID
+    payload: RevenueOSLaunchIn
+    user: EnsuredUser
+
+
+def prepare_revenueos_launch(
+    payload: RevenueOSLaunchIn,
+    actor_id: UUID = Depends(require_revenueos_actor),
+) -> LaunchRequest:
+    """Check both switches and find or create the account before any database
+    work, for the same reasons as prepare_revenueos_user."""
+    settings = Settings.current()
+    if payload.auto_start and not settings.revenueos_auto_start_enabled:
+        # Refused whole, before anything is created: storing a draft when the
+        # caller asked for a running campaign would be a silent downgrade.
+        raise AppError(
+            "integration_not_configured",
+            "Starting campaigns from RevenueOS is not enabled; send "
+            "auto_start false to store a draft",
+            status_code=503,
+        )
+    user = _ensure_account(settings, payload.user.email)
+    return LaunchRequest(actor_id=actor_id, payload=payload, user=user)
+
+
+@provisioning_router.post(
+    "/integrations/revenueos/launch",
+    response_model=RevenueOSLaunchOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def launch_revenueos_campaign(
+    response: Response,
+    # Declared before `db`: see prepare_revenueos_user.
+    prepared: LaunchRequest = Depends(prepare_revenueos_launch),
+    db: Session = Depends(get_db),
+) -> RevenueOSLaunchOut:
+    """Everything in one request (ADR-0022): account, workspace, mailbox,
+    recipients, campaign and, when asked, the start."""
+    result = RevenueOSLaunchService(db).launch(
+        actor_id=prepared.actor_id, payload=prepared.payload, user=prepared.user
+    )
+    if result.duplicate:
+        response.status_code = status.HTTP_200_OK
+    return result

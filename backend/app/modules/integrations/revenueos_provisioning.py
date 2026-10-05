@@ -22,7 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.db.context import set_transaction_context
+from app.db.context import enter_api_scope, set_transaction_context
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.integrations.supabase_auth_admin import EnsuredUser
 from app.modules.mailboxes.repository import MailboxRepository
@@ -32,6 +32,19 @@ from app.modules.mailboxes.service import MailboxService
 logger = logging.getLogger(__name__)
 
 PROVISION_OPERATION = "revenueos.user_provision"
+
+
+def clean_user_email(value: str) -> str:
+    cleaned = value.strip().lower()
+    local, _, domain = cleaned.partition("@")
+    if (
+        not local
+        or "." not in domain
+        or "@" in domain
+        or any(char.isspace() for char in cleaned)
+    ):
+        raise ValueError("a valid email address is required")
+    return cleaned
 
 
 class RevenueOSUserProvisionIn(BaseModel):
@@ -61,16 +74,7 @@ class RevenueOSUserProvisionIn(BaseModel):
     @field_validator("email")
     @classmethod
     def _email(cls, value: str) -> str:
-        cleaned = value.strip().lower()
-        local, _, domain = cleaned.partition("@")
-        if (
-            not local
-            or "." not in domain
-            or "@" in domain
-            or any(char.isspace() for char in cleaned)
-        ):
-            raise ValueError("a valid email address is required")
-        return cleaned
+        return clean_user_email(value)
 
     @field_validator("workspace_name")
     @classmethod
@@ -306,6 +310,12 @@ class RevenueOSProvisioningService:
             result.mailbox_error = (
                 "This SMTP login is already connected to another mailbox"
             )
+        # The mailbox repository switches the transaction to its own database
+        # role (app_connection) and leaves it there. Whatever follows in this
+        # request must run as app_api again.
+        enter_api_scope(
+            self.session, user_id=actor_id, workspace_id=result.workspace_id
+        )
         logger.info(
             "RevenueOS mailbox applied",
             extra={
