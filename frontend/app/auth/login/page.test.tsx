@@ -100,3 +100,29 @@ describe("LoginPage", () => {
     expect(replace).not.toHaveBeenCalled();
   });
 });
+
+describe("LoginPage after a failed email link", () => {
+  afterEach(() => {
+    window.history.pushState({}, "", "/");
+  });
+
+  it("explains that the link failed and points to Forgot password", async () => {
+    window.history.pushState({}, "", "/auth/login?error=auth_callback_failed");
+
+    render(<LoginPage />);
+
+    expect(
+      await screen.findByText(/that link is invalid or has expired/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows nothing for an unknown error value", async () => {
+    window.history.pushState({}, "", "/auth/login?error=something_else");
+
+    render(<LoginPage />);
+
+    await waitFor(() =>
+      expect(screen.queryByText(/that link is invalid/i)).not.toBeInTheDocument(),
+    );
+  });
+});

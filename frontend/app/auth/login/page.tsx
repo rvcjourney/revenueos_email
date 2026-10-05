@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { ArrowRight, Loader2, LockKeyhole } from "lucide-react";
@@ -25,6 +25,18 @@ type FormValues = z.infer<typeof schema>;
 export default function LoginPage() {
   const router = useRouter();
   const [formError, setFormError] = useState<string | null>(null);
+
+  // /auth/callback and /auth/confirm send a link they could not verify here.
+  // Read from the location, not useSearchParams, which would force this page
+  // behind a Suspense boundary.
+  useEffect(() => {
+    const error = new URLSearchParams(window.location.search).get("error");
+    if (error === "auth_callback_failed") {
+      setFormError(
+        "That link is invalid or has expired. Use Forgot password to get a new one.",
+      );
+    }
+  }, []);
 
   const {
     register,

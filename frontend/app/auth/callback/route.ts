@@ -1,22 +1,19 @@
 import { NextResponse, type NextRequest } from "next/server";
 
+import { failedLinkUrl, publicOrigin, safeNextPath } from "@/app/auth/redirects";
 import { createClient } from "@/lib/supabase/server";
 
 /**
  * Exchanges a Supabase auth code (signup confirmation, magic link, or
  * password recovery) for a session, then redirects to an approved local
- * destination only. `next` is never used verbatim as a redirect target: it
- * must be an internal path, never an absolute/protocol-relative URL, to
- * avoid turning this into an open redirect.
+ * destination only.
+ *
+ * The code can only be exchanged by the browser that asked for the email (it
+ * holds the PKCE verifier). Links meant to be opened anywhere use
+ * /auth/confirm instead.
  */
-function safeNextPath(next: string | null): string {
-  if (!next) return "/app";
-  if (!next.startsWith("/") || next.startsWith("//")) return "/app";
-  return next;
-}
-
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url);
+  const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
   const next = safeNextPath(searchParams.get("next"));
 
@@ -24,11 +21,9 @@ export async function GET(request: NextRequest) {
     const supabase = await createClient();
     const { error } = await supabase.auth.exchangeCodeForSession(code);
     if (!error) {
-      return NextResponse.redirect(`${origin}${next}`);
+      return NextResponse.redirect(`${publicOrigin(request)}${next}`);
     }
   }
 
-  const loginUrl = new URL("/auth/login", origin);
-  loginUrl.searchParams.set("error", "auth_callback_failed");
-  return NextResponse.redirect(loginUrl);
+  return NextResponse.redirect(failedLinkUrl(request));
 }
