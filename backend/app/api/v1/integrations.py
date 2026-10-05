@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Response, status
@@ -17,8 +18,22 @@ from app.modules.integrations.revenueos_intake import (
     RevenueOSCampaignIntakeOut,
     RevenueOSIntakeService,
 )
+from app.modules.integrations.revenueos_provisioning import (
+    RevenueOSProvisioningService,
+    RevenueOSUserProvisionIn,
+    RevenueOSUserProvisionOut,
+)
+from app.modules.integrations.supabase_auth_admin import (
+    AuthAdminError,
+    AuthAdminRejectedError,
+    AuthAdminUnavailableError,
+    EnsuredUser,
+    SupabaseAuthAdminClient,
+)
 
 router = APIRouter()
+# Routes that are not scoped to one workspace (they create it).
+provisioning_router = APIRouter()
 
 
 def require_revenueos_actor(
@@ -92,6 +107,78 @@ def store_revenueos_campaign(
     """Store a complete STANDARD draft campaign sent by RevenueOS. Never
     activates it: a person reviews the audience and starts it in the UI."""
     result = RevenueOSIntakeService(db).store_campaign(context, payload)
+    if result.duplicate:
+        response.status_code = status.HTTP_200_OK
+    return result
+
+
+@dataclass(frozen=True)
+class ProvisionRequest:
+    actor_id: UUID
+    payload: RevenueOSUserProvisionIn
+    user: EnsuredUser
+
+
+def prepare_revenueos_user(
+    payload: RevenueOSUserProvisionIn,
+    actor_id: UUID = Depends(require_revenueos_actor),
+) -> ProvisionRequest:
+    """Find or create the person's account before any database work (ADR-0020).
+
+    Resolved before `get_db` on purpose: the account lives in Supabase Auth,
+    reached over the network, and a pooled connection must not be held while
+    waiting on it. Creating the account first is safe to repeat: a retry finds
+    it by email.
+    """
+    settings = Settings.current()
+    if (
+        not settings.revenueos_provisioning_enabled
+        or not settings.supabase_service_role_key
+    ):
+        raise AppError(
+            "integration_not_configured",
+            "RevenueOS user provisioning is not enabled",
+            status_code=503,
+        )
+    try:
+        user = SupabaseAuthAdminClient(settings).ensure_user(payload.email)
+    except AuthAdminUnavailableError as exc:
+        raise AppError(
+            "service_unavailable",
+            "The account service is temporarily unavailable. Please retry.",
+            status_code=503,
+        ) from exc
+    except AuthAdminRejectedError as exc:
+        raise AppError(
+            "validation_error",
+            "The account service refused this email address",
+            status_code=422,
+        ) from exc
+    except AuthAdminError as exc:
+        raise AppError(
+            "provider_error",
+            "The account service returned an unexpected response",
+            status_code=502,
+        ) from exc
+    return ProvisionRequest(actor_id=actor_id, payload=payload, user=user)
+
+
+@provisioning_router.post(
+    "/integrations/revenueos/users",
+    response_model=RevenueOSUserProvisionOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def provision_revenueos_user(
+    response: Response,
+    # Declared before `db`: see prepare_revenueos_user.
+    prepared: ProvisionRequest = Depends(prepare_revenueos_user),
+    db: Session = Depends(get_db),
+) -> RevenueOSUserProvisionOut:
+    """Give a person an account and a workspace owned by the RevenueOS acting
+    user. Never returns or accepts a password."""
+    result = RevenueOSProvisioningService(db).provision(
+        actor_id=prepared.actor_id, payload=prepared.payload, user=prepared.user
+    )
     if result.duplicate:
         response.status_code = status.HTTP_200_OK
     return result

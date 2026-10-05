@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     # the Member role). The route is disabled (503) unless both are set.
     revenueos_intake_key: SecretStr = SecretStr("")
     revenueos_actor_user_id: str = ""
+    # RevenueOS user provisioning (ADR-0020): lets the same key create accounts
+    # and workspaces. Off by default; also needs SUPABASE_SERVICE_ROLE_KEY.
+    revenueos_provisioning_enabled: bool = False
 
     supabase_url: str = Field(default="", min_length=1)
     supabase_jwt_secret: str = ""
