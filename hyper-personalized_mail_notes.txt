@@ -1,0 +1,259 @@
+Here is the complete Hyper-Personalized reference: the flow, every field, and a payload for each account and sender case.
+
+Status: all of this is pushed to main (0e9974a). Launch and sample generation ran live on your server today. The approve call and the actual sending have not been run on your server yet.
+
+1. The flow
+Step	Call	Result
+1	POST /api/v1/integrations/revenueos/launch	Account, sender, leads and campaign stored; a sample email is requested
+2	GET /api/v1/workspaces/{workspace_id}/integrations/revenueos/campaigns/{campaign_id}/samples	The sample text, to read before approving (optional)
+3	POST /api/v1/workspaces/{workspace_id}/integrations/revenueos/campaigns/{campaign_id}/approve	Approved and started
+Base address: https://revenueosemial.b2botix.ai
+Header on every call: X-RevenueOS-Key: <your key> (plus Content-Type: application/json on step 1)
+
+workspace_id and campaign_id come from the step 1 response. Approving can also be done by a person in the app.
+
+2. What makes a request Hyper-Personalized
+Two fields:
+
+
+"campaign_type": "HYPER_PERSONALIZED",
+"objective": { ... }
+The emails you send are reference emails. The AI rewrites each one for every recipient, keeping the offer and call to action.
+
+3. Fields
+objective
+
+Field	Required	Meaning
+objective	Yes	The goal of the campaign
+offer	Yes	What you offer
+cta	Yes	The call to action; kept in every email
+target	No	Who it is for
+problem_solved	No	The pain point
+tone	No	Writing style
+must_mention	No	Up to 10 phrases every email must contain
+never_say	No	Up to 10 phrases that must never appear
+email_format	No	"TEXT" or "HTML"
+brand	With HTML	Logo, colours, font, button
+recipients (1 to 500)
+
+Field	Used by the AI
+email	Required; never sent to the AI
+first_name, last_name, company, title	Yes
+company_industry, city, state, country	Yes
+company_website	Yes; the platform reads the site for facts
+phone, linkedin_url	Stored only; never sent to the AI
+A recipient with too few details gets the reference email as written, not an AI version.
+
+emails (1 to 10): subject, body_html, preheader, wait_days_before (0 for the first, 1 or more for each follow-up).
+
+schedule: timezone, weekdays, window_start_local, window_end_local, daily_limit.
+
+auto_start is ignored for this type.
+
+4. Case 1: New account
+
+{
+  "client_reference": "CLIENT-0002",
+  "reference": "CLIENT-0002-HYPER-01",
+  "campaign_type": "HYPER_PERSONALIZED",
+  "user": { "email": "newuser@client.com", "workspace_name": "Client Name", "role": "ADMIN" },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "security_mode": "STARTTLS",
+    "port": 587,
+    "username": "sender@client.com",
+    "password": "SENDER-APP-PASSWORD",
+    "email_address": "sender@client.com",
+    "sender_display_name": "Client Sales Team"
+  },
+  "objective": {
+    "objective": "Book a 15-minute intro call with B2B sales leaders",
+    "offer": "We help B2B teams build a steady sales pipeline with targeted outreach",
+    "cta": "Would a 15-minute call next week be useful?",
+    "target": "Sales and marketing heads at B2B companies",
+    "problem_solved": "Unpredictable pipeline and manual prospecting",
+    "tone": "friendly and direct",
+    "must_mention": [],
+    "never_say": ["guaranteed"],
+    "email_format": "TEXT"
+  },
+  "recipients": [
+    { "email": "lead1@example.com", "first_name": "Asha", "company": "Acme Industries", "title": "Head of Sales", "company_industry": "Manufacturing", "city": "Pune", "country": "India", "company_website": "https://www.acme.example" },
+    { "email": "lead2@example.com", "first_name": "Ravi", "company": "Bright Foods", "title": "Marketing Director", "company_industry": "Food processing", "city": "Mumbai", "country": "India", "company_website": "https://www.brightfoods.example" },
+    { "email": "lead3@example.com", "first_name": "Meera", "company": "Nova Logistics", "title": "CEO", "company_industry": "Logistics", "city": "Delhi", "country": "India", "company_website": "https://www.novalogistics.example" }
+  ],
+  "campaign": { "name": "Personalized intro", "description": "Hyper-personalized outreach" },
+  "emails": [
+    { "subject": "A quick idea for {{company}}", "body_html": "<p>Hi {{first_name}},</p><p>We help B2B teams build a steady sales pipeline with targeted outreach.</p><p>Would a 15-minute call next week be useful?</p><p>Best regards,<br>Client Sales Team</p>", "preheader": null, "wait_days_before": 0 },
+    { "subject": "One more thought for {{company}}", "body_html": "<p>Hi {{first_name}},</p><p>Teams like yours often lose hours to manual prospecting. We take that work off your plate.</p><p>Would a 15-minute call next week be useful?</p><p>Best regards,<br>Client Sales Team</p>", "preheader": null, "wait_days_before": 3 },
+    { "subject": "Should I close this out?", "body_html": "<p>Hi {{first_name}},</p><p>If a steadier pipeline is not a priority right now, no problem at all.</p><p>Would a 15-minute call next week be useful?</p><p>Best regards,<br>Client Sales Team</p>", "preheader": null, "wait_days_before": 4 }
+  ],
+  "schedule": {
+    "timezone": "Asia/Kolkata",
+    "weekdays": [1, 2, 3, 4, 5],
+    "window_start_local": "09:30:00",
+    "window_end_local": "17:30:00",
+    "daily_limit": 10
+  }
+}
+5. Case 2: Same account, same sender email
+Keep client_reference and user the same, change reference, and leave out smtp.
+
+
+{
+  "client_reference": "MOTM-LAUNCH-0001",
+  "reference": "MOTM-HYPER-0002",
+  "campaign_type": "HYPER_PERSONALIZED",
+  "user": { "email": "govinda@motm.tech", "workspace_name": "MOTM Marketing", "role": "ADMIN" },
+  "objective": {
+    "objective": "Book a 15-minute intro call with B2B sales leaders",
+    "offer": "We help B2B teams build a steady sales pipeline with targeted outreach",
+    "cta": "Would a 15-minute call next week be useful?",
+    "tone": "friendly and direct",
+    "email_format": "TEXT"
+  },
+  "recipients": [
+    { "email": "lead1@example.com", "first_name": "Asha", "company": "Acme Industries", "title": "Head of Sales", "company_industry": "Manufacturing", "city": "Pune", "country": "India", "company_website": "https://www.acme.example" },
+    { "email": "lead2@example.com", "first_name": "Ravi", "company": "Bright Foods", "title": "Marketing Director", "company_industry": "Food processing", "city": "Mumbai", "country": "India", "company_website": "https://www.brightfoods.example" }
+  ],
+  "campaign": { "name": "MOTM - Personalized intro 2", "description": "Same account, same sender" },
+  "emails": [
+    { "subject": "A quick idea for {{company}}", "body_html": "<p>Hi {{first_name}},</p><p>I'm reaching out from MOTM Technologies. We help B2B teams build a steady sales pipeline with targeted outreach.</p><p>Would a 15-minute call next week be useful?</p><p>Best regards,<br>Team MOTM</p>", "preheader": null, "wait_days_before": 0 },
+    { "subject": "One more thought for {{company}}", "body_html": "<p>Hi {{first_name}},</p><p>Teams like yours often lose hours to manual prospecting. MOTM Technologies takes that work off your plate.</p><p>Would a 15-minute call next week be useful?</p><p>Best regards,<br>Team MOTM</p>", "preheader": null, "wait_days_before": 3 }
+  ],
+  "schedule": {
+    "timezone": "Asia/Kolkata",
+    "weekdays": [1, 2, 3, 4, 5],
+    "window_start_local": "09:30:00",
+    "window_end_local": "17:30:00",
+    "daily_limit": 10
+  }
+}
+This goes out from quickicp@gmail.com, the sender already connected to that account.
+
+6. Case 3: Same account, different sender email
+Use the Case 2 payload with a new reference, and add this block right after the user line:
+
+
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "security_mode": "STARTTLS",
+    "port": 587,
+    "username": "secondsender@gmail.com",
+    "password": "SECOND-SENDER-APP-PASSWORD",
+    "email_address": "secondsender@gmail.com",
+    "sender_display_name": "MOTM Marketing"
+  },
+username and email_address must both be the new mailbox.
+Check mailbox_status in the response. If it says failed, the campaign fell back to the account's oldest sender.
+Once an account has two senders, a request with no smtp uses the oldest one. To use the second again, include its smtp block again.
+7. Case 4: Same sender, new SMTP password
+Send the smtp block with the same email_address and the new password, in any campaign payload for that account. The response shows "mailbox_status": "updated".
+
+8. Summary of cases
+Case	client_reference	reference	user	smtp
+1. New account	New	New	New	New sender
+2. Same account, same sender	Same	New	Same	Leave out
+3. Same account, different sender	Same	New	Same	The new sender
+4. Same sender, new password	Same	New or same	Same	Same sender, new password
+Always send client_reference for an existing account. Without it, a new reference creates a new, empty workspace; that is how the three empty workspaces appeared yesterday.
+
+9. TEXT or HTML
+For a designed email, replace "email_format": "TEXT" with:
+
+
+"email_format": "HTML",
+"brand": {
+  "logo_url": "https://yourdomain.com/logo.png",
+  "logo_alt": "Your Company",
+  "primary": "#1f2937",
+  "accent": "#2563eb",
+  "text": "#111827",
+  "background": "#ffffff",
+  "font_key": "sans",
+  "cta_url": "https://yourdomain.com/book-a-call",
+  "cta_label": "Book a call"
+}
+Colours are #rrggbb. font_key is one of sans, humanist, serif, times, modern, mono. URLs must start with https://. Write body_html as plain paragraphs in both formats; the platform adds the design.
+
+With HTML, a recipient with too little data gets your plain reference email, unbranded. Use TEXT, or give every recipient full details.
+
+10. Step 1 response
+
+{
+  "status": "launched",
+  "workspace_id": "…",
+  "campaign_id": "…",
+  "campaign_type": "HYPER_PERSONALIZED",
+  "campaign_status": "DRAFT",
+  "mailbox_status": null,
+  "recipients_created": 2,
+  "recipients_existing": 0,
+  "recipients_rejected": [],
+  "start_status": "awaiting_approval"
+}
+start_status	Meaning	What to do
+awaiting_approval	Stored; sample requested	Go to step 2 or 3
+pending	Audience not ready in 15 seconds	Send the same request again
+blocked	No usable sender; nothing stored	Fix smtp and resend
+failed	Stored but the sample could not be requested	Read start_error
+already_started	The campaign is already running	Nothing
+11. Step 2: read the sample
+
+{
+  "campaign_status": "DRAFT",
+  "samples_status": "ready",
+  "approval_status": "NONE",
+  "samples": [
+    {
+      "email_number": 1,
+      "state": "OK",
+      "recipient_first_name": "Asha",
+      "recipient_company": "Acme Industries",
+      "subject": "A quick idea for Acme Industries",
+      "body_html": "<p>Hi Asha,</p>…",
+      "fallback_used": false,
+      "failure_codes": []
+    }
+  ]
+}
+samples_status is generating (ask again in a few seconds), ready, failed, stale or none. There is one sample per email in the sequence, written for the first recipient.
+
+12. Step 3: approve and start
+No body. Response:
+
+
+{ "status": "started", "campaign_id": "…", "campaign_status": "RUNNING" }
+Response	Meaning
+200, started	Approved and running
+200, already_started	Already running
+409, previews_incomplete	Sample still being written; retry shortly
+409, previews_failed	The sample failed; it cannot be approved
+409, approval_stale	Content changed; new samples needed
+422, preflight_failed	Something else blocks the start; the reason is in the response
+503	REVENUEOS_AUTO_START_ENABLED is off
+13. After it starts
+Each email is written for its recipient about an hour before it is due, so the first one does not go out instantly.
+Emails go out only inside the schedule, up to daily_limit per day.
+Follow-ups are also rewritten per recipient, using what the previous email said.
+An email the AI cannot write correctly after 3 attempts is not sent.
+14. Server settings needed
+
+PERSONALIZATION_ENABLED=true
+PERSONALIZATION_MODEL=gpt-4o-mini
+REVENUEOS_PROVISIONING_ENABLED=true
+REVENUEOS_AUTO_START_ENABLED=true
+SEQUENCE_PROGRESSION_ENABLED=true
+SENDING_WORKER_ENABLED=true
+Plus the OpenAI key in .env.personalization.
+
+15. Rules and limits
+At most 500 recipients and 10 emails (9 follow-ups) per request.
+One sender mailbox can belong to only one account.
+user must stay exactly the same for an existing client_reference, or the request is refused with 409.
+A recipient already in the account is reused with their saved details; new details in the payload do not overwrite them.
+Reusing an old reference creates nothing and returns duplicate: true.
+Lead details go to OpenAI: name, company, title, industry, location, website text. Never email, phone or LinkedIn.
+Each sample and each email costs OpenAI usage on your account.
+Brain cannot pause or stop a campaign; a person does that in the app.
+No unsubscribe footer is added (an existing platform gap).
