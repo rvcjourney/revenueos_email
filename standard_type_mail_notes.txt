@@ -1,0 +1,155 @@
+Understood. Here is the full reference: one API, and a payload for each case. All of it is for Standard campaigns.
+
+The API
+
+POST https://revenueosemial.b2botix.ai/api/v1/integrations/revenueos/launch
+X-RevenueOS-Key: <REVENUEOS_INTAKE_KEY from the server .env>
+Content-Type: application/json
+Two IDs decide which case you are in:
+
+Field	Identifies	Rule
+client_reference	The account (user, workspace)	Same value = same account
+reference	The campaign	New value = new campaign
+Case 1: New account
+Creates the user, the workspace, the sender mailbox, the leads and the campaign.
+
+
+{
+  "client_reference": "CLIENT-0002",
+  "reference": "CLIENT-0002-CAMPAIGN-01",
+  "user": {
+    "email": "newuser@client.com",
+    "workspace_name": "Client Name",
+    "role": "ADMIN"
+  },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "security_mode": "STARTTLS",
+    "port": 587,
+    "username": "sender@client.com",
+    "password": "SENDER-APP-PASSWORD",
+    "email_address": "sender@client.com",
+    "sender_display_name": "Client Sales Team"
+  },
+  "recipients": [
+    { "email": "lead1@example.com", "first_name": "Asha", "company": "Acme" },
+    { "email": "lead2@example.com", "first_name": "Ravi" }
+  ],
+  "campaign": { "name": "Intro campaign", "description": "First outreach" },
+  "emails": [
+    { "subject": "Hello {{first_name}}", "body_html": "<p>Hi {{first_name}},</p><p>First email.</p>", "preheader": null, "wait_days_before": 0 },
+    { "subject": "Following up", "body_html": "<p>Hi {{first_name}},</p><p>Follow-up.</p>", "preheader": null, "wait_days_before": 3 }
+  ],
+  "schedule": {
+    "timezone": "Asia/Kolkata",
+    "weekdays": [1, 2, 3, 4, 5],
+    "window_start_local": "09:30:00",
+    "window_end_local": "17:30:00",
+    "daily_limit": 10
+  },
+  "auto_start": true
+}
+The new user logs in with their email as both username and password, if REVENUEOS_INITIAL_PASSWORD_IS_EMAIL=true is set on the server. Otherwise they use Forgot password.
+
+Case 2: Same account, same sender email
+A new campaign from your existing account, sent from the mailbox it already has. Keep client_reference and user the same, change reference, and leave out smtp.
+
+
+{
+  "client_reference": "MOTM-LAUNCH-0001",
+  "reference": "MOTM-CAMPAIGN-0002",
+  "user": {
+    "email": "govinda@motm.tech",
+    "workspace_name": "MOTM Marketing",
+    "role": "ADMIN"
+  },
+  "recipients": [
+    { "email": "ramvish023@gmail.com", "first_name": "Rameshwar" },
+    { "email": "ramvish958@gmail.com", "first_name": "Ram" }
+  ],
+  "campaign": { "name": "Second campaign", "description": "Same account, same sender" },
+  "emails": [
+    { "subject": "A second note", "body_html": "<p>Hi {{first_name}},</p><p>Second campaign.</p>", "preheader": null, "wait_days_before": 0 }
+  ],
+  "schedule": {
+    "timezone": "Asia/Kolkata",
+    "weekdays": [1, 2, 3, 4, 5],
+    "window_start_local": "09:30:00",
+    "window_end_local": "17:30:00",
+    "daily_limit": 10
+  },
+  "auto_start": true
+}
+This goes out from quickicp@gmail.com, the mailbox connected in your first launch.
+
+Case 3: Same account, different sender email
+A new campaign from the same account, sent from a second mailbox. Same as Case 2, plus an smtp block for the new sender.
+
+
+{
+  "client_reference": "MOTM-LAUNCH-0001",
+  "reference": "MOTM-CAMPAIGN-0003",
+  "user": {
+    "email": "govinda@motm.tech",
+    "workspace_name": "MOTM Marketing",
+    "role": "ADMIN"
+  },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "security_mode": "STARTTLS",
+    "port": 587,
+    "username": "secondsender@gmail.com",
+    "password": "SECOND-SENDER-APP-PASSWORD",
+    "email_address": "secondsender@gmail.com",
+    "sender_display_name": "MOTM Marketing"
+  },
+  "recipients": [
+    { "email": "ramvish023@gmail.com", "first_name": "Rameshwar" }
+  ],
+  "campaign": { "name": "Third campaign", "description": "Same account, different sender" },
+  "emails": [
+    { "subject": "From our other mailbox", "body_html": "<p>Hi {{first_name}},</p><p>Third campaign.</p>", "preheader": null, "wait_days_before": 0 }
+  ],
+  "schedule": {
+    "timezone": "Asia/Kolkata",
+    "weekdays": [1, 2, 3, 4, 5],
+    "window_start_local": "09:30:00",
+    "window_end_local": "17:30:00",
+    "daily_limit": 10
+  },
+  "auto_start": true
+}
+The account then has two mailboxes, and this campaign uses the new one ("mailbox_status": "connected").
+
+Rules for a second sender:
+
+username and email_address must both be the new mailbox. The same SMTP login under a different sender address is refused.
+If the new mailbox fails to connect, the campaign still goes out, from the account's oldest mailbox. Check mailbox_status in the response: if it says failed, the campaign was sent from the old sender.
+After two mailboxes exist, a payload with no smtp uses the oldest one. To send from the second one again, include its smtp block again, password included.
+Case 4: Same account, same sender, new SMTP password
+Send the smtp block with the same email_address and the new password, inside any campaign payload for that account. The mailbox is updated in place ("mailbox_status": "updated").
+
+Summary
+Case	client_reference	reference	user	smtp
+1. New account	New	New	New	New sender
+2. Same account, same sender	Same	New	Same	Leave out
+3. Same account, different sender	Same	New	Same	The new sender
+4. Same sender, new password	Same	New or same	Same	Same sender, new password
+The response
+Field	Meaning
+workspace_id, user_id	The account. Same in Cases 2–4 as before
+mailbox_id, mailbox_status	connected (new), updated (changed), failed, or null when no smtp was sent
+recipients_created / recipients_existing / recipients_rejected	New leads, leads already in the account, and bad addresses
+campaign_id, campaign_status	The new campaign
+start_status	started, pending (send again), failed, or blocked (no usable mailbox)
+Limits
+At most 500 recipients and 10 emails per request. The first email has wait_days_before 0; each follow-up has 1 or more.
+One sender mailbox can belong to only one account.
+user must stay exactly the same for an existing client_reference, or the request is refused with 409.
+Reusing an old reference creates nothing and returns duplicate: true.
+What is tested
+Case 1 ran live on your server on Monday.
+Cases 2 and 4 pass tests against a real database, but have not been run on your server.
+Case 3 has no test of its own; it combines the tested connect step and the tested multi-campaign step. Try it first with your own addresses.
+Cases 2–4 need the latest code (6b44214) deployed. A 422 saying client_reference is not allowed means it isn't deployed yet.
+If you want this as a shareable page for your team, I can publish it.
