@@ -249,7 +249,13 @@ def prepare_revenueos_launch(
     """Check both switches and find or create the account before any database
     work, for the same reasons as prepare_revenueos_user."""
     settings = Settings.current()
-    if payload.auto_start and not settings.revenueos_auto_start_enabled:
+    if payload.is_hyper and not settings.personalization_enabled:
+        raise AppError(
+            "integration_not_configured",
+            "Hyper-personalized campaigns are not enabled for this deployment",
+            status_code=503,
+        )
+    if payload.wants_auto_start and not settings.revenueos_auto_start_enabled:
         # Refused whole, before anything is created: storing a draft when the
         # caller asked for a running campaign would be a silent downgrade.
         raise AppError(

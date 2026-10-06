@@ -1,6 +1,8 @@
 """RevenueOS launch (ADR-0022): one request that provisions the user and
 workspace, connects the mailbox, adds the recipients as leads, stores the
-campaign and starts it.
+campaign and starts it. A HYPER_PERSONALIZED campaign (ADR-0023) is stored
+with its objective and sample emails are requested; a person approves them
+and starts it in the app.
 
 It is an orchestration of the other RevenueOS services and of LeadService;
 every rule stays where it already lives.
@@ -12,6 +14,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from typing import Literal
 from uuid import UUID
@@ -24,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import WorkspaceContext
 from app.core.errors import AppError
 from app.db.context import enter_api_scope
+from app.modules.campaigns.audience_service import AudienceService
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import AudienceSelectIn, CampaignSettingsCreateIn
 from app.modules.integrations.revenueos_intake import (
@@ -44,7 +48,10 @@ from app.modules.leads.normalization import normalize_email
 from app.modules.leads.service import LeadService
 from app.modules.mailboxes.repository import MailboxRepository
 from app.modules.mailboxes.schemas import SmtpConnectRequest
-from app.schemas.leads import LeadCreateIn, LeadListCreateIn
+from app.modules.personalization.api_service import PersonalizationApiService
+from app.modules.personalization.config_schema import PersonalizationConfig
+from app.modules.personalization.schemas import PreviewCreateIn
+from app.schemas.leads import LeadCreateIn, LeadListCreateIn, LeadProfileIn
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +79,11 @@ class LaunchUserIn(BaseModel):
         return clean_user_email(value)
 
 
-class LaunchRecipientIn(BaseModel):
+class LaunchRecipientIn(LeadProfileIn):
+    """A lead. The profile fields (company_industry, company_website, city,
+    country, ...) are what a hyper-personalized email is written from; a
+    recipient with too few of them gets the reference email instead."""
+
     model_config = ConfigDict(extra="forbid")
 
     email: str = Field(min_length=3, max_length=320)
@@ -101,8 +112,13 @@ class RevenueOSLaunchIn(BaseModel):
     campaign: IntakeCampaignIn
     emails: list[IntakeEmailIn] = Field(min_length=1, max_length=_MAX_EMAILS)
     schedule: CampaignSettingsCreateIn
-    # False stores a draft for a person to start.
+    # False stores a draft for a person to start. Not used for a
+    # HYPER_PERSONALIZED campaign, which a person always approves and starts.
     auto_start: bool = True
+    campaign_type: Literal["STANDARD", "HYPER_PERSONALIZED"] = "STANDARD"
+    # HYPER_PERSONALIZED only, and required for it: what the campaign is
+    # trying to achieve. `emails` are then the reference templates.
+    objective: PersonalizationConfig | None = None
 
     @field_validator("reference", "client_reference")
     @classmethod
@@ -118,9 +134,21 @@ class RevenueOSLaunchIn(BaseModel):
     def resolved_client_reference(self) -> str:
         return self.client_reference or self.reference
 
+    @property
+    def is_hyper(self) -> bool:
+        return self.campaign_type == "HYPER_PERSONALIZED"
+
+    @property
+    def wants_auto_start(self) -> bool:
+        return self.auto_start and not self.is_hyper
+
     @model_validator(mode="after")
     def _waits_match_sequence_rules(self) -> RevenueOSLaunchIn:
         validate_email_waits(self.emails)
+        if self.is_hyper and self.objective is None:
+            raise ValueError("a HYPER_PERSONALIZED campaign needs an objective")
+        if not self.is_hyper and self.objective is not None:
+            raise ValueError("objective is only for a HYPER_PERSONALIZED campaign")
         return self
 
 
@@ -155,23 +183,37 @@ class RevenueOSLaunchOut(BaseModel):
 
     campaign_id: UUID | None = None
     campaign_status: str | None = None
+    campaign_type: Literal["STANDARD", "HYPER_PERSONALIZED"] = "STANDARD"
     # started / already_started: running. pending: capture not finished in time,
-    # call the start route. failed: the reason is in start_error. blocked: no
-    # campaign was stored. not_requested: auto_start was false.
+    # send the same request again. failed: the reason is in start_error.
+    # blocked: no campaign was stored. not_requested: auto_start was false.
+    # awaiting_approval: hyper-personalized, samples requested; a person
+    # approves them and starts the campaign in the app.
     start_status: Literal[
-        "started", "already_started", "pending", "failed", "blocked", "not_requested"
+        "started",
+        "already_started",
+        "pending",
+        "failed",
+        "blocked",
+        "not_requested",
+        "awaiting_approval",
     ]
     start_error: str | None = None
 
 
 def _payload_hash(payload: RevenueOSLaunchIn) -> str:
+    content = {
+        "campaign": payload.campaign.model_dump(mode="json"),
+        "emails": [email.model_dump(mode="json") for email in payload.emails],
+        "schedule": payload.schedule.model_dump(mode="json"),
+        "recipients": sorted(r.email.strip().lower() for r in payload.recipients),
+    }
+    if payload.objective is not None:
+        # Added only when present, so a STANDARD launch stored before this
+        # key existed keeps its hash and still replays.
+        content["objective"] = payload.objective.canonical()
     encoded = json.dumps(
-        {
-            "campaign": payload.campaign.model_dump(mode="json"),
-            "emails": [email.model_dump(mode="json") for email in payload.emails],
-            "schedule": payload.schedule.model_dump(mode="json"),
-            "recipients": sorted(r.email.strip().lower() for r in payload.recipients),
-        },
+        content,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -217,6 +259,7 @@ class RevenueOSLaunchService:
             mailbox_id=provisioned.mailbox_id,
             mailbox_status=provisioned.mailbox_status,
             mailbox_error=provisioned.mailbox_error,
+            campaign_type=payload.campaign_type,
             start_status="blocked",
         )
         # Provisioning returns only when the acting user is the Owner of the
@@ -228,14 +271,17 @@ class RevenueOSLaunchService:
         self._store(context, payload, result)
         if result.campaign_id is None:
             return result
-        if not payload.auto_start:
+        if not payload.is_hyper and not payload.auto_start:
             result.start_status = "not_requested"
             return result
 
         # The capture worker can only see the audience once this is committed,
         # and nothing below may undo what was stored above.
         self.session.commit()
-        self._start(context, result, sleep, clock)
+        if payload.is_hyper:
+            self._request_samples(context, result, sleep, clock)
+        else:
+            self._start(context, result, sleep, clock)
         return result
 
     def _store(
@@ -296,6 +342,7 @@ class RevenueOSLaunchService:
                 audience=AudienceSelectIn(list_ids=[list_id]),
                 mailbox_id=mailbox_id,
             ),
+            objective=payload.objective,
         )
         try:
             launch_receipt = self.repo.insert_pending_command_receipt(
@@ -459,3 +506,97 @@ class RevenueOSLaunchService:
             result.start_status = started.status
             result.campaign_status = started.campaign_status
             return
+
+    def _request_samples(
+        self,
+        context: WorkspaceContext,
+        result: RevenueOSLaunchOut,
+        sleep: Callable[[float], None],
+        clock: Callable[[], float],
+    ) -> None:
+        """Hyper-personalized: confirm the captured audience and ask for sample
+        emails for its first recipient. Approving them and starting stays with a
+        person (owner decision, ADR-0023). Safe to repeat."""
+        assert result.campaign_id is not None
+        deadline = clock() + _START_WAIT_SECONDS
+        while True:
+            enter_api_scope(
+                self.session,
+                user_id=context.user_id,
+                workspace_id=context.workspace_id,
+            )
+            try:
+                waiting = self._request_samples_once(context, result)
+            except AppError as exc:
+                self.session.rollback()
+                result.start_status = "failed"
+                result.start_error = exc.message
+                return
+            if not waiting:
+                return
+            self.session.rollback()
+            if clock() >= deadline:
+                result.start_status = "pending"
+                result.start_error = (
+                    "The audience is still being captured. Send the same request again."
+                )
+                return
+            sleep(_START_POLL_SECONDS)
+
+    def _request_samples_once(
+        self, context: WorkspaceContext, result: RevenueOSLaunchOut
+    ) -> bool:
+        """True while the audience is still being captured."""
+        campaign_id = result.campaign_id
+        assert campaign_id is not None
+        campaign = self.repo.get_campaign(
+            workspace_id=context.workspace_id, campaign_id=campaign_id
+        )
+        if campaign is None:
+            raise AppError("not_found", "Campaign not found", status_code=404)
+        result.campaign_status = campaign["status"]
+        if campaign["status"] != "DRAFT":
+            # A person already approved and started it (or stopped it).
+            result.start_status = "already_started"
+            return False
+
+        audience = self.repo.get_latest_audience(
+            workspace_id=context.workspace_id, campaign_id=campaign_id
+        )
+        if audience is None or audience["status"] == "CAPTURING":
+            return True
+        if audience["status"] != "READY":
+            raise AppError(
+                "validation_error",
+                f"Audience capture ended as {audience['status']}",
+                status_code=422,
+            )
+        audience_id = UUID(str(audience["id"]))
+        if str(campaign["draft_audience_id"]) != str(audience_id):
+            AudienceService(self.session).commit_audience(
+                context, campaign_id, audience_id
+            )
+        members = self.repo.list_accepted_audience_members(
+            workspace_id=context.workspace_id,
+            audience_id=audience_id,
+            after_ordinal=None,
+            limit=1,
+        )
+        if not members:
+            raise AppError(
+                "validation_error",
+                "No recipient was accepted into the audience",
+                status_code=422,
+            )
+        # create_previews commits and dispatches the generation task. The batch
+        # id is derived from the campaign, so a repeat spends nothing more.
+        PersonalizationApiService(self.session).create_previews(
+            context,
+            campaign_id,
+            PreviewCreateIn(
+                batch_id=uuid.uuid5(uuid.NAMESPACE_URL, f"revenueos:{campaign_id}"),
+                audience_member_ids=[UUID(str(members[0]["id"]))],
+            ),
+        )
+        result.start_status = "awaiting_approval"
+        return False

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -438,3 +439,189 @@ def test_a_client_reference_cannot_be_taken_over_by_another_user(
         )
 
     assert excinfo.value.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# HYPER_PERSONALIZED launches (ADR-0023)
+# ---------------------------------------------------------------------------
+
+OBJECTIVE = {
+    "objective": "Book a short intro call",
+    "offer": "We help B2B teams build a steady sales pipeline",
+    "cta": "Would a 15-minute call next week be useful?",
+    "target": "B2B sales leaders",
+    "tone": "friendly",
+}
+
+
+@pytest.fixture()
+def personalization_on(monkeypatch: pytest.MonkeyPatch):
+    from app.core.config import reset_settings_cache
+
+    monkeypatch.setenv("PERSONALIZATION_ENABLED", "true")
+    monkeypatch.setenv("PERSONALIZATION_MODEL", "test-model")
+    reset_settings_cache()
+    yield
+    monkeypatch.undo()
+    reset_settings_cache()
+
+
+def hyper_body(reference: str, **overrides: Any) -> dict[str, Any]:
+    return body(
+        reference,
+        campaign_type="HYPER_PERSONALIZED",
+        objective=OBJECTIVE,
+        recipients=[
+            {
+                "email": unique_email("lead"),
+                "first_name": "Asha",
+                "company": "Acme",
+                "title": "Head of Sales",
+                "company_industry": "Software",
+                "city": "Pune",
+                "country": "India",
+                "company_website": "https://acme.example",
+            }
+        ],
+        emails=[
+            {
+                "subject": "A quick idea for {{company}}",
+                "body_html": "<p>Hi {{first_name}},</p><p>We help B2B teams build "
+                "a steady sales pipeline.</p><p>Would a 15-minute call next week "
+                "be useful?</p>",
+            }
+        ],
+        **overrides,
+    )
+
+
+def finish_capture(su, campaign_id: uuid.UUID) -> None:
+    """Stand in for the capture worker: mark the audience READY with its one
+    recipient accepted."""
+    workspace_id, audience_id = su.execute(
+        "SELECT workspace_id, id FROM public.campaign_audiences WHERE campaign_id = %s",
+        [campaign_id],
+    ).fetchone()
+    lead_id = su.execute(
+        "SELECT id FROM public.leads WHERE workspace_id = %s LIMIT 1", [workspace_id]
+    ).fetchone()[0]
+    su.execute("SET session_replication_role = replica")
+    su.execute(
+        "INSERT INTO public.campaign_audience_members (workspace_id, campaign_id, "
+        "audience_id, lead_id, address_id, capture_ordinal, contact_revision) "
+        "VALUES (%s, %s, %s, %s, %s, 1, 1)",
+        [workspace_id, campaign_id, audience_id, lead_id, uuid.uuid4()],
+    )
+    su.execute(
+        "UPDATE public.campaign_audiences SET status = 'READY', completed_at = now(), "
+        "source_manifest_digest = %s WHERE id = %s",
+        ["a" * 64, audience_id],
+    )
+    su.execute("SET session_replication_role = origin")
+
+
+def test_hyper_launch_stores_the_objective_and_waits_for_a_person(
+    engine, su, actor, smtp_ok, personalization_on
+) -> None:
+    person = auth_user(su)
+    payload = hyper_body("HYPER-1")
+    ticks = iter([0.0, 20.0, 40.0])
+
+    first = launch(
+        engine, actor, person, payload, sleep=lambda _: None, clock=lambda: next(ticks)
+    )
+
+    assert first.campaign_type == "HYPER_PERSONALIZED"
+    # auto_start is true in the payload, yet nothing is started.
+    assert first.start_status == "pending" and first.campaign_status == "DRAFT"
+    assert (
+        scalar(
+            su,
+            "SELECT campaign_type FROM public.campaigns WHERE id = %s",
+            first.campaign_id,
+        )
+        == "HYPER_PERSONALIZED"
+    )
+    stored = scalar(
+        su,
+        "SELECT personalization_config FROM public.campaign_sequences "
+        "WHERE campaign_id = %s",
+        first.campaign_id,
+    )
+    assert stored["offer"] == OBJECTIVE["offer"] and stored["cta"] == OBJECTIVE["cta"]
+    # The profile fields a personalized email is written from reached the lead.
+    row = su.execute(
+        "SELECT company, title FROM public.leads WHERE workspace_id = %s",
+        [first.workspace_id],
+    ).fetchone()
+    assert row == ("Acme", "Head of Sales")
+
+    finish_capture(su, first.campaign_id)
+    producer = MagicMock()
+    with patch("app.services.task_dispatch.get_task_producer", return_value=producer):
+        again = launch(engine, actor, person, payload)
+        third = launch(engine, actor, person, payload)
+
+    assert again.duplicate is True and again.start_status == "awaiting_approval"
+    assert third.start_status == "awaiting_approval"
+    # The audience was confirmed and one sample was requested, once.
+    assert (
+        scalar(
+            su,
+            "SELECT draft_audience_id IS NOT NULL FROM public.campaigns WHERE id = %s",
+            first.campaign_id,
+        )
+        is True
+    )
+    assert (
+        scalar(
+            su,
+            "SELECT count(*) FROM public.personalization_previews "
+            "WHERE campaign_id = %s",
+            first.campaign_id,
+        )
+        == 1
+    )
+    producer.send_task.assert_called_once()
+    assert producer.send_task.call_args.args[0] == "personalization.generate_previews"
+    # Still a draft, and not approved: that is a person's step.
+    assert (
+        scalar(
+            su, "SELECT status FROM public.campaigns WHERE id = %s", first.campaign_id
+        )
+        == "DRAFT"
+    )
+    assert (
+        scalar(
+            su,
+            "SELECT count(*) FROM public.campaign_personalization_approvals "
+            "WHERE campaign_id = %s",
+            first.campaign_id,
+        )
+        == 0
+    )
+
+
+def test_standard_launch_is_unchanged_by_the_new_fields(
+    engine, su, actor, smtp_ok
+) -> None:
+    result = launch(engine, actor, auth_user(su), body("STD-AFTER-HYPER"))
+
+    assert result.campaign_type == "STANDARD"
+    assert (
+        scalar(
+            su,
+            "SELECT campaign_type FROM public.campaigns WHERE id = %s",
+            result.campaign_id,
+        )
+        == "STANDARD"
+    )
+    assert (
+        scalar(
+            su,
+            "SELECT personalization_config FROM public.campaign_sequences "
+            "WHERE campaign_id = %s",
+            result.campaign_id,
+        )
+        is None
+    )

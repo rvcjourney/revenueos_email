@@ -4,6 +4,8 @@ What the request stores is proven in test_revenueos_launch_real_db.py."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -458,3 +460,142 @@ def test_the_workspace_is_provisioned_under_the_client_reference() -> None:
     sent = provisioning.return_value.provision.call_args.kwargs["payload"]
     assert sent.reference == "CLIENT-7"
     assert result.reference == "CAMPAIGN-2" and result.client_reference == "CLIENT-7"
+
+
+# ---------------------------------------------------------------------------
+# HYPER_PERSONALIZED (ADR-0023)
+# ---------------------------------------------------------------------------
+
+OBJECTIVE = {
+    "objective": "Book a short intro call",
+    "offer": "We help B2B teams build a steady pipeline",
+    "cta": "Would a 15-minute call be useful?",
+}
+
+
+def test_hyper_needs_an_objective_and_standard_refuses_one() -> None:
+    hyper = _payload(campaign_type="HYPER_PERSONALIZED", objective=OBJECTIVE)
+    assert hyper.is_hyper and hyper.wants_auto_start is False
+    assert _payload().is_hyper is False and _payload().wants_auto_start is True
+    with pytest.raises(ValidationError):
+        _payload(campaign_type="HYPER_PERSONALIZED")
+    with pytest.raises(ValidationError):
+        _payload(objective=OBJECTIVE)
+    with pytest.raises(ValidationError):
+        _payload(campaign_type="HYPER_PERSONALIZED", objective={"offer": "x"})
+
+
+def test_recipients_accept_the_profile_fields_personalization_reads() -> None:
+    payload = _payload(
+        recipients=[
+            {
+                "email": "lead@acme.com",
+                "company_industry": "Software",
+                "company_website": "https://acme.example",
+                "city": "Pune",
+                "country": "India",
+            }
+        ]
+    )
+    assert payload.recipients[0].company_industry == "Software"
+    with pytest.raises(ValidationError):
+        _payload(recipients=[{"email": "lead@acme.com", "favourite_colour": "red"}])
+
+
+def test_objective_is_part_of_the_hash_only_when_present() -> None:
+    hyper = _payload(campaign_type="HYPER_PERSONALIZED", objective=OBJECTIVE)
+    other = _payload(
+        campaign_type="HYPER_PERSONALIZED", objective={**OBJECTIVE, "offer": "Other"}
+    )
+    assert _payload_hash(hyper) != _payload_hash(other)
+    assert _payload_hash(hyper) != _payload_hash(_payload())
+    # A STANDARD launch hashes exactly as it did before these fields existed:
+    # the same four keys and nothing else.
+    standard = _payload()
+    expected = hashlib.sha256(
+        json.dumps(
+            {
+                "campaign": standard.campaign.model_dump(mode="json"),
+                "emails": [e.model_dump(mode="json") for e in standard.emails],
+                "schedule": standard.schedule.model_dump(mode="json"),
+                "recipients": ["lead@acme.com"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert _payload_hash(standard) == expected
+
+
+def test_hyper_launch_requests_samples_and_never_starts() -> None:
+    session = MagicMock()
+    service = RevenueOSLaunchService(session)
+
+    def store(_context: Any, _payload: Any, result: RevenueOSLaunchOut) -> None:
+        result.campaign_id, result.campaign_status = CAMPAIGN_ID, "DRAFT"
+
+    with (
+        patch.object(revenueos_launch, "RevenueOSProvisioningService") as provisioning,
+        patch.object(service, "_store", side_effect=store),
+        patch.object(service, "_start") as start,
+        patch.object(service, "_request_samples") as samples,
+    ):
+        provisioning.return_value.provision.return_value = MagicMock(
+            user_id=PERSON,
+            email="cam@motm.tech",
+            user_created=True,
+            workspace_id=WORKSPACE,
+            workspace_name="Acme",
+            role="ADMIN",
+            mailbox_id=None,
+            mailbox_status=None,
+            mailbox_error=None,
+        )
+        service.launch(
+            actor_id=ACTOR,
+            payload=_payload(campaign_type="HYPER_PERSONALIZED", objective=OBJECTIVE),
+            user=EnsuredUser(user_id=PERSON, created=True),
+        )
+
+    start.assert_not_called()
+    samples.assert_called_once()
+    session.commit.assert_called_once()
+
+
+def test_hyper_is_refused_whole_while_personalization_is_off(
+    monkeypatch: pytest.MonkeyPatch, collaborators: tuple[MagicMock, MagicMock]
+) -> None:
+    _configure(monkeypatch, provisioning="true", auto_start="true")
+    monkeypatch.setenv("PERSONALIZATION_ENABLED", "false")
+    reset_settings_cache()
+    admin, service = collaborators
+    client, db = _client()
+
+    response = client.post(
+        URL,
+        json=_body(campaign_type="HYPER_PERSONALIZED", objective=OBJECTIVE),
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 503
+    admin.return_value.ensure_user.assert_not_called()
+    service.return_value.launch.assert_not_called()
+    db.execute.assert_not_called()
+
+
+def test_hyper_does_not_need_the_auto_start_switch(
+    monkeypatch: pytest.MonkeyPatch, collaborators: tuple[MagicMock, MagicMock]
+) -> None:
+    _configure(monkeypatch, provisioning="true", auto_start="false")
+    monkeypatch.setenv("PERSONALIZATION_ENABLED", "true")
+    monkeypatch.setenv("PERSONALIZATION_MODEL", "test-model")
+    reset_settings_cache()
+    client, _ = _client()
+
+    response = client.post(
+        URL,
+        json=_body(campaign_type="HYPER_PERSONALIZED", objective=OBJECTIVE),
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 201

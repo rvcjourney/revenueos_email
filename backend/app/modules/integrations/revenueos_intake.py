@@ -34,6 +34,9 @@ from app.modules.campaigns.schemas import (
 from app.modules.campaigns.sequence_service import SequenceService
 from app.modules.campaigns.service import CampaignService
 from app.modules.campaigns.settings_service import CampaignSettingsService
+from app.modules.personalization.api_service import PersonalizationApiService
+from app.modules.personalization.config_schema import PersonalizationConfig
+from app.modules.personalization.schemas import PersonalizationConfigIn
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +123,16 @@ class RevenueOSIntakeService:
         self.repo = CampaignRepository(session)
 
     def store_campaign(
-        self, context: WorkspaceContext, payload: RevenueOSCampaignIntakeIn
+        self,
+        context: WorkspaceContext,
+        payload: RevenueOSCampaignIntakeIn,
+        *,
+        objective: PersonalizationConfig | None = None,
     ) -> RevenueOSCampaignIntakeOut:
+        """With `objective` the campaign is HYPER_PERSONALIZED and `emails`
+        are its reference templates (ADR-0023); only the launch passes it.
+        It is deliberately not part of the payload or its hash, so every
+        reference stored before it existed still replays."""
         payload_hash = _payload_hash(payload)
         existing = self.repo.get_command_receipt(
             workspace_id=context.workspace_id,
@@ -137,9 +148,17 @@ class RevenueOSIntakeService:
             CampaignCreateIn(
                 name=payload.campaign.name,
                 description=payload.campaign.description,
-                campaign_type="STANDARD",
+                campaign_type=(
+                    "HYPER_PERSONALIZED" if objective is not None else "STANDARD"
+                ),
             ),
         )
+        if objective is not None:
+            # Before the steps: the reference templates are sanitized
+            # according to the email format the objective chose.
+            PersonalizationApiService(self.session).put_config(
+                context, campaign.id, PersonalizationConfigIn(config=objective)
+            )
         try:
             receipt = self.repo.insert_pending_command_receipt(
                 workspace_id=context.workspace_id,
