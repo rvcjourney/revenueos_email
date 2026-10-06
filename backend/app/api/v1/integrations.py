@@ -13,6 +13,10 @@ from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.permissions import has_permission
 from app.db.context import set_transaction_context
+from app.modules.integrations.revenueos_approval import (
+    RevenueOSApprovalService,
+    RevenueOSSamplesOut,
+)
 from app.modules.integrations.revenueos_intake import (
     RevenueOSCampaignIntakeIn,
     RevenueOSCampaignIntakeOut,
@@ -287,3 +291,40 @@ def launch_revenueos_campaign(
     if result.duplicate:
         response.status_code = status.HTTP_200_OK
     return result
+
+
+@router.get(
+    "/integrations/revenueos/campaigns/{campaign_id}/samples",
+    response_model=RevenueOSSamplesOut,
+)
+def get_revenueos_samples(
+    campaign_id: UUID,
+    context: WorkspaceContext = Depends(get_revenueos_context),
+    db: Session = Depends(get_db),
+) -> RevenueOSSamplesOut:
+    """The sample emails of a hyper-personalized campaign, for RevenueOS to
+    read before it approves them (ADR-0024)."""
+    return RevenueOSApprovalService(db).samples(context, campaign_id)
+
+
+@router.post(
+    "/integrations/revenueos/campaigns/{campaign_id}/approve",
+    response_model=RevenueOSCampaignStartOut,
+    # Approving here also starts the campaign, so it sits behind the same
+    # switch as the start route.
+    dependencies=[Depends(require_revenueos_auto_start)],
+)
+def approve_revenueos_campaign(
+    campaign_id: UUID,
+    context: WorkspaceContext = Depends(get_revenueos_context),
+    db: Session = Depends(get_db),
+) -> RevenueOSCampaignStartOut:
+    """Approve the sample emails and start the campaign, as the acting user."""
+    # Same rule as approving in the app and as the start route.
+    if not has_permission(context.role_code, "campaigns.execute"):
+        raise AppError(
+            "forbidden",
+            "You do not have permission to perform this action",
+            status_code=403,
+        )
+    return RevenueOSApprovalService(db).approve_and_start(context, campaign_id)

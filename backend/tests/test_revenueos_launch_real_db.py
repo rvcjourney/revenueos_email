@@ -508,8 +508,9 @@ def finish_capture(su, campaign_id: uuid.UUID) -> None:
     su.execute("SET session_replication_role = replica")
     su.execute(
         "INSERT INTO public.campaign_audience_members (workspace_id, campaign_id, "
-        "audience_id, lead_id, address_id, capture_ordinal, contact_revision) "
-        "VALUES (%s, %s, %s, %s, %s, 1, 1)",
+        "audience_id, lead_id, address_id, capture_ordinal, contact_revision, "
+        "frozen_variables) "
+        'VALUES (%s, %s, %s, %s, %s, 1, 1, \'{"first_name": "Asha"}\')',
         [workspace_id, campaign_id, audience_id, lead_id, uuid.uuid4()],
     )
     su.execute(
@@ -624,4 +625,88 @@ def test_standard_launch_is_unchanged_by_the_new_fields(
             result.campaign_id,
         )
         is None
+    )
+
+
+def test_samples_can_be_read_and_approved_through_the_api(
+    engine, su, actor, smtp_ok, personalization_on
+) -> None:
+    from app.modules.integrations import revenueos_approval
+    from app.modules.integrations.revenueos_approval import RevenueOSApprovalService
+    from app.modules.integrations.revenueos_start import RevenueOSCampaignStartOut
+
+    person = auth_user(su)
+    payload = hyper_body("HYPER-APPROVE")
+    ticks = iter([0.0, 20.0, 40.0])
+    first = launch(
+        engine, actor, person, payload, sleep=lambda _: None, clock=lambda: next(ticks)
+    )
+    finish_capture(su, first.campaign_id)
+    with patch(
+        "app.services.task_dispatch.get_task_producer", return_value=MagicMock()
+    ):
+        launch(engine, actor, person, payload)
+    context = WorkspaceContext(
+        workspace_id=first.workspace_id, user_id=actor, role_code="OWNER"
+    )
+
+    def as_actor(action):
+        with Session(engine) as session:
+            session.execute(text("SET LOCAL ROLE app_api"))
+            session.execute(
+                text("SELECT set_config('app.user_id', :u, true)"), {"u": str(actor)}
+            )
+            session.execute(
+                text("SELECT set_config('app.workspace_id', :w, true)"),
+                {"w": str(first.workspace_id)},
+            )
+            value = action(RevenueOSApprovalService(session))
+            session.commit()
+        return value
+
+    # The worker has not written the sample yet: readable, not approvable.
+    waiting = as_actor(lambda s: s.samples(context, first.campaign_id))
+    assert waiting.samples_status == "generating"
+    assert waiting.approval_status == "NONE"
+    with pytest.raises(AppError) as excinfo:
+        as_actor(lambda s: s.approve_and_start(context, first.campaign_id))
+    assert excinfo.value.code == "previews_incomplete"
+
+    # Stand in for the personalization worker finishing the sample.
+    su.execute(
+        "UPDATE public.personalization_previews SET state = 'OK', "
+        "subject = 'A quick idea for Acme', body_html = '<p>Hi Asha</p>', "
+        "completed_at = now() WHERE campaign_id = %s",
+        [first.campaign_id],
+    )
+    ready = as_actor(lambda s: s.samples(context, first.campaign_id))
+    assert ready.samples_status == "ready"
+    assert [(s.email_number, s.subject) for s in ready.samples] == [
+        (1, "A quick idea for Acme")
+    ]
+    assert ready.samples[0].recipient_first_name == "Asha"
+
+    started = RevenueOSCampaignStartOut(
+        status="started", campaign_id=first.campaign_id, campaign_status="RUNNING"
+    )
+    with patch.object(revenueos_approval, "RevenueOSStartService") as start:
+        start.return_value.start.return_value = started
+        result = as_actor(lambda s: s.approve_and_start(context, first.campaign_id))
+        # A repeat does not approve a second time.
+        as_actor(lambda s: s.approve_and_start(context, first.campaign_id))
+
+    assert result.status == "started"
+    assert start.return_value.start.call_count == 2
+    assert (
+        scalar(
+            su,
+            "SELECT count(*) FROM public.campaign_personalization_approvals "
+            "WHERE campaign_id = %s",
+            first.campaign_id,
+        )
+        == 1
+    )
+    assert (
+        as_actor(lambda s: s.samples(context, first.campaign_id)).approval_status
+        == "APPROVED"
     )
