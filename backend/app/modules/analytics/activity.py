@@ -35,7 +35,22 @@ _FEED_SQL = """
            COALESCE(m.frozen_destination, ra.canonical_address) AS email,
            CAST(e.lead_id AS TEXT) AS lead_id, CAST(m.id AS TEXT) AS message_id,
            m.content_subject AS subject, st.position AS step_position,
-           CAST(NULL AS TEXT) AS d1, CAST(NULL AS TEXT) AS d2,
+           CASE WHEN EXISTS (
+                    SELECT 1 FROM public.message_events oe
+                    WHERE oe.workspace_id = m.workspace_id
+                      AND oe.message_id = m.id AND oe.kind = 'OPENED'
+                      AND oe.qualified_at IS NOT NULL)
+                  OR EXISTS (
+                    SELECT 1 FROM public.inbound_outreach_links rl
+                    JOIN public.inbound_messages rim
+                      ON rim.workspace_id = rl.workspace_id
+                     AND rim.id = rl.inbound_message_id
+                    WHERE rl.workspace_id = m.workspace_id
+                      AND rl.outbound_message_id = m.id
+                      AND rl.status = 'CONFIRMED'
+                      AND COALESCE(rim.classification, 'HUMAN_REPLY') <> 'BOUNCE')
+                THEN 'DELIVERED' END AS d1,
+           CAST(NULL AS TEXT) AS d2,
            CAST(NULL AS TEXT) AS d3, CAST(NULL AS INTEGER) AS open_count
     FROM public.messages m
     LEFT JOIN public.campaign_enrollments e
@@ -237,6 +252,8 @@ def _like_pattern(term: str) -> str:
 def _detail(kind: str, status: str, row: Mapping[str, Any]) -> str | None:
     d1, d2, d3 = row["d1"], row["d2"], row["d3"]
     if kind == "SENT":
+        if d1 == "DELIVERED":
+            return "Delivered"
         return "Accepted by the mail provider. Delivery is not confirmed."
     if kind == "OPENED":
         count = int(row["open_count"] or 0)
