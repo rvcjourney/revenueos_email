@@ -30,6 +30,7 @@ from app.api.deps import WorkspaceContext, get_db
 from app.core.config import Settings
 from app.db.context import set_transaction_context
 from app.main import app
+from app.modules.analytics.activity import CampaignActivityService
 from app.modules.analytics.repository import AnalyticsRepository
 from app.modules.leads.activity import LeadActivityService
 from app.modules.mailboxes.providers.base import (
@@ -852,3 +853,64 @@ class TestBounceAssociation:
         bare = ProviderInboundMessage(**{**bare.__dict__, "report_text": "Final-Recipient: rfc822; lead0@target0.test\nAction: failed\nStatus: 5.1.1"})
         run_sync(session_factory, w, [page(bare)])
         assert su.execute("SELECT bounce_type, source FROM public.message_events WHERE message_id=%s", [w.message1_id]).fetchone() == ("HARD", "DSN_RECIPIENT")
+
+
+class TestCampaignActivityFeed:
+    """The campaign Activity feed, read back as the real app_api role."""
+
+    def test_feed_reads_every_source_under_rls_and_is_tenant_scoped(
+        self, session_factory, su, tracking_client
+    ):
+        w = seed_sent_world(su)
+        connect_mailbox(su, w)
+        token = open_token(w)
+        for _ in range(3):
+            assert tracking_client.get(
+                f"/api/v1/t/o/{token}.gif", headers={"User-Agent": HUMAN_UA}
+            ).status_code == 200
+        result, _ = run_sync(session_factory, w, [page(reply_message())])
+        assert result.status == "CURRENT", result.error
+        su.execute(
+            "INSERT INTO public.recipient_outcomes (workspace_id, enrollment_id, kind, source_key, occurred_at) "
+            "VALUES (%s,%s,'UNSUBSCRIBED','tok-1',now())",
+            [w.ws, w.enrollment_id],
+        )
+
+        ctx = WorkspaceContext(user_id=w.owner, workspace_id=w.ws, role_code="OWNER")
+        with session_factory() as session:
+            as_api(session, w)
+            feed = CampaignActivityService(session).get_activity(ctx, w.campaign_id, limit=100)
+        by_type = {i.type.value: i for i in feed.items}
+        assert {"SENT", "OPENED", "REPLIED", "UNSUBSCRIBED"} <= set(by_type)
+        assert len([i for i in feed.items if i.type.value == "OPENED"]) == 1
+        assert by_type["OPENED"].open_count == 3
+        assert by_type["SENT"].recipient_email == "lead0@target0.test"
+        assert by_type["REPLIED"].lead_id == w.lead_ids[0]
+        assert feed.counts_by_type is not None and feed.counts_by_type["OPENED"] == 1
+        times = [i.occurred_at for i in feed.items]
+        assert times == sorted(times, reverse=True)
+
+        # Filters, search and keyset paging run on Postgres too.
+        with session_factory() as session:
+            as_api(session, w)
+            service = CampaignActivityService(session)
+            first = service.get_activity(ctx, w.campaign_id, limit=2, q="LEAD0@")
+            assert first.has_more and first.next_cursor
+            rest = service.get_activity(ctx, w.campaign_id, limit=2, q="lead0@", cursor=first.next_cursor)
+            ids = [i.id for i in first.items + rest.items]
+            assert len(ids) == len(set(ids))
+            assert service.get_activity(ctx, w.campaign_id, q="nobody@").items == []
+
+    def test_other_tenants_campaign_is_not_found_and_not_listed(self, session_factory, su):
+        w = seed_sent_world(su)
+        other = seed_sent_world(su)
+        from app.core.errors import AppError
+
+        with session_factory() as session:
+            as_api(session, other, user=other.owner)
+            ctx = WorkspaceContext(user_id=other.owner, workspace_id=other.ws, role_code="OWNER")
+            with pytest.raises(AppError) as exc:
+                CampaignActivityService(session).get_activity(ctx, w.campaign_id)
+            assert exc.value.status_code == 404
+            own = CampaignActivityService(session).get_activity(ctx, other.campaign_id, limit=100)
+        assert all(i.message_id != w.message1_id for i in own.items)

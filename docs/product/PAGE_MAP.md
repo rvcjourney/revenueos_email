@@ -1164,6 +1164,25 @@ Analytics answers:
 
 > How did the campaign perform?
 
+## Implemented scope
+
+The Activity tab follows Analytics. It is a read-only, newest-first feed built from
+persisted facts (`GET .../analytics/campaigns/{campaign_id}/activity`), with type,
+status, date-range and recipient/subject search filters and cursor pagination.
+
+Included: sent, opened (one entry per email with its open count; automated hits
+excluded), bounced, replied (confirmed matches only), unsubscribed, spam complaints
+and send failures (including emails waiting to retry).
+
+Not included:
+
+- Link clicks are not tracked, so there is no click entry.
+- Providers do not confirm delivery, so there is no delivered entry.
+- An unsubscribe that arrives after the recipient's enrollment already ended is not
+  attributed to the campaign.
+- The campaign lifecycle entries listed above (created, paused, resumed, completed)
+  are not part of this feed.
+
 ---
 
 # 40. `/app/campaigns/[campaign_id]/analytics`

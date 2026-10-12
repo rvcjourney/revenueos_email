@@ -51,6 +51,7 @@ describe("Campaign shell", () => {
     expect(await tabLabels()).toEqual([
       "Overview",
       "Analytics",
+      "Activity",
       "Audience",
       "Sequence",
       "Senders",
@@ -66,6 +67,7 @@ describe("Campaign shell", () => {
     expect(await tabLabels()).toEqual([
       "Overview",
       "Analytics",
+      "Activity",
       "Audience",
       "Sequence",
       "Senders",

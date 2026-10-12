@@ -18,6 +18,7 @@ import { useWorkspace } from "@/lib/workspace-context";
 const TABS: { href: string; label: string }[] = [
   { href: "overview", label: "Overview" },
   { href: "analytics", label: "Analytics" },
+  { href: "activity", label: "Activity" },
   { href: "audience", label: "Audience" },
   { href: "sequence", label: "Sequence" },
   { href: "senders", label: "Senders" },
