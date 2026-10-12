@@ -495,3 +495,142 @@ describe("CampaignSequencePage for a hyper-personalized campaign", () => {
     expect(api.addSequenceStep.mock.calls[0][2].email_subject).toBe("New email");
   });
 });
+
+describe("CampaignSequencePage while the campaign is paused (ADR-0020)", () => {
+  function pausedSequence(allowed: boolean, lockedThrough = 1) {
+    return {
+      ...threeEmails(),
+      status: "FROZEN",
+      paused_edit_allowed: allowed,
+      structure_locked_through: lockedThrough,
+      steps: threeEmails().steps.map((step) =>
+        step.kind === "EMAIL"
+          ? { ...step, sent_count: step.id === "e1" ? 4 : 0, unsent_count: step.id === "e1" ? 6 : 0 }
+          : step,
+      ),
+    };
+  }
+
+  beforeEach(() => {
+    api.getCampaign.mockResolvedValue({ id: "camp-1", status: "PAUSED", version: 3 });
+  });
+
+  it("lets a manager edit emails, and explains that only unsent emails change", async () => {
+    mockWorkspace("MANAGER");
+    api.getSequence.mockResolvedValue(pausedSequence(true));
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByText(/changes apply to emails that haven't been sent yet/i)).toBeVisible();
+    const first = screen.getByRole("article", { name: "Step 1: Email" });
+    expect(within(first).getByRole("button", { name: /edit/i })).toBeInTheDocument();
+    expect(within(first).getByText(/Sent to 4 leads/)).toHaveTextContent("6 waiting");
+
+    await user.click(within(first).getByRole("button", { name: /edit/i }));
+    expect(await screen.findByRole("dialog", { name: /step editor/i })).toHaveTextContent("editable");
+  });
+
+  it("keeps the place of every step a lead has already reached", async () => {
+    mockWorkspace("MANAGER");
+    api.getSequence.mockResolvedValue(pausedSequence(true, 1));
+    renderPage();
+    await screen.findByRole("article", { name: "Step 1: Email" });
+
+    // Step 1 was reached: it can be rewritten but not removed or moved.
+    expect(screen.getByRole("button", { name: "Delete step 1" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Move step 1 down" })).toBeDisabled();
+    // Steps after it are free.
+    expect(screen.getByRole("button", { name: "Delete step 2" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete step 3" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Move step 3 up" })).toBeEnabled();
+    // Step 2 cannot move up into step 1's place.
+    expect(screen.getByRole("button", { name: "Move step 2 up" })).toBeDisabled();
+    // New steps can still be appended or inserted after the last reached step.
+    expect(screen.getByRole("button", { name: /^add step$/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Insert a step after step 1" })).toBeInTheDocument();
+  });
+
+  it("is read-only for someone who may not run campaigns", async () => {
+    mockWorkspace("MEMBER");
+    api.getSequence.mockResolvedValue(pausedSequence(false));
+    renderPage();
+
+    expect(await screen.findByText(/campaign is paused, so its sequence is read-only/i)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^add step$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /delete step/i })).not.toBeInTheDocument();
+  });
+
+  describe("when the campaign is personalized", () => {
+    function hyperSequence() {
+      return {
+        ...threeEmails(),
+        status: "FROZEN",
+        paused_edit_allowed: true,
+        structure_locked_through: 1,
+        steps: threeEmails().steps.map((step) =>
+          step.kind === "EMAIL"
+            ? {
+                ...step,
+                written_count: step.id === "e1" ? 5 : 0,
+                unwritten_count: step.id === "e1" ? 0 : 3,
+              }
+            : step,
+        ),
+      };
+    }
+
+    beforeEach(() => {
+      api.getCampaign.mockResolvedValue({
+        id: "camp-1",
+        status: "PAUSED",
+        version: 3,
+        campaign_type: "HYPER_PERSONALIZED",
+      });
+    });
+
+    it("opens only references that have not been written, and locks the structure", async () => {
+      mockWorkspace("MANAGER");
+      api.getSequence.mockResolvedValue(hyperSequence());
+      const user = userEvent.setup();
+      renderPage();
+
+      expect(await screen.findByText(/versions already written, the waits and the order of steps can't change/i)).toBeVisible();
+      const first = screen.getByRole("article", { name: "Step 1: Email" });
+      const second = screen.getByRole("article", { name: "Step 2: Email" });
+      expect(within(first).getByText(/5 personalized emails already written/)).toBeVisible();
+      expect(within(first).getByRole("button", { name: /view/i })).toBeInTheDocument();
+      expect(within(second).getByText(/3 will be written from this version/)).toBeVisible();
+      expect(within(second).getByRole("button", { name: /edit/i })).toBeInTheDocument();
+
+      // Nothing structural is offered.
+      expect(screen.queryByRole("button", { name: /^add step$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /delete step/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /move step/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /duplicate step/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /insert a step/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /edit wait/i })).not.toBeInTheDocument();
+
+      await user.click(within(second).getByRole("button", { name: /edit/i }));
+      expect(await screen.findByRole("dialog", { name: /step editor/i })).toHaveTextContent("editable");
+    });
+
+    it("shows a written step read-only", async () => {
+      mockWorkspace("MANAGER");
+      api.getSequence.mockResolvedValue(hyperSequence());
+      const user = userEvent.setup();
+      renderPage();
+      const first = await screen.findByRole("article", { name: "Step 1: Email" });
+      await user.click(within(first).getByRole("button", { name: /view/i }));
+      expect(await screen.findByRole("dialog", { name: /step editor/i })).toHaveTextContent("read-only");
+    });
+  });
+
+  it("tells a running campaign's editor to pause first", async () => {
+    mockWorkspace("MANAGER");
+    api.getCampaign.mockResolvedValue({ id: "camp-1", status: "RUNNING", version: 3 });
+    api.getSequence.mockResolvedValue({ ...pausedSequence(false), paused_edit_allowed: false });
+    renderPage();
+
+    expect(await screen.findByText(/Pause it to edit emails that haven't been sent/i)).toBeVisible();
+  });
+});

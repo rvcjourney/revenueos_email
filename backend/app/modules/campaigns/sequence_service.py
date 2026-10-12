@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import WorkspaceContext
 from app.core.errors import AppError
+from app.core.permissions import has_permission
 from app.modules.campaigns.attachment_service import to_attachment_out
 from app.modules.campaigns.attachments import extract_cid_references
 from app.modules.campaigns.repository import CampaignRepository
@@ -50,26 +51,114 @@ def _normalize_preheader(preheader: str | None) -> str | None:
     return cleaned
 
 
+def describe_sequence_problem(steps: Any) -> str | None:
+    """Why a sequence cannot run, or None. The rules preflight applies at
+    activation that edits can break: it starts and ends with an email, emails
+    and waits alternate, every email has a subject."""
+    ordered = sorted(steps, key=lambda step: step["position"])
+    if not ordered:
+        return "A campaign needs at least one email"
+    if [step["position"] for step in ordered] != list(range(1, len(ordered) + 1)):
+        return "Step positions are not contiguous"
+    for index, step in enumerate(ordered):
+        expected = "EMAIL" if index % 2 == 0 else "WAIT"
+        if step["kind"] != expected:
+            return "Emails and waits must alternate, starting and ending with an email"
+        if step["kind"] == "EMAIL" and not (step["email_subject"] or "").strip():
+            return "Every email needs a subject"
+    if ordered[-1]["kind"] != "EMAIL":
+        return "Emails and waits must alternate, starting and ending with an email"
+    return None
+
+
 class SequenceService:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.repo = CampaignRepository(session)
 
-    def _require_draft_campaign(
+    def _require_editable_campaign(
         self, context: WorkspaceContext, campaign_id: UUID
-    ) -> RowMapping:
+    ) -> tuple[RowMapping, bool]:
+        """(campaign, paused_edit). DRAFT is edited as always. An activated,
+        PAUSED campaign may be edited by campaigns.execute holders (ADR-0020); every
+        other state is frozen. A personalized campaign allows far less: callers
+        reject structure changes with `_refuse_hyper_structure`, and a step may only
+        be edited while none of its emails has been written."""
         campaign = self.repo.get_campaign(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
         if campaign is None:
             raise AppError("not_found", "Campaign not found", status_code=404)
-        if campaign["status"] != "DRAFT":
-            raise AppError(
-                "state_conflict",
-                "Sequence can only be edited while the campaign is DRAFT",
-                status_code=409,
+        if campaign["status"] == "DRAFT":
+            return campaign, False
+        if campaign["status"] == "PAUSED" and campaign["activation_id"] is not None:
+            if not has_permission(context.role_code, "campaigns.execute"):
+                raise AppError(
+                    "forbidden",
+                    "Only a manager can edit the emails of a paused campaign",
+                    status_code=403,
+                )
+            return campaign, True
+        raise AppError(
+            "state_conflict",
+            "Sequence can only be edited while the campaign is DRAFT or paused",
+            status_code=409,
+        )
+
+    @staticmethod
+    def _is_hyper(campaign: RowMapping) -> bool:
+        return campaign.get("campaign_type") == "HYPER_PERSONALIZED"
+
+    def _refuse_hyper_structure(self, campaign: RowMapping, paused: bool) -> None:
+        """A personalized campaign writes every email from its step's reference just
+        before sending, so adding, removing, reordering or re-timing steps would
+        change who gets what. Only the wording of an unwritten reference may change."""
+        if paused and self._is_hyper(campaign):
+            raise self._locked(
+                "Steps of a personalized campaign can't be added, removed, "
+                "reordered or re-timed once it has started. You can still improve "
+                "the wording of an email that hasn't been written yet."
             )
-        return campaign
+
+    def _sequence_frontier(self, context: WorkspaceContext, sequence_id: UUID) -> int:
+        return self.repo.get_sequence_frontier(
+            workspace_id=context.workspace_id, sequence_id=sequence_id
+        )
+
+    @staticmethod
+    def _locked(message: str) -> AppError:
+        return AppError("step_locked", message, status_code=409)
+
+    def _finish_paused_edit(
+        self,
+        context: WorkspaceContext,
+        campaign_id: UUID,
+        sequence_id: UUID,
+        *,
+        operation: str,
+        step_id: UUID | None = None,
+        fields: list[str] | None = None,
+    ) -> None:
+        """After an edit to a frozen sequence: prove the result is still a valid
+        Email/Wait sequence (raising rolls the whole request back), then audit.
+        Ids and field names only -- never content."""
+        steps = self.repo.list_steps_ordered(
+            workspace_id=context.workspace_id, sequence_id=sequence_id
+        )
+        problem = describe_sequence_problem(steps)
+        if problem is not None:
+            raise AppError("sequence_invalid", problem, status_code=422)
+        self.repo.record_campaign_audit(
+            workspace_id=context.workspace_id,
+            actor_id=context.user_id,
+            action="campaign.sequence_edited_while_paused",
+            campaign_id=campaign_id,
+            after_state={
+                "operation": operation,
+                "step_id": str(step_id) if step_id else None,
+                "fields": fields or [],
+            },
+        )
 
     @staticmethod
     def _sanitizer_profile(
@@ -176,7 +265,7 @@ class SequenceService:
         return subject.strip(), clean_body, clean_preheader, variable_schema
 
     def get_sequence(self, context: WorkspaceContext, campaign_id: UUID) -> SequenceOut:
-        self._require_campaign(context, campaign_id)
+        campaign = self._require_campaign(context, campaign_id)
         sequence = self.repo.get_sequence(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
@@ -196,15 +285,39 @@ class SequenceService:
             workspace_id=context.workspace_id, sequence_id=UUID(str(sequence["id"]))
         ):
             by_step.setdefault(str(attachment["step_id"]), []).append(attachment)
+        activated = campaign["activation_id"] is not None
+        # Only the paused editor shows sent/unsent counts and the frontier, and both
+        # walk the campaign's messages -- do not pay that on every page load of a
+        # running campaign that may hold hundreds of thousands of them.
+        paused = activated and campaign["status"] == "PAUSED"
+        counts = (
+            self.repo.count_step_messages(
+                workspace_id=context.workspace_id, campaign_id=campaign_id
+            )
+            if paused
+            else {}
+        )
         return SequenceOut(
             id=sequence["id"],
             campaign_id=sequence["campaign_id"],
             revision=sequence["revision"],
             status=sequence["status"],
             steps=[
-                self._to_step_out(row, by_step.get(str(row["id"]), []))
+                self._to_step_out(
+                    row, by_step.get(str(row["id"]), []), counts.get(str(row["id"]))
+                )
                 for row in steps
             ],
+            paused_edit_allowed=(
+                campaign["status"] == "PAUSED"
+                and activated
+                and has_permission(context.role_code, "campaigns.execute")
+            ),
+            structure_locked_through=(
+                self._sequence_frontier(context, UUID(str(sequence["id"])))
+                if paused
+                else 0
+            ),
         )
 
     def list_preview_recipients(
@@ -284,8 +397,20 @@ class SequenceService:
         campaign_id: UUID,
         payload: SequenceStepCreateIn,
     ) -> SequenceStepOut:
-        campaign = self._require_draft_campaign(context, campaign_id)
+        campaign, paused = self._require_editable_campaign(context, campaign_id)
+        self._refuse_hyper_structure(campaign, paused)
         sequence = self._ensure_sequence(context, campaign_id)
+        if paused:
+            existing_steps = self.repo.list_steps_ordered(
+                workspace_id=context.workspace_id,
+                sequence_id=UUID(str(sequence["id"])),
+            )
+            target = max(1, min(payload.position, len(existing_steps) + 1))
+            if target <= self._sequence_frontier(context, UUID(str(sequence["id"]))):
+                raise self._locked(
+                    "Leads have already reached that part of the sequence. Add "
+                    "the new email after the last step they have received."
+                )
 
         if payload.kind == "EMAIL":
             if payload.wait_duration_minutes is not None:
@@ -369,6 +494,14 @@ class SequenceService:
                 wait_duration_minutes=payload.wait_duration_minutes,
                 source_template_version_id=None,
             )
+        if paused:
+            self._finish_paused_edit(
+                context,
+                campaign_id,
+                UUID(str(sequence["id"])),
+                operation="add_step",
+                step_id=UUID(str(row["id"])),
+            )
         return self._to_step_out(row)
 
     def update_step(
@@ -378,12 +511,14 @@ class SequenceService:
         step_id: UUID,
         payload: SequenceStepUpdateIn,
     ) -> SequenceStepOut:
-        campaign = self._require_draft_campaign(context, campaign_id)
+        campaign, paused = self._require_editable_campaign(context, campaign_id)
         existing = self.repo.get_step(
             workspace_id=context.workspace_id, step_id=step_id
         )
         if existing is None or str(existing["campaign_id"]) != str(campaign_id):
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        if paused and self._is_hyper(campaign):
+            self._require_unwritten_reference(context, existing, payload)
 
         if existing["kind"] == "EMAIL":
             content_changing = (
@@ -474,6 +609,15 @@ class SequenceService:
             )
         if row is None:
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        if paused:
+            self._finish_paused_edit(
+                context,
+                campaign_id,
+                UUID(str(existing["sequence_id"])),
+                operation="update_step",
+                step_id=step_id,
+                fields=sorted(payload.model_fields_set - {"expected_version"}),
+            )
         return self._to_step_out(
             row,
             self.repo.list_step_attachments(
@@ -492,12 +636,24 @@ class SequenceService:
         """Delete a step. With `with_adjacent_wait`, deleting an EMAIL step also
         removes the WAIT before it (or the one after it when it is first), in the
         same transaction, so Email/Wait alternation is not left broken."""
-        self._require_draft_campaign(context, campaign_id)
+        campaign, paused = self._require_editable_campaign(context, campaign_id)
+        self._refuse_hyper_structure(campaign, paused)
         sequence = self.repo.get_sequence(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
         if sequence is None:
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        frontier = 0
+        if paused:
+            frontier = self._sequence_frontier(context, UUID(str(sequence["id"])))
+            doomed = self.repo.get_step(
+                workspace_id=context.workspace_id, step_id=step_id
+            )
+            if doomed is not None and doomed["position"] <= frontier:
+                raise self._locked(
+                    "Leads have already received this email, so it can't be "
+                    "removed. Edit it instead."
+                )
         if with_adjacent_wait:
             steps = self.repo.list_steps_ordered(
                 workspace_id=context.workspace_id,
@@ -513,6 +669,11 @@ class SequenceService:
                 elif index + 1 < len(steps) and steps[index + 1]["kind"] == "WAIT":
                     neighbour = steps[index + 1]
                 if neighbour is not None:
+                    if paused and neighbour["position"] <= frontier:
+                        raise self._locked(
+                            "The wait before this email belongs to steps leads "
+                            "have already reached, so it can't be removed."
+                        )
                     self.repo.delete_step(
                         workspace_id=context.workspace_id,
                         sequence_id=UUID(str(sequence["id"])),
@@ -525,6 +686,14 @@ class SequenceService:
         )
         if not deleted:
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        if paused:
+            self._finish_paused_edit(
+                context,
+                campaign_id,
+                UUID(str(sequence["id"])),
+                operation="delete_step",
+                step_id=step_id,
+            )
 
     def duplicate_step(
         self, context: WorkspaceContext, campaign_id: UUID, step_id: UUID
@@ -537,7 +706,8 @@ class SequenceService:
         inserts run in the request transaction, so they commit or roll back
         together.
         """
-        self._require_draft_campaign(context, campaign_id)
+        campaign, paused = self._require_editable_campaign(context, campaign_id)
+        self._refuse_hyper_structure(campaign, paused)
         source = self.repo.get_step(workspace_id=context.workspace_id, step_id=step_id)
         if source is None or str(source["campaign_id"]) != str(campaign_id):
             raise AppError("not_found", "Sequence step not found", status_code=404)
@@ -549,6 +719,14 @@ class SequenceService:
             )
 
         sequence_id = UUID(str(source["sequence_id"]))
+        if paused and source["position"] < self._sequence_frontier(
+            context, sequence_id
+        ):
+            raise self._locked(
+                "Leads have already moved past this email, so a copy can't be "
+                "inserted after it. Duplicate the last email they received, or "
+                "a later one."
+            )
         steps = self.repo.list_steps_ordered(
             workspace_id=context.workspace_id, sequence_id=sequence_id
         )
@@ -595,6 +773,14 @@ class SequenceService:
             to_sequence_id=sequence_id,
             to_step_id=UUID(str(copy["id"])),
         )
+        if paused:
+            self._finish_paused_edit(
+                context,
+                campaign_id,
+                sequence_id,
+                operation="duplicate_step",
+                step_id=UUID(str(copy["id"])),
+            )
         return self.get_sequence(context, campaign_id)
 
     def reorder_steps(
@@ -603,7 +789,8 @@ class SequenceService:
         campaign_id: UUID,
         payload: SequenceStepsReorderIn,
     ) -> SequenceOut:
-        self._require_draft_campaign(context, campaign_id)
+        campaign, paused = self._require_editable_campaign(context, campaign_id)
+        self._refuse_hyper_structure(campaign, paused)
         sequence = self.repo.get_sequence(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
@@ -632,13 +819,60 @@ class SequenceService:
                 status_code=422,
             )
 
+        if paused:
+            frontier = self._sequence_frontier(context, sequence_id)
+            current = {str(row["id"]): row["position"] for row in existing}
+            for entry in payload.steps:
+                old = current[str(entry.step_id)]
+                if entry.position != old and (
+                    old <= frontier or entry.position <= frontier
+                ):
+                    raise self._locked(
+                        "Leads have already reached the first "
+                        f"{frontier} steps, so those can't be moved. You can "
+                        "reorder the steps after them."
+                    )
+
         ordering = [(entry.step_id, entry.position) for entry in payload.steps]
         self.repo.reorder_steps(
             workspace_id=context.workspace_id,
             sequence_id=sequence_id,
             ordering=ordering,
         )
+        if paused:
+            self._finish_paused_edit(
+                context, campaign_id, sequence_id, operation="reorder_steps"
+            )
         return self.get_sequence(context, campaign_id)
+
+    def _require_unwritten_reference(
+        self,
+        context: WorkspaceContext,
+        step: RowMapping,
+        payload: SequenceStepUpdateIn,
+    ) -> None:
+        """Paused personalized campaign: only an EMAIL step's wording, and only while
+        none of its emails has been written (the database guard enforces the same)."""
+        if step["kind"] != "EMAIL" or payload.wait_duration_minutes is not None:
+            raise self._locked(
+                "Waits of a personalized campaign can't be changed once it has started."
+            )
+        if self.repo.count_written_step_messages(
+            workspace_id=context.workspace_id, step_id=UUID(str(step["id"]))
+        ):
+            raise self._locked(
+                "Emails for this step have already been written, so its wording "
+                "can't change. Steps whose emails haven't been written yet can "
+                "still be edited."
+            )
+        body = payload.email_body_html
+        if body is not None and extract_cid_references(body):
+            raise AppError(
+                "reference_inline_image_unsupported",
+                "Inline images can't be used in the reference email of a "
+                "personalized campaign.",
+                status_code=422,
+            )
 
     def _validate_cid_references(
         self, context: WorkspaceContext, step_id: UUID | None, body_html: str | None
@@ -667,7 +901,10 @@ class SequenceService:
             )
 
     def _to_step_out(
-        self, row: RowMapping, attachments: Any = ()
+        self,
+        row: RowMapping,
+        attachments: Any = (),
+        counts: tuple[int, int, int, int] | None = None,
     ) -> SequenceStepOut:
         return SequenceStepOut(
             id=row["id"],
@@ -682,6 +919,10 @@ class SequenceService:
             email_variable_schema=row["email_variable_schema"],
             wait_duration_minutes=row["wait_duration_minutes"],
             source_template_version_id=row["source_template_version_id"],
+            sent_count=counts[0] if counts else 0,
+            unsent_count=counts[1] if counts else 0,
+            written_count=counts[2] if counts else 0,
+            unwritten_count=counts[3] if counts else 0,
             version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

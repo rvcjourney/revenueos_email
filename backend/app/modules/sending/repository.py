@@ -85,7 +85,8 @@ class SendingRepository:
                    mailbox_id, address_id, status, dispatch_generation, version,
                    retry_count, retry_budget, content_subject, content_body_html,
                    content_digest, renderer_version, rendered_at, frozen_destination,
-                   frozen_sender_address, frozen_sender_name, rfc_message_id, step_id
+                   frozen_sender_address, frozen_sender_name, rfc_message_id, step_id,
+                   schedule_generation
             FROM public.messages
             WHERE workspace_id = :ws AND id = :mid
             {lock_clause}
@@ -105,12 +106,14 @@ class SendingRepository:
 
         campaign_status = None
         campaign_planning_status = None
+        campaign_schedule_generation = None
         if msg["purpose"] == "CAMPAIGN" and msg["campaign_id"] is not None:
             camp = (
                 self.session.execute(
                     text(
                         f"""
-                    SELECT status, planning_status FROM public.campaigns
+                    SELECT status, planning_status, schedule_generation
+                    FROM public.campaigns
                     WHERE workspace_id = :ws AND id = :cid
                     {plain_lock_clause}
                     """
@@ -123,6 +126,7 @@ class SendingRepository:
             if camp:
                 campaign_status = camp["status"]
                 campaign_planning_status = camp["planning_status"]
+                campaign_schedule_generation = camp["schedule_generation"]
 
         enrollment_state = None
         if msg["purpose"] == "CAMPAIGN" and msg["enrollment_id"] is not None:
@@ -222,6 +226,8 @@ class SendingRepository:
             mailbox_original_address=mailbox["original_address"],
             mailbox_sender_display_name=mailbox["sender_display_name"],
             mailbox_pending_safety_count=int(mailbox.get("pending_safety_count", 0)),
+            message_schedule_generation=msg["schedule_generation"],
+            campaign_schedule_generation=campaign_schedule_generation,
             raw=dict(msg),
         )
 

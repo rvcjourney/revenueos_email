@@ -113,10 +113,17 @@ export default function CampaignSequencePage() {
   const sequence = sequenceQuery.data;
   const steps = sequence?.steps ?? [];
   const campaignStatus = campaignQuery.data?.status;
-  // Editing is allowed only while the campaign is a DRAFT (the server enforces
-  // this too and answers state_conflict otherwise).
-  const readOnly =
-    !mayDraft || campaignStatus !== "DRAFT" || sequence?.status === "FROZEN";
+  // Editing is allowed while the campaign is a DRAFT, or -- for a manager of a
+  // paused standard campaign -- once the server says so (ADR-0020). The server
+  // enforces both and answers state_conflict / forbidden otherwise.
+  const pausedEdit = campaignStatus === "PAUSED" && sequence?.paused_edit_allowed === true;
+  const lockedThrough = pausedEdit ? (sequence?.structure_locked_through ?? 0) : 0;
+  // A paused personalized campaign opens only the wording of references nobody has
+  // been sent a written version of; the rest of its setup and structure stay frozen.
+  const pausedHyper = pausedEdit && isHyper;
+  const readOnly = pausedEdit
+    ? false
+    : !mayDraft || campaignStatus !== "DRAFT" || sequence?.status === "FROZEN";
   const latestSettings = settingsQuery.data?.length
     ? settingsQuery.data.reduce((a, b) => (b.revision > a.revision ? b : a))
     : null;
@@ -255,7 +262,7 @@ export default function CampaignSequencePage() {
         day={timings.get(openStep.id)?.day ?? 1}
         previousEmailDay={previousEmail ? (timings.get(previousEmail.id)?.day ?? 1) : null}
         precedingWait={precedingWait}
-        readOnly={readOnly}
+        readOnly={readOnly || (pausedHyper && (openStep.written_count ?? 0) > 0)}
         canTestSend={canExecuteCampaign(activeWorkspace?.role_code)}
         referenceMode={isHyper}
         designedEmail={designedEmail}
@@ -285,10 +292,27 @@ export default function CampaignSequencePage() {
         </p>
       </div>
 
-      {readOnly && campaignStatus && campaignStatus !== "DRAFT" ? (
+      {pausedHyper ? (
         <Alert variant="info">
-          This campaign is {campaignStatus.toLowerCase()}, so its sequence is read-only. Duplicate
-          the campaign to make changes.
+          This campaign is paused. You can improve the wording of an email whose personalized
+          versions haven&apos;t been written yet; versions already written, the waits and the
+          order of steps can&apos;t change. Edits take effect when you resume.
+        </Alert>
+      ) : pausedEdit ? (
+        <Alert variant="info">
+          This campaign is paused. Changes apply to emails that haven&apos;t been sent yet; a lead
+          who already received an email keeps it. Emails after the last one any lead has received
+          can be added, moved or removed. Edits take effect when you resume.
+        </Alert>
+      ) : readOnly && campaignStatus && campaignStatus !== "DRAFT" ? (
+        <Alert variant="info">
+          {campaignStatus === "PAUSED" && isHyper
+            ? "Only a manager can edit the emails of a paused personalized campaign. Duplicate the campaign to make larger changes."
+            : `This campaign is ${campaignStatus.toLowerCase()}, so its sequence is read-only. ${
+                campaignStatus === "RUNNING" || campaignStatus === "SCHEDULED"
+                  ? "Pause it to edit emails that haven't been sent, or duplicate it to make a new version."
+                  : "Duplicate the campaign to make changes."
+              }`}
         </Alert>
       ) : null}
       {actionError ? <Alert variant="error">{actionError}</Alert> : null}
@@ -332,7 +356,7 @@ export default function CampaignSequencePage() {
           workspaceId={activeWorkspaceId ?? ""}
           campaignId={campaignId}
           state={personalizationState}
-          readOnly={readOnly}
+          readOnly={readOnly || pausedHyper}
           aiAvailable={aiAvailable}
           saving={personalization.saveMutation.isPending}
           saveError={personalization.saveError}
@@ -342,7 +366,7 @@ export default function CampaignSequencePage() {
       {isHyper ? (
         <AiDraftBar
           emailCount={emailSteps.length}
-          readOnly={readOnly}
+          readOnly={readOnly || pausedHyper}
           hasObjective={Boolean(personalizationState?.config)}
           aiAvailable={aiAvailable}
           generation={generation}
@@ -374,6 +398,8 @@ export default function CampaignSequencePage() {
           busy={busy}
           scheduleNote={describeSchedule(latestSettings)}
           savingWaitId={savingWaitId}
+          lockedThrough={lockedThrough}
+          referenceOnly={pausedHyper}
           onOpenEmail={(step) => setOpenStepId(step.id)}
           onDuplicate={(step) => duplicateMutation.mutate(step)}
           onDelete={onDelete}
@@ -386,7 +412,7 @@ export default function CampaignSequencePage() {
             addMutation.mutate({ position: steps.length + 1, withWait: steps.length > 0 })
           }
           onRegenerateEmail={
-            isHyper && aiAvailable && personalizationState?.config
+            isHyper && !pausedHyper && aiAvailable && personalizationState?.config
               ? (step, number) => setRegenerateTarget({ id: step.id, number })
               : undefined
           }

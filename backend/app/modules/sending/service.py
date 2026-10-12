@@ -14,6 +14,7 @@ from app.core.config import Settings
 from app.core.crypto import decrypt_credentials, encrypt_credentials
 from app.core.errors import AppError
 from app.core.metrics import (
+    MetricsRegistry,
     record_ambiguous_outcome,
     record_auth_failure,
     record_duplicate_task_noop,
@@ -82,6 +83,9 @@ CREDENTIAL_REFRESH_SAFETY_MARGIN = timedelta(minutes=5)
 MIN_DEFERRAL = timedelta(seconds=30)
 MAX_DEFERRAL = timedelta(hours=24)
 SAFETY_HOLD_RETRY = timedelta(minutes=15)
+# Short: the reconcile pass (or its sweep) re-stamps the message within seconds
+# to minutes, and until then it is unclaimable anyway.
+STALE_GENERATION_RETRY = timedelta(minutes=1)
 DEFERRAL_JITTER_FRACTION = 0.1
 
 
@@ -165,6 +169,7 @@ class SendingService:
             )
         except (
             gates.CampaignStateRejected,
+            gates.StaleScheduleGeneration,
             gates.EnrollmentStateRejected,
             gates.MailboxStateRejected,
             gates.SafetyHoldRejected,
@@ -180,11 +185,32 @@ class SendingService:
                 # A held mailbox stays held until a person releases it: retry
                 # in 15 minutes instead of churning through claim leases.
                 self._hand_back(ctx, SAFETY_HOLD_RETRY)
+            elif isinstance(exc, gates.MailboxStateRejected):
+                # Disconnected, restricted, degraded, breaker open or in cooldown.
+                # Leaving it QUEUED would have the lease expire (5 minutes) and the
+                # scheduler claim it again at once -- a loop. Hand it back; the
+                # scheduler also stops claiming for a mailbox that cannot send.
+                self._hand_back(ctx, self._mailbox_retry_delay(ctx, exc))
+            elif isinstance(exc, gates.StaleScheduleGeneration):
+                # Claimed before a pause/resume: release it now (with a
+                # dispatch-generation bump) so the reconcile pass can re-time
+                # and re-stamp it, instead of waiting out the claim lease.
+                self._hand_back(ctx, STALE_GENERATION_RETRY)
             self.session.commit()
             logger.info(
                 "Send deferred (temporary gate rejection)",
                 extra={"message_id": str(message_id), "reason": exc.terminal_reason},
             )
+            if (
+                isinstance(exc, gates.CampaignStateRejected)
+                and ctx.campaign_status == "PAUSED"
+            ):
+                logger.info(
+                    "CAMPAIGN_EXECUTION_SKIPPED_PAUSED campaign=%s message=%s",
+                    ctx.campaign_id,
+                    message_id,
+                )
+                MetricsRegistry.get().increment("campaign_execution_skipped_paused_total")
             return SendOutcome(
                 message_id=message_id, outcome="DEFERRED", reason=exc.terminal_reason
             )
@@ -991,6 +1017,21 @@ class SendingService:
         return SendOutcome(
             message_id=ctx.message_id, outcome="SKIPPED", reason=terminal_reason
         )
+
+    @staticmethod
+    def _mailbox_retry_delay(
+        ctx: LoadedSendContext, exc: gates.MailboxStateRejected
+    ) -> timedelta:
+        """How long to leave a message alone after its mailbox refused it. A cooldown
+        has a known end (the same clamped, jittered wait a rate-limit hint gets);
+        anything else needs a person or a recovery, so wait as for a held mailbox."""
+        if exc.terminal_reason == "mailbox_blocked" and ctx.mailbox_blocked_until:
+            blocked_until = ctx.mailbox_blocked_until
+            if blocked_until.tzinfo is None:
+                blocked_until = blocked_until.replace(tzinfo=UTC)
+            seconds = (blocked_until - datetime.now(UTC)).total_seconds()
+            return deferral_delay(max(0.0, seconds))
+        return SAFETY_HOLD_RETRY
 
     def _hand_back(self, ctx: LoadedSendContext, delay: timedelta) -> None:
         """Return this claimed message to the scheduler, due after `delay`.

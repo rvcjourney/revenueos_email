@@ -6,6 +6,8 @@ No reopening COMPLETED/ARCHIVED; no activated audience/content mutation; RUNNING
 
 These decisions supersede corresponding proposals/Open Decisions below. Other release-policy decisions remain open.
 
+**Amended by [ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md):** pause and resume are idempotent (a repeat of an already-achieved state returns it unchanged), resume revalidates and fences unsent work with a `schedule_generation` bump, and PAUSED campaigns accept the edits listed in the ADR. COMPLETED/ARCHIVED campaigns still cannot resume.
+
 
 ## Purpose and authority
 
@@ -45,7 +47,7 @@ U = permission-checked user/domain command; S = system transition; F = classifie
 
 **Activate:** DRAFT, expected revision, current permission, complete audience capture, valid nonempty sequence, usable same-workspace senders, valid timezone/windows, no workspace restriction, and initial eligible recipients. Commit activation, state, planning job, event/outbox and audit atomically. Invalid preflight leaves DRAFT with validation response, not ERROR.
 
-**Due start:** SCHEDULED, database time at/after scheduled start, still authorized workspace execution and ready configuration. Planning may still be finishing; RUNNING alone does not permit sends until planning READY. Temporary dependency unavailability retains SCHEDULED with visible hold. Fatal configuration/invariant failure enters ERROR.
+**Due start** (implemented by the scheduler loop, ADR-0020): SCHEDULED, database time at/after scheduled start, still authorized workspace execution and ready configuration. The UPDATE is guarded on `status = 'SCHEDULED' AND start_at <= transaction_timestamp()`, so a pause that committed first wins; it writes a `campaign.start` audit row and dispatches the reconcile pass when the generation is above 1. Planning may still be finishing; RUNNING alone does not permit sends until planning READY. Temporary dependency unavailability retains SCHEDULED with visible hold. Fatal configuration/invariant failure enters ERROR.
 
 **Pause:** locks the campaign gate exclusively. Once committed, no new attempt may authorize against the prior status/version. Already SENDING or UNKNOWN_OUTCOME attempts remain tracked and may later become SENT. Pause response includes outstanding attempt count; it never promises recall. Pausing before initial start preserves that start time.
 

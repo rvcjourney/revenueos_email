@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -18,6 +19,47 @@ from app.core.errors import AppError
 # without ever setting position <= 0 (sequence_steps_position_check forbids
 # that even transiently -- CHECK constraints are not deferrable here).
 _POSITION_TEMP_OFFSET = 1_000_000
+
+
+_PAUSE_COLUMNS = ("paused_at", "paused_total_seconds", "last_resumed_at")
+# {"present": bool, "checked_at": float}. A positive answer is permanent for the
+# process; a negative one is re-checked so applying migration 0040 is noticed
+# without a restart.
+_pause_columns_cache: dict[str, Any] = {}
+_PAUSE_COLUMNS_RECHECK_SECONDS = 60.0
+
+
+def reset_pause_columns_cache() -> None:
+    _pause_columns_cache.clear()
+
+
+def campaigns_have_pause_columns(session: Session) -> bool:
+    """Whether migration 0040 is applied. Pause is the emergency stop, so it must
+    keep working on a database that has not been migrated yet: without the columns
+    pause/resume still change the status (and resume still bumps the generation);
+    they just do not record when. Uses the catalog, which every role can read."""
+    cached = _pause_columns_cache.get("present")
+    if cached is True:
+        return True
+    now = time.monotonic()
+    if cached is False and now - _pause_columns_cache.get("checked_at", 0.0) < (
+        _PAUSE_COLUMNS_RECHECK_SECONDS
+    ):
+        return False
+    present = (
+        session.execute(
+            text(
+                "SELECT count(*) FROM pg_catalog.pg_attribute a "
+                "WHERE a.attrelid = pg_catalog.to_regclass('public.campaigns') "
+                "AND a.attname = ANY(:names) AND NOT a.attisdropped"
+            ),
+            {"names": list(_PAUSE_COLUMNS)},
+        ).scalar()
+        == len(_PAUSE_COLUMNS)
+    )
+    _pause_columns_cache["present"] = present
+    _pause_columns_cache["checked_at"] = now
+    return present
 
 
 class CampaignRepository:
@@ -171,16 +213,33 @@ class CampaignRepository:
         description: str | None,
         description_provided: bool,
         actor_id: UUID,
+        may_edit_paused: bool = False,
     ) -> RowMapping | None:
+        # ADR-0020: a paused campaign's name/description may change, but the row
+        # policy only lets campaigns.execute update an activated campaign, and it
+        # would hide the row from FOR UPDATE (a misleading 404) -- so answer
+        # "forbidden" before locking.
+        peek = self.get_campaign(workspace_id=workspace_id, campaign_id=campaign_id)
+        if (
+            peek is not None
+            and peek["status"] == "PAUSED"
+            and peek["activation_id"] is not None
+            and not may_edit_paused
+        ):
+            raise AppError(
+                "forbidden",
+                "Only a manager can edit a paused campaign",
+                status_code=403,
+            )
         existing = self.get_campaign(
             workspace_id=workspace_id, campaign_id=campaign_id, for_update=True
         )
         if existing is None:
             return None
-        if existing["status"] not in ("DRAFT",):
+        if existing["status"] not in ("DRAFT", "PAUSED"):
             raise AppError(
                 "state_conflict",
-                "Only DRAFT campaigns can be edited",
+                "Only DRAFT or PAUSED campaigns can be edited",
                 status_code=409,
             )
         if existing["version"] != expected_version:
@@ -505,6 +564,77 @@ class CampaignRepository:
         )
         return list(rows)
 
+    def get_sequence_frontier(self, *, workspace_id: UUID, sequence_id: UUID) -> int:
+        """Highest step position any message or enrollment pointer already
+        references (0 when none). Mirrors the definition in
+        app_guard_frozen_sequence_steps (migration 0042), which is authoritative."""
+        value = self.session.execute(
+            text(
+                """
+                SELECT COALESCE(MAX(ss.position), 0)
+                FROM sequence_steps ss
+                WHERE ss.workspace_id = :workspace_id AND ss.sequence_id = :sequence_id
+                  AND (
+                      EXISTS (SELECT 1 FROM messages m
+                              WHERE m.workspace_id = ss.workspace_id
+                                AND m.step_id = ss.id)
+                      OR EXISTS (SELECT 1 FROM campaign_enrollments e
+                                 WHERE e.workspace_id = ss.workspace_id
+                                   AND e.next_step_id = ss.id)
+                  )
+                """
+            ),
+            {"workspace_id": str(workspace_id), "sequence_id": str(sequence_id)},
+        ).scalar()
+        return int(value or 0)
+
+    def count_step_messages(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> dict[str, tuple[int, int, int, int]]:
+        """step_id -> (sent, unsent, written, unwritten) campaign messages, for the
+        paused editor. "Written" = the email text exists (rendered_at set); for a
+        personalized campaign an unwritten message will be written from the step's
+        current reference, a written one never changes."""
+        rows = self.session.execute(
+            text(
+                """
+                SELECT step_id,
+                       count(*) FILTER (WHERE status = 'SENT') AS sent,
+                       count(*) FILTER (
+                           WHERE status IN ('PLANNED', 'SCHEDULED', 'RETRY_SCHEDULED')
+                       ) AS unsent,
+                       count(*) FILTER (WHERE rendered_at IS NOT NULL) AS written,
+                       count(*) FILTER (
+                           WHERE rendered_at IS NULL AND status = 'PLANNED'
+                       ) AS unwritten
+                FROM messages
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                  AND purpose = 'CAMPAIGN'
+                GROUP BY step_id
+                """
+            ),
+            {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+        ).all()
+        return {
+            str(r[0]): (int(r[1]), int(r[2]), int(r[3]), int(r[4])) for r in rows
+        }
+
+    def count_written_step_messages(
+        self, *, workspace_id: UUID, step_id: UUID
+    ) -> int:
+        """Messages of this step whose text has been written (rendered)."""
+        value = self.session.execute(
+            text(
+                """
+                SELECT count(*) FROM messages
+                WHERE workspace_id = :workspace_id AND step_id = :step_id
+                  AND rendered_at IS NOT NULL
+                """
+            ),
+            {"workspace_id": str(workspace_id), "step_id": str(step_id)},
+        ).scalar()
+        return int(value or 0)
+
     def get_step(
         self, *, workspace_id: UUID, step_id: UUID, for_update: bool = False
     ) -> RowMapping | None:
@@ -537,6 +667,35 @@ class CampaignRepository:
         sequence_id, position) unique constraint at any intermediate step,
         without ever needing position <= 0 (which the CHECK constraint
         forbids even transiently)."""
+        if not ordering:
+            return
+        # Rows that keep their position are left alone: touching them would bump
+        # their version for nothing and, on a paused campaign, trip the frontier
+        # guard on steps that leads have already reached.
+        current = {
+            str(row["id"]): row["position"]
+            for row in self.session.execute(
+                text(
+                    """
+                    SELECT id, position FROM sequence_steps
+                    WHERE workspace_id = :workspace_id AND sequence_id = :sequence_id
+                      AND id = ANY(:ids)
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "sequence_id": str(sequence_id),
+                    "ids": [str(step_id) for step_id, _ in ordering],
+                },
+            )
+            .mappings()
+            .all()
+        }
+        ordering = [
+            (step_id, position)
+            for step_id, position in ordering
+            if current.get(str(step_id)) != position
+        ]
         if not ordering:
             return
         ids = [str(step_id) for step_id, _ in ordering]
@@ -922,7 +1081,8 @@ class CampaignRepository:
                     SELECT cm.mailbox_id, cm.active, cm.allocation_position,
                            m.provider, m.original_address, m.sender_display_name,
                            m.connection_state, m.health_state, m.policy_state,
-                           m.policy_reason
+                           m.policy_reason, m.circuit_state, m.blocked_until,
+                           m.pending_safety_count
                     FROM campaign_mailboxes cm
                     JOIN mailboxes m
                       ON m.workspace_id = cm.workspace_id AND m.id = cm.mailbox_id
@@ -1132,6 +1292,7 @@ class CampaignRepository:
         workspace_id: UUID,
         campaign_id: UUID,
         selection_manifest: dict[str, Any],
+        kind: str = "ACTIVATION",
     ) -> RowMapping:
         next_revision = self.session.execute(
             text(
@@ -1144,18 +1305,23 @@ class CampaignRepository:
             {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
         ).scalar_one()
         audience_id = uuid.uuid4()
+        # The `kind` column exists from migration 0043. Only a SUPPLEMENT names it,
+        # so choosing an audience for an ordinary draft keeps working on a database
+        # that has not been migrated yet (the default is ACTIVATION).
+        kind_column = ", kind" if kind != "ACTIVATION" else ""
+        kind_value = ", :kind" if kind != "ACTIVATION" else ""
         row = (
             self.session.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO campaign_audiences
                         (id, workspace_id, campaign_id, revision, status,
-                         selection_manifest)
+                         selection_manifest{kind_column})
                     VALUES
                         (:id, :workspace_id, :campaign_id, :revision, 'CAPTURING',
-                         CAST(:selection_manifest AS jsonb))
+                         CAST(:selection_manifest AS jsonb){kind_value})
                     RETURNING *
-                    """
+                    """  # noqa: S608 -- both fragments are fixed constants above
                 ),
                 {
                     "id": str(audience_id),
@@ -1163,6 +1329,7 @@ class CampaignRepository:
                     "campaign_id": str(campaign_id),
                     "revision": next_revision,
                     "selection_manifest": json.dumps(selection_manifest),
+                    "kind": kind,
                 },
             )
             .mappings()
@@ -1665,7 +1832,56 @@ class CampaignRepository:
             )
         return row
 
-    def update_campaign_status(
+    def pause_campaign(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        expected_version: int,
+        actor_id: UUID,
+        previous_status: str,
+    ) -> RowMapping | None:
+        """Caller must already hold a FOR UPDATE lock and have validated that
+        the campaign is RUNNING/SCHEDULED. The status guard in the WHERE clause
+        is belt-and-braces: a no-row result means the state moved underneath."""
+        paused_at_sql = (
+            ", paused_at = COALESCE(paused_at, pg_catalog.transaction_timestamp())"
+            if campaigns_have_pause_columns(self.session)
+            else ""
+        )
+        row = (
+            self.session.execute(
+                text(
+                    f"""
+                    UPDATE campaigns
+                    SET status = 'PAUSED'{paused_at_sql}
+                    WHERE workspace_id = :workspace_id AND id = :campaign_id
+                      AND version = :expected_version
+                      AND status IN ('RUNNING', 'SCHEDULED')
+                    RETURNING *
+                    """  # noqa: S608 -- paused_at_sql is a fixed constant above
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "expected_version": expected_version,
+                },
+            )
+            .mappings()
+            .first()
+        )
+        if row is not None:
+            self._record_audit_event(
+                workspace_id=workspace_id,
+                actor_id=actor_id,
+                action="campaign.pause",
+                target_id=campaign_id,
+                before_state={"status": previous_status},
+                after_state={"status": "PAUSED"},
+            )
+        return row
+
+    def resume_campaign(
         self,
         *,
         workspace_id: UUID,
@@ -1673,21 +1889,42 @@ class CampaignRepository:
         expected_version: int,
         target_status: str,
         actor_id: UUID,
-        action: str,
     ) -> RowMapping | None:
-        """Caller must already hold a FOR UPDATE lock and have validated the
-        current status allows this transition -- mirrors activate_campaign's
-        version-only guard. Used by pause/resume."""
+        """Flip PAUSED -> RUNNING/SCHEDULED and bump schedule_generation in ONE
+        statement (ADR-0020). The bump is the resume fence: the scheduler only
+        claims messages whose schedule_generation equals the campaign's, so no
+        pre-existing unsent message can be claimed until the reconcile pass has
+        re-validated and re-stamped it. Caller holds the FOR UPDATE lock."""
+        pause_metadata_sql = (
+            """,
+                        paused_total_seconds = paused_total_seconds + COALESCE(
+                            GREATEST(
+                                pg_catalog.floor(pg_catalog.date_part(
+                                    'epoch',
+                                    pg_catalog.transaction_timestamp() - paused_at
+                                )),
+                                0
+                            )::bigint,
+                            0
+                        ),
+                        paused_at = NULL,
+                        last_resumed_at = pg_catalog.transaction_timestamp()"""
+            if campaigns_have_pause_columns(self.session)
+            else ""
+        )
         row = (
             self.session.execute(
                 text(
-                    """
+                    f"""
                     UPDATE campaigns
-                    SET status = :target_status
+                    SET status = :target_status,
+                        schedule_generation = schedule_generation + 1
+                        {pause_metadata_sql}
                     WHERE workspace_id = :workspace_id AND id = :campaign_id
                       AND version = :expected_version
+                      AND status = 'PAUSED'
                     RETURNING *
-                    """
+                    """  # noqa: S608 -- pause_metadata_sql is a fixed constant above
                 ),
                 {
                     "workspace_id": str(workspace_id),
@@ -1703,11 +1940,41 @@ class CampaignRepository:
             self._record_audit_event(
                 workspace_id=workspace_id,
                 actor_id=actor_id,
-                action=action,
+                action="campaign.resume",
                 target_id=campaign_id,
-                after_state={"status": target_status},
+                before_state={"status": "PAUSED"},
+                after_state={
+                    "status": target_status,
+                    "schedule_generation": int(row["schedule_generation"]),
+                },
             )
         return row
+
+    def database_now(self) -> Any:
+        """The database clock. SCHEDULED campaigns start by this clock (the scheduler's
+        due-start), so resume must decide RUNNING-vs-SCHEDULED by the same one."""
+        return self.session.execute(
+            text("SELECT pg_catalog.transaction_timestamp()")
+        ).scalar_one()
+
+    def count_outstanding_attempts(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> int:
+        """Messages that are already past the send gate (claimed, being sent or
+        of unknown outcome). A pause cannot recall them (CAMPAIGN_STATE_MACHINE:
+        'Pause response includes outstanding attempt count')."""
+        value = self.session.execute(
+            text(
+                """
+                SELECT count(*) FROM messages
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                  AND purpose = 'CAMPAIGN'
+                  AND status IN ('QUEUED', 'SENDING', 'UNKNOWN_OUTCOME')
+                """
+            ),
+            {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+        ).scalar()
+        return int(value or 0)
 
     def insert_planning_job(
         self,
@@ -1718,6 +1985,7 @@ class CampaignRepository:
         sequence_id: UUID,
         phase: str,
         total_count: int,
+        audience_id: UUID | None = None,
     ) -> RowMapping:
         job_id = uuid.uuid4()
         row = (
@@ -1726,11 +1994,12 @@ class CampaignRepository:
                     """
                     INSERT INTO campaign_planning_jobs
                         (id, workspace_id, campaign_id, activation_id, sequence_id,
-                         phase, state, total_count, next_due_at)
+                         phase, state, total_count, next_due_at, audience_id)
                     VALUES
                         (:id, :workspace_id, :campaign_id, :activation_id, :sequence_id,
                          :phase, 'PENDING', :total_count,
-                         pg_catalog.transaction_timestamp())
+                         pg_catalog.transaction_timestamp(),
+                         CAST(:audience_id AS uuid))
                     RETURNING *
                     """
                 ),
@@ -1742,6 +2011,7 @@ class CampaignRepository:
                     "sequence_id": str(sequence_id),
                     "phase": phase,
                     "total_count": total_count,
+                    "audience_id": str(audience_id) if audience_id else None,
                 },
             )
             .mappings()
@@ -1759,6 +2029,7 @@ class CampaignRepository:
                     SELECT * FROM campaign_planning_jobs
                     WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
                       AND activation_id = :activation_id
+                      AND audience_id IS NULL
                     """
                 ),
                 {
@@ -1771,6 +2042,83 @@ class CampaignRepository:
             .all()
         )
         return rows
+
+    def list_supplement_audiences(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> Sequence[RowMapping]:
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT * FROM campaign_audiences
+                    WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                      AND kind = 'SUPPLEMENT'
+                    ORDER BY revision ASC
+                    """
+                ),
+                {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+            )
+            .mappings()
+            .all()
+        )
+        return rows
+
+    def list_supplement_jobs(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> Sequence[RowMapping]:
+        """ENROLL/RENDER jobs of supplement audiences (ADR-0020)."""
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT audience_id, phase, state, processed_count, error_reason
+                    FROM campaign_planning_jobs
+                    WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                      AND phase IN ('ENROLL', 'RENDER') AND audience_id IS NOT NULL
+                    """
+                ),
+                {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+            )
+            .mappings()
+            .all()
+        )
+        return rows
+
+    def count_unfinished_supplement_jobs(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> int:
+        """Supplement jobs still running. Resume waits for them: a half-enrolled
+        supplement must not start sending."""
+        value = self.session.execute(
+            text(
+                """
+                SELECT count(*) FROM campaign_planning_jobs
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                  AND phase IN ('ENROLL', 'RENDER') AND audience_id IS NOT NULL
+                  AND state IN ('PENDING', 'PROCESSING')
+                """
+            ),
+            {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+        ).scalar()
+        return int(value or 0)
+
+    def count_failed_planning_jobs(
+        self, *, workspace_id: UUID, campaign_id: UUID, supplements_only: bool = False
+    ) -> int:
+        """ENROLL/RENDER jobs that failed. Their leads' first emails may never be
+        created or rendered, so resume refuses until someone retries them."""
+        value = self.session.execute(
+            text(
+                f"""
+                SELECT count(*) FROM campaign_planning_jobs
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                  AND phase IN ('ENROLL', 'RENDER') AND state = 'FAILED'
+                  {"AND audience_id IS NOT NULL" if supplements_only else ""}
+                """  # noqa: S608 -- the optional clause is a fixed constant
+            ),
+            {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+        ).scalar()
+        return int(value or 0)
 
     def get_command_receipt(
         self,
@@ -1869,6 +2217,27 @@ class CampaignRepository:
     # -------------------------------------------------------------------
     # Audit
     # -------------------------------------------------------------------
+
+    def record_campaign_audit(
+        self,
+        *,
+        workspace_id: UUID,
+        actor_id: UUID,
+        action: str,
+        campaign_id: UUID,
+        before_state: dict[str, Any] | None = None,
+        after_state: dict[str, Any] | None = None,
+    ) -> None:
+        """Audit row for a user action on a campaign made outside this
+        repository (paused-edit services). Ids and field names only."""
+        self._record_audit_event(
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+            action=action,
+            target_id=campaign_id,
+            before_state=before_state,
+            after_state=after_state,
+        )
 
     def _record_audit_event(
         self,

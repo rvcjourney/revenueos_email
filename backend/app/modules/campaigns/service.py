@@ -136,6 +136,7 @@ class CampaignService:
             description=payload.description,
             description_provided="description" in payload.model_fields_set,
             actor_id=context.user_id,
+            may_edit_paused=has_permission(context.role_code, "campaigns.execute"),
         )
         if row is None:
             raise AppError("not_found", "Campaign not found", status_code=404)
@@ -278,6 +279,7 @@ class CampaignService:
             current_settings_id=row["current_settings_id"],
             is_activated=row.get("activation_id") is not None,
             erased_at=row.get("erased_at"),
+            paused_at=row.get("paused_at"),
             version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -301,6 +303,9 @@ class CampaignService:
             error_reason=row["error_reason"],
             is_activated=row.get("activation_id") is not None,
             erased_at=row.get("erased_at"),
+            paused_at=row.get("paused_at"),
+            paused_total_seconds=int(row.get("paused_total_seconds") or 0),
+            last_resumed_at=row.get("last_resumed_at"),
             version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

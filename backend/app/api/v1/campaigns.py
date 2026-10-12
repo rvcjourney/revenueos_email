@@ -55,9 +55,11 @@ from app.modules.campaigns.schemas import (
     StepAttachmentOut,
     StepAttachmentUrlOut,
     StepTestSendIn,
+    SupplementOut,
 )
 from app.modules.campaigns.sequence_service import SequenceService
 from app.modules.campaigns.service import CampaignService
+from app.modules.campaigns.supplement_service import SupplementService
 from app.modules.campaigns.settings_service import CampaignSettingsService
 from app.modules.campaigns.step_test_send_service import StepTestSendService
 from app.modules.leads.pagination import DEFAULT_LIMIT
@@ -197,6 +199,19 @@ def resume_campaign(
     db: Session = Depends(get_db),
 ) -> CampaignDetailOut:
     return CampaignActivationService(db).resume(context, campaign_id, payload)
+
+
+@router.post(
+    "/campaigns/{campaign_id}/planning/retry",
+    response_model=CampaignPlanningOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_campaign_planning(
+    campaign_id: UUID,
+    context: WorkspaceContext = Depends(require_permission("campaigns.execute")),
+    db: Session = Depends(get_db),
+) -> CampaignPlanningOut:
+    return CampaignActivationService(db).retry_planning(context, campaign_id)
 
 
 @router.get("/campaigns/{campaign_id}/planning", response_model=CampaignPlanningOut)
@@ -502,6 +517,62 @@ def select_audience(
     db: Session = Depends(get_db),
 ) -> AudienceOut:
     return AudienceService(db).select_audience(context, campaign_id, payload)
+
+
+# Supplement routes are registered before "/audience/{audience_id}" on purpose:
+# "supplements" would otherwise be parsed as an audience id (and rejected as 422).
+@router.get(
+    "/campaigns/{campaign_id}/audience/supplements",
+    response_model=list[SupplementOut],
+)
+def list_supplement_audiences(
+    campaign_id: UUID,
+    context: WorkspaceContext = Depends(get_workspace_context),
+    db: Session = Depends(get_db),
+) -> list[SupplementOut]:
+    return SupplementService(db).list_supplements(context, campaign_id)
+
+
+@router.post(
+    "/campaigns/{campaign_id}/audience/supplements",
+    response_model=SupplementOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def select_supplement_audience(
+    campaign_id: UUID,
+    payload: AudienceSelectIn,
+    context: WorkspaceContext = Depends(require_permission("campaigns.execute")),
+    db: Session = Depends(get_db),
+) -> SupplementOut:
+    return SupplementService(db).select(context, campaign_id, payload)
+
+
+@router.post(
+    "/campaigns/{campaign_id}/audience/supplements/{audience_id}/enroll",
+    response_model=SupplementOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def enroll_supplement_audience(
+    campaign_id: UUID,
+    audience_id: UUID,
+    context: WorkspaceContext = Depends(require_permission("campaigns.execute")),
+    db: Session = Depends(get_db),
+) -> SupplementOut:
+    return SupplementService(db).enroll(context, campaign_id, audience_id)
+
+
+@router.post(
+    "/campaigns/{campaign_id}/audience/supplements/{audience_id}/retry",
+    response_model=SupplementOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_supplement_audience(
+    campaign_id: UUID,
+    audience_id: UUID,
+    context: WorkspaceContext = Depends(require_permission("campaigns.execute")),
+    db: Session = Depends(get_db),
+) -> SupplementOut:
+    return SupplementService(db).retry(context, campaign_id, audience_id)
 
 
 @router.get(

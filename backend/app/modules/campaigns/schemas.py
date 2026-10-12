@@ -59,6 +59,7 @@ class CampaignListItem(BaseModel):
     # be erased, never purged); erased_at is set once its personal data was erased.
     is_activated: bool = False
     erased_at: datetime | None = None
+    paused_at: datetime | None = None
     version: int
     created_at: datetime
     updated_at: datetime
@@ -86,6 +87,13 @@ class CampaignDetailOut(BaseModel):
     error_reason: str | None = None
     is_activated: bool = False
     erased_at: datetime | None = None
+    # Pause bookkeeping (migration 0040). paused_at is set only while PAUSED.
+    paused_at: datetime | None = None
+    paused_total_seconds: int = 0
+    last_resumed_at: datetime | None = None
+    # Only set on the response to a pause command: messages that were already
+    # QUEUED/SENDING/UNKNOWN_OUTCOME and cannot be recalled.
+    outstanding_attempts: int | None = None
     version: int
     created_at: datetime
     updated_at: datetime
@@ -161,6 +169,14 @@ class SequenceStepOut(BaseModel):
     email_variable_schema: dict[str, Any] | None = None
     wait_duration_minutes: int | None = None
     source_template_version_id: UUID | None = None
+    # Activated campaigns only (ADR-0020): how many leads already received this
+    # email, and how many unsent messages an edit would still change.
+    sent_count: int = 0
+    unsent_count: int = 0
+    # Personalized campaigns: emails already written (frozen) vs still to be
+    # written from the step's current reference.
+    written_count: int = 0
+    unwritten_count: int = 0
     version: int
     created_at: datetime
     updated_at: datetime
@@ -172,6 +188,14 @@ class SequenceOut(BaseModel):
     revision: int
     status: str
     steps: list[SequenceStepOut]
+    # True when the current user may edit this activated sequence right now
+    # (campaign paused, campaigns.execute). For a personalized campaign only the
+    # wording of steps with no written email can change (see written_count).
+    # DRAFT editing is unchanged and reported by the campaign status as before.
+    paused_edit_allowed: bool = False
+    # Steps at or before this position were already reached by a lead: their
+    # content and waits may change, their place in the sequence may not.
+    structure_locked_through: int = 0
 
 
 class PreviewRecipientOut(BaseModel):
@@ -306,6 +330,31 @@ class AudienceOut(BaseModel):
     selected_lead_ids: list[UUID] = Field(default_factory=list)
 
 
+class SupplementOut(BaseModel):
+    """A set of leads being added to a paused, activated campaign (ADR-0020).
+
+    `status` is the capture; `enroll_state` is the later step that turns the
+    accepted leads into enrollments. A lead already in the campaign, suppressed
+    or archived is excluded (counted in `exclusions`), never enrolled twice."""
+
+    id: UUID
+    campaign_id: UUID
+    revision: int
+    status: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    total_candidates: int | None = None
+    processed_count: int = 0
+    accepted_count: int | None = None
+    excluded_count: int | None = None
+    exclusions: dict[str, int] = Field(default_factory=dict)
+    # NOT_STARTED | PENDING | PROCESSING | READY | FAILED
+    enroll_state: str = "NOT_STARTED"
+    render_state: str = "NOT_STARTED"
+    enrolled_count: int = 0
+    error_reason: str | None = None
+
+
 class AudienceExclusionBreakdown(BaseModel):
     """Why excluded_count leads were excluded, for the audience review UI.
 
@@ -368,6 +417,10 @@ class PauseIn(BaseModel):
 
 class ResumeIn(BaseModel):
     expected_version: int = Field(ge=1)
+    # Leads that already finished the sequence are given the emails appended while the
+    # campaign was paused (ADR-0020). Off unless the user asks: a finished lead is never
+    # contacted again by surprise.
+    include_completed: bool = False
 
 
 class PlanningJobStatusOut(BaseModel):

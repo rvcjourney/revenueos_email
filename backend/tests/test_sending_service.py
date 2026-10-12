@@ -461,6 +461,26 @@ def test_paused_campaign_defers_leaves_message_untouched() -> None:
     service.repository.finalize_attempt_result.assert_not_called()
 
 
+def test_message_from_before_a_resume_is_handed_back_not_sent() -> None:
+    """ADR-0020: claimed before the pause, so its time/content were never
+    re-validated by the reconcile pass. Released with a dispatch-generation bump
+    (not skipped, not sent) so the reconcile pass can re-stamp it."""
+    fake_provider = MagicMock()
+    ProviderRegistry.register("GMAIL", fake_provider)
+    ctx = _ctx(message_schedule_generation=1, campaign_schedule_generation=2)
+    service = _make_service(ctx)
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert outcome.outcome == "DEFERRED"
+    assert outcome.reason == "stale_schedule_generation"
+    fake_provider.send_message.assert_not_called()
+    service.repository.skip_message.assert_not_called()
+    service.repository.defer_for_capacity.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Provider outcomes, once authorization succeeds
 # ---------------------------------------------------------------------------

@@ -318,7 +318,7 @@ export function EmailStepDialog({
       } else if (error instanceof ApiError && error.code === "state_conflict") {
         setBanner({
           kind: "error",
-          text: "This campaign is no longer a draft, so the sequence can’t be edited. Your text is still here if you want to copy it.",
+          text: "This campaign is no longer a draft or paused, so the sequence can’t be edited. Your text is still here if you want to copy it.",
         });
         onLocked();
       } else {
@@ -355,7 +355,7 @@ export function EmailStepDialog({
       if (error instanceof ApiError && error.code === "state_conflict") {
         setBanner({
           kind: "error",
-          text: "This campaign is no longer a draft, so files can't be added.",
+          text: "This campaign is no longer a draft or paused, so files can't be added.",
         });
         onLocked();
       } else {

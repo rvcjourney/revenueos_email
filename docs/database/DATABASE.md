@@ -200,7 +200,19 @@ Mailbox FK, connection generation, folder/sync scope, opaque protected checkpoin
 
 ### campaigns (T)
 
-Name/description, creator FK, lifecycle status (seven-state closed set), version, start_at, current draft/activated sequence and audience references, activation identity, planning status, schedule generation, archive time and safe error. Index `(workspace_id,status,id)` for browser and `(status,start_at,id)` for system due activation. State/required activation checks; no arbitrary status mutation grant. T-read/T-service commands only. Historical archive, not cascade. [Campaign state machine](../architecture/CAMPAIGN_STATE_MACHINE.md) owns transitions.
+Name/description, creator FK, lifecycle status (seven-state closed set), version, start_at, current draft/activated sequence and audience references, activation identity, planning status, schedule generation, archive time and safe error. Index `(workspace_id,status,id)` for browser and `(status,start_at,id)` for system due activation. State/required activation checks; no arbitrary status mutation grant. T-read/T-service commands only. Historical archive, not cascade. [Campaign state machine](../architecture/CAMPAIGN_STATE_MACHINE.md) owns transitions. Pause bookkeeping (migration 0040): `paused_at` (set only while PAUSED), `paused_total_seconds`, `last_resumed_at`. `schedule_generation` is the resume fence: resume bumps it in the same statement as the status flip, and the scheduler claims only messages stamped with the campaign's current value ([ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md)).
+
+### campaign_audiences — kind (ADR-0020, migration 0043)
+
+`kind` is `ACTIVATION` (the audience captured before activation, immutable once READY) or `SUPPLEMENT` (leads added while the campaign is PAUSED, captured with the same machinery, never modifying the activated audience). Immutable after insert. A supplement may only be created by `campaigns.execute` on a PAUSED activated campaign; enrollments from it are accepted by the enrollment guard only while the campaign is PAUSED and the supplement READY. Supplement ENROLL/RENDER planning jobs carry the supplement's `audience_id` and have their own unique key, so they never collide with the activation's jobs.
+
+### Reference edits for a paused personalized campaign (ADR-0020, migration 0044)
+
+`app_guard_frozen_sequence_steps` (SECURITY DEFINER, owned by `app_integrity_guard`) accepts an UPDATE of a step of a FROZEN sequence of a PAUSED, activated `HYPER_PERSONALIZED` campaign only if `kind`, `position` and `wait_duration_minutes` are unchanged and no message of that step has `rendered_at` set. INSERT, DELETE, reorder and every attachment change stay refused. STANDARD campaigns are unchanged from 0042. The guard functions use COALESCE-hardened comparisons so a NULL campaign type fails closed.
+
+### campaign_planning_jobs — scheduler discovery (ADR-0020, migration 0045)
+
+`app_scheduler` gains a table-level `SELECT` and a `USING (true)` policy on `campaign_planning_jobs`, exactly like its other discovery policies, so the periodic sweep can name ENROLL/RENDER jobs whose task message was lost. It stays **read-only**: the migration asserts the role has no INSERT/UPDATE/DELETE. The recovery itself is a worker task (`app_worker_general`) running workspace-scoped.
 
 ### campaign_sequences (T)
 

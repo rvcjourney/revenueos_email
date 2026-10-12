@@ -301,6 +301,7 @@ class FakeRepo:
             "email_body_html": s.step["email_body_html"],
             "email_preheader": s.step["email_preheader"],
             "step_position": s.step["position"],
+            "step_version": s.step.get("version", 1),
             "personalization_config": s.config,
             "timezone": "UTC",
             "weekday_set": ALL_DAYS,
@@ -326,6 +327,7 @@ class FakeRepo:
             "planning_status": s.campaign["planning_status"],
             "enrollment_state": s.enrollment["state"],
             "next_step_id": s.enrollment["next_step_id"],
+            "step_version": s.step.get("version", 1),
         }
 
     def finalize_message(

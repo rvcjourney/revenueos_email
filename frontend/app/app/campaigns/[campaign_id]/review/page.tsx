@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, Loader2, Lock, Rocket } from "lucide-react";
 import { useState } from "react";
 
+import { CampaignRunControls } from "@/components/campaigns/campaign-run-controls";
 import { GenerationProgressPanel } from "@/components/campaigns/personalization/generation-progress-panel";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -16,8 +17,6 @@ import {
   activateCampaign,
   getCampaignPlanning,
   getReview,
-  pauseCampaign,
-  resumeCampaign,
 } from "@/lib/campaigns-api";
 import { getPersonalization } from "@/lib/personalization-api";
 import { canExecuteCampaign } from "@/lib/permissions";
@@ -148,7 +147,7 @@ export default function CampaignReviewPage() {
   const mayExecute = canExecuteCampaign(activeWorkspace?.role_code);
   const queryClient = useQueryClient();
   const [actionError, setActionError] = useState<string | null>(null);
-  const [pendingAction, setPendingAction] = useState<"activate" | "pause" | "resume" | null>(null);
+  const [pendingAction, setPendingAction] = useState<"activate" | null>(null);
 
   const reviewQuery = useQuery({
     queryKey: ["workspace", activeWorkspaceId, "campaigns", campaignId, "review"],
@@ -193,36 +192,6 @@ export default function CampaignReviewPage() {
       if (!activeWorkspaceId || !campaignId || !reviewQuery.data)
         throw new Error("Not ready");
       return activateCampaign(activeWorkspaceId, campaignId, {
-        expected_version: reviewQuery.data.campaign.version,
-      });
-    },
-    onSuccess: () => {
-      setActionError(null);
-      invalidateAll();
-    },
-    onError: (err) => setActionError(errorMessage(err)),
-  });
-
-  const pauseMutation = useMutation({
-    mutationFn: () => {
-      if (!activeWorkspaceId || !campaignId || !reviewQuery.data)
-        throw new Error("Not ready");
-      return pauseCampaign(activeWorkspaceId, campaignId, {
-        expected_version: reviewQuery.data.campaign.version,
-      });
-    },
-    onSuccess: () => {
-      setActionError(null);
-      invalidateAll();
-    },
-    onError: (err) => setActionError(errorMessage(err)),
-  });
-
-  const resumeMutation = useMutation({
-    mutationFn: () => {
-      if (!activeWorkspaceId || !campaignId || !reviewQuery.data)
-        throw new Error("Not ready");
-      return resumeCampaign(activeWorkspaceId, campaignId, {
         expected_version: reviewQuery.data.campaign.version,
       });
     },
@@ -412,75 +381,29 @@ export default function CampaignReviewPage() {
             </p>
           </>
         ) : (
-          <div className="flex items-center gap-2">
-            {(campaign.status === "RUNNING" || campaign.status === "SCHEDULED") &&
-              mayExecute && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={pauseMutation.isPending}
-                  onClick={() => setPendingAction("pause")}
-                >
-                  {pauseMutation.isPending && (
-                    <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                  )}
-                  Pause
-                </Button>
-              )}
-            {campaign.status === "PAUSED" && mayExecute && (
-              <Button
-                size="sm"
-                disabled={resumeMutation.isPending}
-                onClick={() => setPendingAction("resume")}
-              >
-                {resumeMutation.isPending && (
-                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
-                )}
-                Resume
-              </Button>
-            )}
+          <div className="flex flex-wrap items-center gap-3">
+            <CampaignRunControls campaign={campaign} />
             <p className="text-xs text-slate-500">
-              Campaign is {campaign.status}. Configuration is restricted while activated.
+              Campaign is {campaign.status}.{" "}
+              {campaign.status === "PAUSED"
+                ? "Configuration can be changed while it is paused."
+                : "Configuration is restricted while activated."}
             </p>
           </div>
         )}
       </div>
       <ConfirmDialog
         open={pendingAction !== null}
-        title={
-          pendingAction === "activate"
-            ? `Activate "${campaign.name}"?`
-            : pendingAction === "pause"
-              ? `Pause "${campaign.name}"?`
-              : `Resume "${campaign.name}"?`
-        }
+        title={`Activate "${campaign.name}"?`}
         description={
-          pendingAction === "activate"
-            ? "This freezes the sequence, senders and audience and creates a durable message plan. No email is sent by this action, and configuration becomes restricted from editing." +
-              (isHyper
-                ? " Each personalized email is written shortly before it is due to send."
-                : "")
-            : undefined
+          "This freezes the sequence, senders and audience and creates a durable message plan. No email is sent by this action, and configuration becomes restricted from editing." +
+          (isHyper ? " Each personalized email is written shortly before it is due to send." : "")
         }
-        confirmLabel={
-          pendingAction === "activate"
-            ? "Activate campaign"
-            : pendingAction === "pause"
-              ? "Pause campaign"
-              : "Resume campaign"
-        }
-        loading={
-          activateMutation.isPending || pauseMutation.isPending || resumeMutation.isPending
-        }
+        confirmLabel="Activate campaign"
+        loading={activateMutation.isPending}
         onCancel={() => setPendingAction(null)}
         onConfirm={() => {
-          const mutation =
-            pendingAction === "activate"
-              ? activateMutation
-              : pendingAction === "pause"
-                ? pauseMutation
-                : resumeMutation;
-          mutation.mutate(undefined, { onSettled: () => setPendingAction(null) });
+          activateMutation.mutate(undefined, { onSettled: () => setPendingAction(null) });
         }}
       />
     </div>

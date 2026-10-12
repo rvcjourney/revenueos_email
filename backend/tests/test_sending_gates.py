@@ -125,6 +125,37 @@ def test_campaign_not_running_rejected(
         gates.check_campaign_state(ctx)
 
 
+def test_stale_schedule_generation_rejected() -> None:
+    """ADR-0020: a message claimed before a pause/resume carries the old
+    generation; it must be handed back, not sent."""
+    ctx = _ctx(message_schedule_generation=1, campaign_schedule_generation=2)
+    with pytest.raises(gates.StaleScheduleGeneration) as info:
+        gates.check_schedule_generation(ctx)
+    assert info.value.terminal_reason == "stale_schedule_generation"
+
+
+def test_matching_or_unknown_schedule_generation_passes() -> None:
+    gates.check_schedule_generation(
+        _ctx(message_schedule_generation=3, campaign_schedule_generation=3)
+    )
+    gates.check_schedule_generation(_ctx())  # not loaded (None) -> not enforced
+    gates.check_schedule_generation(
+        _ctx(
+            purpose="CONTROLLED_TEST",
+            message_schedule_generation=1,
+            campaign_schedule_generation=None,
+        )
+    )
+
+
+def test_stale_schedule_generation_is_part_of_the_pre_authorization_gates() -> None:
+    ctx = _ctx(message_schedule_generation=1, campaign_schedule_generation=2)
+    with pytest.raises(gates.StaleScheduleGeneration):
+        gates.run_pre_authorization_gates(
+            _fake_session_no_suppression(), ctx, expected_dispatch_generation=1
+        )
+
+
 def test_controlled_test_purpose_skips_campaign_gate() -> None:
     ctx = _ctx(
         purpose="CONTROLLED_TEST", campaign_status=None, campaign_planning_status=None

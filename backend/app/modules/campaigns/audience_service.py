@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import WorkspaceContext
 from app.core.errors import AppError
+from app.core.permissions import has_permission
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import (
     AudienceExclusionBreakdown,
@@ -41,7 +42,20 @@ class AudienceService:
         self, context: WorkspaceContext, campaign_id: UUID, payload: AudienceSelectIn
     ) -> AudienceOut:
         self._require_draft_campaign(context, campaign_id)
+        return self.start_capture(context, campaign_id, payload, kind="ACTIVATION")
 
+    def start_capture(
+        self,
+        context: WorkspaceContext,
+        campaign_id: UUID,
+        payload: AudienceSelectIn,
+        *,
+        kind: str,
+    ) -> AudienceOut:
+        """Validate the selection, create the CAPTURING audience, hold the list
+        capture gates and queue the capture. The caller has already checked that
+        the campaign is in a state that allows this kind of audience (DRAFT for
+        ACTIVATION, PAUSED + activated for SUPPLEMENT)."""
         if not payload.list_ids and not payload.lead_ids:
             raise AppError(
                 "validation_error",
@@ -87,6 +101,7 @@ class AudienceService:
                 workspace_id=context.workspace_id,
                 campaign_id=campaign_id,
                 selection_manifest=selection_manifest,
+                kind=kind,
             )
         except IntegrityError as exc:
             # campaign_audiences_active_capture_idx: only one CAPTURING
@@ -227,6 +242,16 @@ class AudienceService:
         )
         if audience is None:
             raise AppError("not_found", "Audience revision not found", status_code=404)
+        if audience.get("kind") == "SUPPLEMENT" and not has_permission(
+            context.role_code, "campaigns.execute"
+        ):
+            # Adding leads to a paused campaign is a manager action (ADR-0020), so
+            # cancelling one is too: a member must not stop a manager's capture.
+            raise AppError(
+                "forbidden",
+                "Only a manager can cancel adding leads to a paused campaign",
+                status_code=403,
+            )
         if audience["status"] != "CAPTURING":
             raise AppError(
                 "state_conflict",

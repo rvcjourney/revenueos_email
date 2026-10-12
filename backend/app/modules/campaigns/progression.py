@@ -3,13 +3,18 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 
 from app.core.errors import AppError
 from app.modules.campaigns.message_rendering import render_step_content
-from app.modules.campaigns.scheduling import project_into_window
+from app.modules.campaigns.pacing import (
+    MailboxPacing,
+    SpreadPlanner,
+    pacing_from_policies,
+)
+from app.modules.campaigns.scheduling import WindowCalendar, project_into_window
 from app.modules.personalization.version import CAMPAIGN_TYPE_HYPER
 
 logger = logging.getLogger(__name__)
@@ -100,6 +105,21 @@ class ProgressionRepository(Protocol):
 
     def fail_enrollment(self, **kwargs: Any) -> bool: ...
 
+    # Only used when overdue follow-ups are spread (ProgressionService with pacing).
+    def lock_campaign_for_planning(self, **kwargs: Any) -> None: ...
+
+    def list_eligible_campaign_mailboxes(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> Sequence[Mapping[str, Any]]: ...
+
+    def list_mailbox_limit_policies(
+        self, *, workspace_id: UUID, mailbox_ids: list[UUID]
+    ) -> dict[UUID, list[dict[str, int]]]: ...
+
+    def list_mailbox_unsent_hourly(
+        self, **kwargs: Any
+    ) -> dict[UUID, list[tuple[datetime, int]]]: ...
+
 
 @dataclass
 class ProgressionSummary:
@@ -112,6 +132,7 @@ class ProgressionSummary:
     # stay eligible, so a chunk must be able to continue past them.
     last_enrollment_id: UUID | None = None
     reasons: dict[str, int] = field(default_factory=dict)
+    spread: int = 0
 
     def skip(self, reason: str) -> None:
         self.skipped += 1
@@ -142,9 +163,18 @@ class ProgressionService:
         *,
         personalization_lead_seconds: int = 3600,
         personalization_max_attempts: int = 3,
+        default_pacing: MailboxPacing | None = None,
+        overdue_grace: timedelta = timedelta(minutes=2),
     ) -> None:
         self.repo = repo
         self.is_suppressed = is_suppressed
+        # With pacing, a follow-up whose time already passed (typically because the
+        # campaign was paused longer than its wait) is spread over the next sending
+        # windows, per mailbox, instead of everything becoming due at once. Without
+        # it (None) behaviour is exactly as before. A follow-up that is only a little
+        # late -- normal sweep lag -- keeps its time: `overdue_grace`.
+        self.default_pacing = default_pacing
+        self.overdue_grace = overdue_grace
         # Only used for hyper-personalized campaigns (ADR-0011).
         self.personalization_lead_seconds = personalization_lead_seconds
         self.personalization_max_attempts = personalization_max_attempts
@@ -156,8 +186,11 @@ class ProgressionService:
         campaign_id: UUID,
         limit: int,
         after_id: UUID | None = None,
+        now: datetime | None = None,
     ) -> ProgressionSummary:
         summary = ProgressionSummary()
+        now = now or datetime.now(UTC)
+        planner: SpreadPlanner | None = None
         ctx = self.repo.get_progression_context(
             workspace_id=workspace_id, campaign_id=campaign_id
         )
@@ -242,6 +275,19 @@ class ProgressionService:
                 summary.skip("no_sending_window")
                 continue
 
+            if self.default_pacing is not None and due_at < now - self.overdue_grace:
+                if planner is None:
+                    planner = self._spread_planner(workspace_id, campaign_id, ctx, now)
+                # Never earlier than accepted_at + wait: spreading only moves later.
+                due_at = max(
+                    planner.place(
+                        UUID(str(row["assigned_mailbox_id"])),
+                        f"{enrollment_id}:{plan.step['id']}",
+                    ),
+                    due_at,
+                )
+                summary.spread += 1
+
             hyper = ctx.get("campaign_type") == CAMPAIGN_TYPE_HYPER
             rendered = (
                 None
@@ -308,3 +354,48 @@ class ProgressionService:
             else:
                 summary.skip("concurrent_change")
         return summary
+
+    def _spread_planner(
+        self,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        ctx: Mapping[str, Any],
+        now: datetime,
+    ) -> SpreadPlanner:
+        """The planner for this batch's overdue follow-ups. Built (and the campaign
+        row locked, so a concurrent sweep or reconcile cannot read the same free
+        slots) only when a batch actually has overdue work."""
+        assert self.default_pacing is not None
+        self.repo.lock_campaign_for_planning(
+            workspace_id=workspace_id, campaign_id=campaign_id
+        )
+        mailbox_ids = [
+            UUID(str(r["mailbox_id"]))
+            for r in self.repo.list_eligible_campaign_mailboxes(
+                workspace_id=workspace_id, campaign_id=campaign_id
+            )
+        ]
+        policies = self.repo.list_mailbox_limit_policies(
+            workspace_id=workspace_id, mailbox_ids=mailbox_ids
+        )
+        return SpreadPlanner(
+            WindowCalendar(
+                now,
+                timezone=ctx["timezone"],
+                weekday_set=int(ctx["weekday_set"]),
+                window_start_local=ctx["window_start_local"],
+                window_end_local=ctx["window_end_local"],
+            ),
+            mailbox_count=len(mailbox_ids),
+            campaign_daily_limit=ctx.get("daily_limit"),
+            pacing_by_mailbox={
+                mailbox_id: pacing_from_policies(
+                    policies.get(mailbox_id, []), self.default_pacing
+                )
+                for mailbox_id in mailbox_ids
+            },
+            default=self.default_pacing,
+            hourly_by_mailbox=self.repo.list_mailbox_unsent_hourly(
+                workspace_id=workspace_id, campaign_id=campaign_id, from_at=now
+            ),
+        )

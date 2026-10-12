@@ -204,6 +204,45 @@ sending limit and release a safety hold, and it gives every existing mailbox a d
 sends (messages are deferred with reason `mailbox_limits_missing`). No script here applies it;
 apply it yourself like the others.
 
+**Pause, resume, edits while paused and adding leads (migrations 0040-0045).** All six are
+additive (0041 is a repair, see below) and prepared only; review each header (it is the migration
+review) and apply them one at a time, **in numeric order**: 0040 (pause bookkeeping columns), 0041
+(owner of the two frozen-sequence guards), 0042 (edits to an activated campaign's emails while
+paused), 0043 (leads added to a paused campaign), 0044 (reference-email edits for a paused
+personalized campaign; needs 0042), 0045 (the scheduler may read planning jobs so it can
+re-dispatch lost ones). Apply them **before** deploying this version of the backend, workers and
+scheduler. Deploy the **worker first** (new tasks), then the API, then the scheduler. Pause itself
+keeps working on a database that has not had 0040 yet (it then skips the bookkeeping columns), so
+the emergency stop never depends on a migration; every other piece of the feature needs its own.
+Details: [ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md).
+
+**Database whose `app_guard_*` functions are owned by `postgres` (production, 2026-10-09).** 0042
+and 0044 assert that the two frozen-sequence guards are owned by `app_integrity_guard` and roll
+back with `0042 postcondition failed: ... is not SECURITY DEFINER owned by app_integrity_guard`
+when they are not. **0041_guard_function_ownership.sql** repairs exactly that (it is
+idempotent and a no-op where the owners are already right). It first proves that `app_integrity_guard` has the privileges the guards need and stops
+with nothing changed if it does not, then changes the owner of only those two functions. After it,
+save one edit of a DRAFT campaign's email step in the app before continuing with 0042. Undo:
+`ALTER FUNCTION public.app_guard_frozen_sequence_steps() OWNER TO postgres;` and the same for
+`app_guard_frozen_step_attachments()`. The other `app_guard_*` functions keep working as
+`postgres` and are left alone on purpose, so the preflight keeps listing them under `Function
+ownership`.
+
+**Is the database really up to date? The preflight now tells you.** The go-live preflight below
+checks, with read-only catalog queries, which of migrations 0021-0045 the database has (`Migration
+NNNN`), that there are no gaps in the chain (`Migration chain`) and that the `app_*` guard and
+erasure functions have the right owner (`Function ownership`). A `FAIL` names the migration and what
+breaks without it. If it reports `Function ownership` problems, the production database was set up
+by something other than the committed chain: do not apply anything on a guess; look at it first
+(read-only):
+
+```sql
+select p.proname, pg_get_userbyid(p.proowner) as owner, p.prosecdef as security_definer
+from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public' and p.proname like 'app\_%'
+order by 1;
+```
+
 Finish with `unset DB`.
 
 ### 5.2 Storage bucket
@@ -251,7 +290,7 @@ https://YOUR_DOMAIN/api/v1/mailboxes/connect/microsoft/callback
 ```
 
 Under **API permissions** the delegated permissions are now `Mail.Send` and **`Mail.ReadWrite`**
-(plus `offline_access`, `openid`, `profile`, `email`). Outlook mailboxes connected before this
+(plus `User.Read`, `offline_access`, `openid`, `profile`, `email`). Outlook mailboxes connected before this
 version must be disconnected and reconnected to grant `Mail.ReadWrite`.
 
 ---
@@ -613,6 +652,29 @@ connected mailbox has a daily limit. Fix every `FAIL`. A `WARN` is worth reading
 `SEQUENCE_PROGRESSION_ENABLED=false` means **only the first email of each sequence is sent**.
 The database checks need the owner/migration database user (one that bypasses row-level security);
 with any other user they are reported as unverified rather than guessed.
+
+### Pause / resume rehearsal (staging, with your own mailbox)
+
+The automated tests prove the rules against a real PostgreSQL and the screens against a mock; they
+cannot prove a live mailbox. Before using pause/resume on a real campaign, once, with your own
+addresses and a staging copy (or a throwaway campaign of 3-5 of your own addresses):
+
+1. Start the campaign, then **Pause** while at least one email is waiting. Confirm no further
+   email leaves (`docker compose logs -f worker-send`) and that the pause message says how many were
+   already being sent.
+2. While paused: change the sending window, edit the wording of an email that has not been sent,
+   and add one more of your own addresses (Audience, **Add leads**). Resume must be refused until
+   the added lead finishes; use **Retry** if it shows as failed.
+3. **Resume.** Waiting emails go out gradually over your sending windows, not all at once, and the
+   edited wording is what arrives. Check one real email's body and its unsubscribe footer.
+4. Repeat Pause and Resume twice quickly: the second click must change nothing (no duplicate email,
+   no second "resumed" in the audit trail).
+5. Optional: let one of your addresses finish the sequence, pause, add an email to the end, and
+   resume **with** "also send the new emails to leads who already finished the sequence" ticked. That
+   address (and only that one, if it has not replied or unsubscribed) receives exactly one new email.
+6. Browser checks of the screens against the mock backend: `cd frontend && npm run e2e` (needs the
+   Playwright browser download, or `PLAYWRIGHT_CHROME_PATH` pointing at an installed Chrome). Nothing
+   there touches a database or sends email.
 
 ### Rehearsal before real leads
 

@@ -13,6 +13,13 @@ from app.modules.scheduler.service import OutboxPublisherService, SchedulerServi
 
 logger = logging.getLogger(__name__)
 
+# A resume dispatches its own reconcile task; this sweep only repairs a lost one,
+# so a slow cadence is enough and no setting is needed.
+_RECONCILE_SWEEP_INTERVAL_SECONDS = 60.0
+_RECONCILE_CAMPAIGNS_PER_RUN = 20
+_PLANNING_RECOVERY_INTERVAL_SECONDS = 60.0
+_PLANNING_RECOVERY_PER_RUN = 50
+
 
 class SchedulerRuntime:
     def __init__(self, settings: Settings | None = None) -> None:
@@ -25,6 +32,11 @@ class SchedulerRuntime:
         # Hyper-personalized generation (ADR-0011) has its own cadence and cursor.
         self._personalization_last_run = float("-inf")
         self._personalization_cursor: UUID | None = None
+        # Post-resume reconcile repair sweep (ADR-0020).
+        self._reconcile_last_run = float("-inf")
+        self._reconcile_cursor: UUID | None = None
+        # Lost planning-task repair (ADR-0020 follow-up).
+        self._planning_recovery_last_run = float("-inf")
 
     def stop(self, signum: int | None = None, frame: object | None = None) -> None:
         logger.info("Scheduler shutdown requested")
@@ -32,6 +44,13 @@ class SchedulerRuntime:
 
     def run_once(self) -> None:
         logger.info("Scheduler heartbeat")
+
+        # 0. Start campaigns whose scheduled start has arrived, so work that became
+        # claimable with them is picked up in this same pass.
+        try:
+            self._start_due_campaigns()
+        except Exception:
+            logger.exception("Error starting due campaigns")
 
         # 1. Discover due work and claim
         try:
@@ -124,6 +143,23 @@ class SchedulerRuntime:
                 logger.info(f"Scheduler queued personalization for {queued} campaigns")
         except Exception:
             logger.exception("Error during personalization dispatch")
+
+        # 7d. Re-publish the post-resume reconcile for campaigns whose pass was
+        # lost (ADR-0020). Until it runs their old messages are unclaimable.
+        try:
+            queued = self._dispatch_reconcile()
+            if queued > 0:
+                logger.info(f"Scheduler queued resume reconcile for {queued} campaigns")
+        except Exception:
+            logger.exception("Error during resume reconcile dispatch")
+
+        # 7e. Re-dispatch planning jobs whose task message was lost
+        try:
+            redispatched = self._dispatch_planning_recovery()
+            if redispatched > 0:
+                logger.info(f"Scheduler re-dispatched {redispatched} stuck planning job(s)")
+        except Exception:
+            logger.exception("Error during planning-job recovery")
 
         # 8. Discover and enqueue due mailbox reply syncs (Phase 13)
         if self.settings.reply_sync_enabled:
@@ -257,6 +293,100 @@ class SchedulerRuntime:
                     "campaign_id": str(campaign_id),
                 },
                 queue="personalization",
+            )
+        return len(campaigns)
+
+    def _dispatch_planning_recovery(self) -> int:
+        """Planning (enrolling an audience, rendering its first emails) is published
+        as Celery tasks after the request commits; a lost publish or retry message
+        would leave a job PENDING/PROCESSING for ever. Offer every such job to a worker
+        again. Safe to repeat: a task claims its job under a lease, and the chunks are
+        idempotent. Slow cadence; nothing here is urgent to the second."""
+        now = time.monotonic()
+        if now - self._planning_recovery_last_run < _PLANNING_RECOVERY_INTERVAL_SECONDS:
+            return 0
+        self._planning_recovery_last_run = now
+
+        from app.modules.scheduler.repository import SchedulerRepository
+
+        from workers.celery_app import celery_app
+
+        with session_scope(self.settings) as session:
+            jobs = SchedulerRepository(session).find_stuck_planning_jobs(
+                limit=_PLANNING_RECOVERY_PER_RUN
+            )
+        for workspace_id, campaign_id, activation_id, audience_id, phase in jobs:
+            kwargs = {
+                "workspace_id": str(workspace_id),
+                "campaign_id": str(campaign_id),
+                "activation_id": str(activation_id),
+            }
+            if audience_id is not None:
+                kwargs["audience_id"] = str(audience_id)
+            celery_app.send_task(
+                "campaigns.enroll_activation_chunk"
+                if phase == "ENROLL"
+                else "campaigns.render_messages_chunk",
+                kwargs=kwargs,
+                queue="campaigns",
+            )
+        return len(jobs)
+
+    def _start_due_campaigns(self) -> int:
+        """SCHEDULED -> RUNNING at start_at (campaign state machine "Due start")."""
+        with session_scope(self.settings) as session:
+            started = SchedulerService(session, self.settings).start_due_campaigns()
+        if not started:
+            return 0
+        from workers.celery_app import celery_app
+
+        for workspace_id, campaign_id, generation in started:
+            if generation <= 1:
+                continue  # never resumed: nothing is fenced
+            # Resumed into SCHEDULED earlier: its pre-pause messages are fenced until
+            # the reconcile pass re-validates them, and it did not run (not RUNNING).
+            celery_app.send_task(
+                "campaigns.reconcile_resume_chunk",
+                kwargs={
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "generation": generation,
+                },
+                queue="campaigns",
+            )
+        logger.info("Scheduler started %d scheduled campaign(s)", len(started))
+        return len(started)
+
+    def _dispatch_reconcile(self) -> int:
+        """Queue the reconcile task for each RUNNING campaign that still has
+        unsent messages below its schedule generation (a bounded slice, wrapping
+        around). Normally a resume dispatches the task itself; this repairs a lost
+        publish or a crashed pass. Duplicates are harmless: the task is idempotent
+        and a stamped message is never selected again."""
+        now = time.monotonic()
+        if now - self._reconcile_last_run < _RECONCILE_SWEEP_INTERVAL_SECONDS:
+            return 0
+        self._reconcile_last_run = now
+
+        from app.modules.scheduler.repository import SchedulerRepository
+
+        from workers.celery_app import celery_app
+
+        limit = _RECONCILE_CAMPAIGNS_PER_RUN
+        with session_scope(self.settings) as session:
+            campaigns = SchedulerRepository(session).find_campaigns_with_stale_generation(
+                after_id=self._reconcile_cursor, limit=limit
+            )
+        self._reconcile_cursor = campaigns[-1][1] if len(campaigns) >= limit else None
+        for workspace_id, campaign_id, generation in campaigns:
+            celery_app.send_task(
+                "campaigns.reconcile_resume_chunk",
+                kwargs={
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "generation": generation,
+                },
+                queue="campaigns",
             )
         return len(campaigns)
 

@@ -207,3 +207,109 @@ class TestDatabaseChecks:
             with pytest.raises(DBAPIError):
                 connection.execute(text("CREATE TABLE public.preflight_probe (x int)"))
             connection.rollback()
+
+
+# ---------------------------------------------------------------------------
+# which migrations does the database actually have? (catalog probes, no history table)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def migrated_to_0039():
+    with throwaway_database(up_to=39) as uri:
+        yield uri
+
+
+@pytest.fixture(scope="module")
+def engine_0039(migrated_to_0039):
+    engine = create_engine("postgresql+psycopg://" + migrated_to_0039.split("://", 1)[1], future=True)
+    yield engine
+    engine.dispose()
+
+
+class TestMigrationState:
+    """Numbered like TestDatabaseChecks: one database, moved forward step by step."""
+
+    def test_b_01_a_database_at_0039_reports_the_pause_migrations_as_missing(self, engine_0039):
+        with engine_0039.connect() as connection:
+            result = by_name(connection)
+
+        assert result["Migration 0026"].status == "OK"
+        assert result["Migration 0037"].status == "OK"
+        # Pause metadata is needed by running code: FAIL, with the exact remedy.
+        assert result["Migration 0040"].status == "FAIL"
+        assert "paused_at" in result["Migration 0040"].detail
+        assert "0040_" in result["Migration 0040"].remedy
+        # The paused-edit and supplement features are opt-in: WARN, not FAIL.
+        assert result["Migration 0041"].status == "OK"  # a chain-built database has the right owners
+        assert result["Migration 0042"].status == "WARN"
+        assert result["Migration 0043"].status == "WARN"
+        assert result["Migration chain"].status == "OK"  # nothing later is applied
+        assert result["Function ownership"].status == "OK", result["Function ownership"].detail
+        assert result["Migration history table"].status == "INFO"
+
+    def test_b_02_the_report_line_carries_the_remedy_only_when_something_is_wrong(self, engine_0039):
+        with engine_0039.connect() as connection:
+            checks_ = database_checks(connection)
+            connection.rollback()
+        lines = render(checks_).splitlines()
+        assert any(line.startswith("[FAIL]") and "Migration 0040" in line and "->" in line for line in lines)
+        assert not any(line.startswith("[OK") and "->" in line for line in lines)
+
+    def test_b_03_a_skipped_migration_is_a_chain_gap(self, migrated_to_0039, engine_0039):
+        apply_range(migrated_to_0039, 43, 43)  # 0043 without 0040 and 0042
+
+        with engine_0039.connect() as connection:
+            result = by_name(connection)
+
+        assert result["Migration 0043"].status == "OK"
+        assert result["Migration chain"].status == "FAIL"
+        assert "0040" in result["Migration chain"].detail and "0042" in result["Migration chain"].detail
+
+    def test_b_04_applying_them_in_order_clears_the_findings(self, migrated_to_0039, engine_0039):
+        apply_range(migrated_to_0039, 40, 42)
+
+        with engine_0039.connect() as connection:
+            result = by_name(connection)
+
+        for number in ("0040", "0041", "0042", "0043"):
+            assert result[f"Migration {number}"].status == "OK", result[f"Migration {number}"].detail
+
+    def test_b_05_a_guard_function_with_the_wrong_owner_is_a_failure(self, migrated_to_0039, engine_0039):
+        with psycopg.connect(migrated_to_0039, autocommit=True) as su:
+            su.execute("ALTER FUNCTION public.app_guard_frozen_sequence_steps() OWNER TO postgres")
+
+        with engine_0039.connect() as connection:
+            result = by_name(connection)
+
+        assert result["Function ownership"].status == "FAIL"
+        assert "app_guard_frozen_sequence_steps" in result["Function ownership"].detail
+        # Production's shape: the repair migration is reported as not applied, with its file named.
+        assert result["Migration 0041"].status == "WARN"
+        assert "0041_" in result["Migration 0041"].remedy
+        assert "app_integrity_guard" in result["Function ownership"].detail
+
+    def test_b_06_a_personalized_deployment_treats_its_migrations_as_blocking(self, engine_0039):
+        with engine_0039.connect() as connection:
+            quiet = {c.name: c for c in database_checks(connection, Settings(**{**READY_ENV, "personalization_enabled": False}))}
+            connection.rollback()
+        assert quiet["Migration 0028"].status == "OK"  # applied here, so no finding either way
+
+        from app.core.migration_state import MIGRATIONS, migration_checks
+
+        class _Missing:  # a connection on which every probe says "absent"
+            def execute(self, *_a, **_k):
+                class _R:
+                    def scalar(self):
+                        return False
+
+                    def first(self):
+                        return None
+
+                return _R()
+
+        by_label = {c.name: c for c in migration_checks(_Missing(), personalization_enabled=True)}
+        assert by_label["Migration 0028"].status == "FAIL"
+        by_label = {c.name: c for c in migration_checks(_Missing(), personalization_enabled=False)}
+        assert by_label["Migration 0028"].status == "WARN"
+        assert len(MIGRATIONS) >= 20

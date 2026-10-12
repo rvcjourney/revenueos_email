@@ -170,3 +170,92 @@ class DuePlanner:
             min_spacing_seconds=pacing.min_spacing_seconds,
             jitter_key=message_id,
         )
+
+
+# How far to look for a free window before piling up in the last one. The calendar
+# itself stops at ~10 years; no real backlog needs more than a few weeks of windows.
+_MAX_WINDOW_SCAN = 400
+
+
+class MailboxOccupancy:
+    """How many unsent messages one mailbox already has in each sending window.
+
+    Built from per-hour counts of its future unsent messages, so it stays small
+    however big the campaign is. `place` hands out the next free slot, so work that
+    became overdue lands after what is already planned instead of on top of it.
+    Pure: no database, no clock (the calendar carries "now").
+    """
+
+    def __init__(
+        self, calendar: WindowCalendar, hourly: Iterable[tuple[datetime, int]] = ()
+    ) -> None:
+        self._calendar = calendar
+        self._counts: dict[int, int] = {}
+        index = 0
+        for hour_start, count in sorted(hourly):
+            at = hour_start + timedelta(minutes=30)
+            while index < _MAX_WINDOW_SCAN and at >= calendar.window(index)[1]:
+                index += 1
+            self._counts[index] = self._counts.get(index, 0) + int(count)
+
+    def place(
+        self, *, per_day: int, min_spacing_seconds: int, jitter_key: UUID | str
+    ) -> datetime:
+        per_day = max(1, per_day)
+        window = 0
+        while self._counts.get(window, 0) >= per_day and window < _MAX_WINDOW_SCAN:
+            window += 1
+        taken = self._counts.get(window, 0)
+        due = planned_due_at(
+            self._calendar,
+            position=window * per_day + taken,
+            per_day=per_day,
+            min_spacing_seconds=min_spacing_seconds,
+            jitter_key=jitter_key,
+        )
+        self._counts[window] = taken + 1
+        return due
+
+
+class SpreadPlanner:
+    """Places overdue work (a follow-up whose time passed while a campaign was paused,
+    a message that was due when it resumed) into the next free slots of its own
+    mailbox, within the mailbox's daily cap and spacing and the campaign's daily
+    limit. One planner serves one batch; the database is the memory between batches
+    (each placed message becomes occupancy for the next), so a replay or a second
+    worker needs no shared counter. The jitter key must be stable per message so a
+    replay computes the same time."""
+
+    def __init__(
+        self,
+        calendar: WindowCalendar,
+        *,
+        mailbox_count: int,
+        campaign_daily_limit: int | None,
+        pacing_by_mailbox: Mapping[UUID, MailboxPacing],
+        default: MailboxPacing,
+        hourly_by_mailbox: Mapping[UUID, Iterable[tuple[datetime, int]]],
+    ) -> None:
+        self._calendar = calendar
+        self._mailbox_count = max(1, mailbox_count)
+        self._daily_limit = campaign_daily_limit
+        self._pacing = pacing_by_mailbox
+        self._default = default
+        self._hourly = hourly_by_mailbox
+        self._occupancy: dict[UUID, MailboxOccupancy] = {}
+
+    def place(self, mailbox_id: UUID, jitter_key: UUID | str) -> datetime:
+        occupancy = self._occupancy.get(mailbox_id)
+        if occupancy is None:
+            occupancy = MailboxOccupancy(
+                self._calendar, self._hourly.get(mailbox_id, ())
+            )
+            self._occupancy[mailbox_id] = occupancy
+        pacing = self._pacing.get(mailbox_id, self._default)
+        return occupancy.place(
+            per_day=per_mailbox_daily(
+                pacing.daily_cap, self._daily_limit, self._mailbox_count
+            ),
+            min_spacing_seconds=pacing.min_spacing_seconds,
+            jitter_key=jitter_key,
+        )

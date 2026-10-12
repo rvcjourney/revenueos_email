@@ -12,6 +12,7 @@ import type {
   CampaignReview,
   CampaignSequence,
   CampaignSettings,
+  CampaignSupplement,
   MailboxTestSendResult,
   PreflightResult,
   SequencePreviewRecipients,
@@ -456,6 +457,51 @@ export async function commitAudience(
   return (await apiRequest<CampaignAudience>(path, { method: "POST" })).data;
 }
 
+// --- Adding leads to a paused campaign (ADR-0020) ---
+
+export async function listSupplements(workspaceId: string, campaignId: string) {
+  const path = workspacePath(workspaceId, `/campaigns/${campaignId}/audience/supplements`);
+  return (await apiRequest<CampaignSupplement[]>(path)).data;
+}
+
+export async function selectSupplement(
+  workspaceId: string,
+  campaignId: string,
+  payload: { lead_ids: string[]; list_ids: string[] },
+) {
+  const path = workspacePath(workspaceId, `/campaigns/${campaignId}/audience/supplements`);
+  return (
+    await apiRequest<CampaignSupplement>(path, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
+  ).data;
+}
+
+export async function enrollSupplement(
+  workspaceId: string,
+  campaignId: string,
+  audienceId: string,
+) {
+  const path = workspacePath(
+    workspaceId,
+    `/campaigns/${campaignId}/audience/supplements/${audienceId}/enroll`,
+  );
+  return (await apiRequest<CampaignSupplement>(path, { method: "POST" })).data;
+}
+
+export async function retrySupplement(
+  workspaceId: string,
+  campaignId: string,
+  audienceId: string,
+) {
+  const path = workspacePath(
+    workspaceId,
+    `/campaigns/${campaignId}/audience/supplements/${audienceId}/retry`,
+  );
+  return (await apiRequest<CampaignSupplement>(path, { method: "POST" })).data;
+}
+
 export async function abandonAudience(
   workspaceId: string,
   campaignId: string,
@@ -502,7 +548,7 @@ export async function pauseCampaign(
 export async function resumeCampaign(
   workspaceId: string,
   campaignId: string,
-  payload: { expected_version: number },
+  payload: { expected_version: number; include_completed?: boolean },
 ) {
   const path = workspacePath(workspaceId, `/campaigns/${campaignId}/resume`);
   return (

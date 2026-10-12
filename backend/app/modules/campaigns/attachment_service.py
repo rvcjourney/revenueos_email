@@ -13,10 +13,12 @@ from sqlalchemy.orm import Session
 from app.api.deps import WorkspaceContext
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.core.permissions import has_permission
 from app.modules.campaigns.attachments import (
     MAX_ATTACHMENTS,
     MAX_INLINE_IMAGES,
     MAX_TOTAL_BYTES,
+    extract_cid_references,
     storage_safe_name,
     validate_upload,
 )
@@ -111,13 +113,49 @@ class StepAttachmentService:
             )
         return campaign
 
-    def _require_draft(self, campaign: RowMapping) -> None:
-        if campaign["status"] != "DRAFT":
-            raise AppError(
-                "state_conflict",
-                "Attachments can only be changed while the campaign is DRAFT",
-                status_code=409,
-            )
+    def _require_editable(
+        self, context: WorkspaceContext, campaign: RowMapping
+    ) -> bool:
+        """True when this is a paused-campaign edit (ADR-0020). Attachments are
+        read live and checksum-verified at send time, so changing them needs no
+        message rewrite; only STANDARD campaigns and campaigns.execute holders."""
+        if campaign["status"] == "DRAFT":
+            return False
+        if campaign["status"] == "PAUSED" and campaign["activation_id"] is not None:
+            if not has_permission(context.role_code, "campaigns.execute"):
+                raise AppError(
+                    "forbidden",
+                    "Only a manager can change attachments of a paused campaign",
+                    status_code=403,
+                )
+            if campaign.get("campaign_type") == "HYPER_PERSONALIZED":
+                raise AppError(
+                    "state_conflict",
+                    "The emails of a personalized campaign can't be changed once "
+                    "it has started",
+                    status_code=409,
+                )
+            return True
+        raise AppError(
+            "state_conflict",
+            "Attachments can only be changed while the campaign is DRAFT or paused",
+            status_code=409,
+        )
+
+    def _audit_paused(
+        self,
+        context: WorkspaceContext,
+        campaign_id: UUID,
+        step_id: UUID,
+        operation: str,
+    ) -> None:
+        self.repo.record_campaign_audit(
+            workspace_id=context.workspace_id,
+            actor_id=context.user_id,
+            action="campaign.sequence_edited_while_paused",
+            campaign_id=campaign_id,
+            after_state={"operation": operation, "step_id": str(step_id), "fields": []},
+        )
 
     def list_attachments(
         self, context: WorkspaceContext, campaign_id: UUID, step_id: UUID
@@ -141,7 +179,7 @@ class StepAttachmentService:
         """Returns (attachment, created). Uploading the same file again returns
         the existing attachment with created=False."""
         campaign = self._draft_step(context, campaign_id, step_id)
-        self._require_draft(campaign)
+        paused = self._require_editable(context, campaign)
         if disposition not in ("ATTACHMENT", "INLINE"):
             raise AppError(
                 "validation_error", "Invalid attachment kind", status_code=422
@@ -230,6 +268,8 @@ class StepAttachmentService:
                     "conflict", "The file could not be attached", status_code=409
                 )
             return to_attachment_out(winner), False
+        if paused:
+            self._audit_paused(context, campaign_id, step_id, "attachment_added")
         return to_attachment_out(row), True
 
     def delete(
@@ -240,7 +280,7 @@ class StepAttachmentService:
         attachment_id: UUID,
     ) -> None:
         campaign = self._draft_step(context, campaign_id, step_id)
-        self._require_draft(campaign)
+        paused = self._require_editable(context, campaign)
         row = self.repo.get_attachment(
             workspace_id=context.workspace_id,
             step_id=step_id,
@@ -248,6 +288,19 @@ class StepAttachmentService:
         )
         if row is None:
             raise AppError("not_found", "Attachment not found", status_code=404)
+        if paused and row["disposition"] == "INLINE":
+            step = self.repo.get_step(
+                workspace_id=context.workspace_id, step_id=step_id
+            )
+            if step is not None and row["content_id"] in extract_cid_references(
+                step["email_body_html"]
+            ):
+                raise AppError(
+                    "validation_error",
+                    "This image is still used in the email. Remove it from the "
+                    "email text first.",
+                    status_code=422,
+                )
         self.repo.delete_attachment(
             workspace_id=context.workspace_id, attachment_id=attachment_id
         )
@@ -259,6 +312,8 @@ class StepAttachmentService:
         )
         if remaining == 0:
             self._delete_object_quietly(self._storage_factory(), row["storage_key"])
+        if paused:
+            self._audit_paused(context, campaign_id, step_id, "attachment_removed")
 
     def signed_url(
         self,

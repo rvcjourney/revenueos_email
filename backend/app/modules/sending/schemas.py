@@ -59,6 +59,9 @@ class LoadedSendContext:
     mailbox_sender_display_name: str | None
     raw: dict[str, Any]
     mailbox_pending_safety_count: int = 0
+    # ADR-0020 resume fence. None for controlled-test sends (no campaign).
+    message_schedule_generation: int | None = None
+    campaign_schedule_generation: int | None = None
 
 
 @dataclass(frozen=True)

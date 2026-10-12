@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import RowMapping
@@ -14,6 +15,7 @@ from app.modules.campaigns.attachments import extract_cid_references
 from app.modules.campaigns.audience_service import AudienceService
 from app.modules.campaigns.mailbox_service import CampaignMailboxService
 from app.modules.campaigns.repository import CampaignRepository
+from app.modules.campaigns.scheduling import project_into_window
 from app.modules.campaigns.schemas import PreflightIssue, PreflightResult
 from app.modules.campaigns.sequence_service import SequenceService
 from app.modules.campaigns.settings_service import CampaignSettingsService
@@ -80,6 +82,144 @@ class PreflightService:
         self._check_compliance(context, errors)
 
         return PreflightResult(ready=len(errors) == 0, errors=errors, warnings=warnings)
+
+    def run_for_resume(
+        self, context: WorkspaceContext, campaign: RowMapping
+    ) -> PreflightResult:
+        """Revalidation for PAUSED -> RUNNING (CAMPAIGN_STATE_MACHINE: 'Resume
+        revalidates configuration, mailbox availability, safety restrictions and
+        schedule'). Read-only. It deliberately does not re-run the sequence or
+        audience checks: those describe the draft that was frozen at activation
+        and are guarded by their own rules, including the paused-edit checks."""
+        campaign_id = UUID(str(campaign["id"]))
+        errors: list[PreflightIssue] = []
+        warnings: list[PreflightIssue] = []
+
+        self._check_resume_mailboxes(context, campaign_id, errors, warnings)
+        self._check_settings(campaign, errors)
+        if campaign["current_settings_id"] is not None:
+            self._check_resume_window(context, campaign, errors)
+        self._check_compliance(context, errors)
+        if self.repo.count_unfinished_supplement_jobs(
+            workspace_id=context.workspace_id, campaign_id=campaign_id
+        ):
+            errors.append(
+                PreflightIssue(
+                    code="lead_additions_in_progress",
+                    message="Leads you added are still being prepared. Resume "
+                    "once that finishes.",
+                    field_path="audience",
+                )
+            )
+        if self.repo.count_failed_planning_jobs(
+            workspace_id=context.workspace_id, campaign_id=campaign_id
+        ):
+            errors.append(
+                PreflightIssue(
+                    code="planning_failed",
+                    message="Preparing leads for this campaign failed. Retry the "
+                    "failed step before resuming, or some leads would never "
+                    "be sent to.",
+                    field_path="audience",
+                )
+            )
+        return PreflightResult(ready=len(errors) == 0, errors=errors, warnings=warnings)
+
+    def _check_resume_mailboxes(
+        self,
+        context: WorkspaceContext,
+        campaign_id: UUID,
+        errors: list[PreflightIssue],
+        warnings: list[PreflightIssue],
+    ) -> None:
+        rows = [
+            row
+            for row in self.repo.list_campaign_mailboxes(
+                workspace_id=context.workspace_id, campaign_id=campaign_id
+            )
+            if row["active"]
+        ]
+        if not rows:
+            errors.append(
+                PreflightIssue(
+                    code="no_mailboxes_assigned",
+                    message="This campaign has no active sending mailbox.",
+                    field_path="mailboxes",
+                )
+            )
+            return
+
+        def reason(row: RowMapping) -> str | None:
+            if row["connection_state"] in _UNHEALTHY_CONNECTION_STATES:
+                return str(row["connection_state"])
+            if row["policy_state"] in _UNHEALTHY_POLICY_STATES:
+                return str(row["policy_state"])
+            if row["health_state"] == "DEGRADED":
+                return "DEGRADED"
+            if row["circuit_state"] == "OPEN":
+                return "CIRCUIT_OPEN"
+            if int(row["pending_safety_count"] or 0) > 0:
+                return "SAFETY_HOLD"
+            return None
+
+        blocked = [(row, reason(row)) for row in rows if reason(row) is not None]
+        if len(blocked) == len(rows):
+            errors.append(
+                PreflightIssue(
+                    code="no_usable_mailboxes",
+                    message="None of the sending mailboxes can send right now "
+                    "(disconnected, restricted or on a safety hold). Fix them "
+                    "first, then resume.",
+                    field_path="mailboxes",
+                )
+            )
+        else:
+            for row, why in blocked:
+                warnings.append(
+                    PreflightIssue(
+                        code="mailbox_unhealthy",
+                        message=f"Mailbox {row['original_address']} cannot send "
+                        f"right now ({why}). Its emails wait until it recovers.",
+                        field_path=f"mailboxes[{row['mailbox_id']}]",
+                    )
+                )
+
+    def _check_resume_window(
+        self,
+        context: WorkspaceContext,
+        campaign: RowMapping,
+        errors: list[PreflightIssue],
+    ) -> None:
+        settings_row = self.repo.get_settings_version(
+            workspace_id=context.workspace_id,
+            settings_id=UUID(str(campaign["current_settings_id"])),
+        )
+        if settings_row is None:
+            errors.append(
+                PreflightIssue(
+                    code="settings_missing",
+                    message="Configure a sending schedule for this campaign.",
+                    field_path="settings",
+                )
+            )
+            return
+        try:
+            project_into_window(
+                datetime.now(UTC),
+                timezone=settings_row["timezone"],
+                weekday_set=int(settings_row["weekday_set"]),
+                window_start_local=settings_row["window_start_local"],
+                window_end_local=settings_row["window_end_local"],
+            )
+        except AppError:
+            errors.append(
+                PreflightIssue(
+                    code="no_sending_window",
+                    message="The sending schedule has no usable window. Allow at "
+                    "least one weekday with a start time before the end time.",
+                    field_path="settings",
+                )
+            )
 
     def _check_sequence(
         self, context: WorkspaceContext, campaign_id: UUID, errors: list[PreflightIssue]

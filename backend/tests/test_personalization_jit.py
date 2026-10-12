@@ -318,6 +318,27 @@ class TestEligibility:
         assert store.usage["GENERATION"] == 0
         assert store.generation["next_attempt_at"] > clock.now
 
+    def test_reference_edited_during_generation_discards_the_stale_email(self) -> None:
+        """Pause -> edit the reference -> resume while a generation is in flight: what
+        the model wrote followed the OLD reference, so it is thrown away unspent and
+        written again from the new one."""
+        runner, store, model, clock = _build()
+
+        def edited(request):
+            store.step["version"] = store.step.get("version", 1) + 1
+            store.step["email_subject"] = "Better subject"
+            return model.default_output(request)
+
+        model._script = [edited]
+        summary = _run(runner)
+        assert summary.deferred == 1 and summary.generated == 0
+        assert store.message["status"] == "PLANNED"  # nothing written
+        assert store.generation["state"] == "PENDING"  # will be claimed again
+        assert store.generation["attempt_count"] == 0
+        assert store.usage["GENERATION"] == 0
+        assert store.attempts[0]["outcome"] == "ABORTED_INELIGIBLE"
+        assert store.generation["next_attempt_at"] > clock.now
+
     def test_message_already_scheduled_by_someone_else_is_not_overwritten(
         self,
     ) -> None:

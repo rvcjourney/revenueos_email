@@ -5,6 +5,7 @@ import { useParams, usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ArrowLeft } from "lucide-react";
 
+import { CampaignRunControls } from "@/components/campaigns/campaign-run-controls";
 import { CampaignTypeBadge } from "@/components/campaigns/campaign-type-badge";
 import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -99,20 +100,32 @@ export default function CampaignLayout({ children }: { children: React.ReactNode
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
           Campaigns
         </Link>
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 min-w-0 break-words">
-            {campaign.name}
-          </h1>
-          <CampaignStatusBadge status={campaign.status} />
-          <CampaignTypeBadge type={campaign.campaign_type} />
-          {campaign.status === "DRAFT" && errorCount > 0 && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-600/25">
-              <AlertTriangle className="h-3 w-3" aria-hidden="true" />
-              {errorCount} item{errorCount === 1 ? "" : "s"} left before this
-              campaign is ready
-            </span>
-          )}
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900 min-w-0 break-words">
+              {campaign.name}
+            </h1>
+            <CampaignStatusBadge status={campaign.status} />
+            <CampaignTypeBadge type={campaign.campaign_type} />
+            {campaign.status === "DRAFT" && errorCount > 0 && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-inset ring-amber-600/25">
+                <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                {errorCount} item{errorCount === 1 ? "" : "s"} left before this
+                campaign is ready
+              </span>
+            )}
+          </div>
+          <CampaignRunControls campaign={campaign} />
         </div>
+        {campaign.status === "PAUSED" && (
+          <div className="mt-3 max-w-3xl">
+            <Alert variant="warning">
+              This campaign is paused, so nothing new is being sent. You can change the
+              schedule, edit emails that haven&apos;t been sent and add leads. Changes
+              apply when you resume.
+            </Alert>
+          </div>
+        )}
         {campaign.description && (
           <p className="mt-1.5 max-w-3xl text-sm text-slate-500">{campaign.description}</p>
         )}

@@ -603,12 +603,20 @@ class GenerationRunner:
                 )
                 summary.superseded += 1
                 return
+            # The reference email was edited (while the campaign was paused, then
+            # resumed) after this generation read it: what was written follows the
+            # OLD reference. Throw it away and write it again from the new one.
+            reference_changed = item.work.get("step_version") is not None and str(
+                locked["step_version"]
+            ) != str(item.work["step_version"])
             if (
                 locked["campaign_status"] != "RUNNING"
                 or locked["planning_status"] != "READY"
+                or reference_changed
             ):
-                # Paused (or otherwise not running): keep the job for later, and
-                # do not spend the attempt or the budget unit.
+                # Paused (or otherwise not running), or the reference changed under
+                # us: keep the job for later, and do not spend the attempt or the
+                # budget unit.
                 repo.finish_attempt(
                     workspace_id=workspace_id,
                     generation_id=item.generation_id,
@@ -621,7 +629,7 @@ class GenerationRunner:
                 repo.release_claim(
                     workspace_id=workspace_id,
                     generation_id=item.generation_id,
-                    delay_seconds=_PAUSED_DEFER_SECONDS,
+                    delay_seconds=1 if reference_changed else _PAUSED_DEFER_SECONDS,
                     refund_attempt=True,
                 )
                 summary.deferred += 1

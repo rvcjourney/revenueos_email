@@ -35,6 +35,8 @@ class Check:
     name: str
     status: Status
     detail: str
+    # What to do about a FAIL/WARN, when there is one specific thing to do.
+    remedy: str = ""
 
 
 def _ok(name: str, detail: str) -> Check:
@@ -167,10 +169,23 @@ _EXPECTED_POLICIES = (
 )
 
 
-def database_checks(connection: Connection) -> list[Check]:
+def database_checks(
+    connection: Connection, settings: Settings | None = None
+) -> list[Check]:
     """Checks against the database. Only SELECTs; the caller rolls back."""
+    from app.core.migration_state import migration_checks
+
     checks: list[Check] = []
     connection.execute(text("SET TRANSACTION READ ONLY"))
+
+    # Which migrations exist here at all? Catalog-only, so it works for any user
+    # and runs before the row-level-security gate below.
+    checks.extend(
+        migration_checks(
+            connection,
+            personalization_enabled=bool(settings and settings.personalization_enabled),
+        )
+    )
 
     # Privileges and policies do not depend on row-level security.
     missing = [
@@ -312,7 +327,7 @@ def run(settings: Settings) -> list[Check]:
     try:
         with engine.connect() as connection:
             try:
-                checks.extend(database_checks(connection))
+                checks.extend(database_checks(connection, settings))
             finally:
                 connection.rollback()
     except Exception as exc:
@@ -323,9 +338,12 @@ def run(settings: Settings) -> list[Check]:
 
 
 def render(checks: Iterable[Check]) -> str:
+    checks = list(checks)
     width = max((len(c.name) for c in checks), default=0)
     return "\n".join(
-        f"[{c.status:<4}] {c.name:<{width}}  {c.detail}" for c in checks
+        f"[{c.status:<4}] {c.name:<{width}}  {c.detail}"
+        + (f"  -> {c.remedy}" if c.remedy and c.status != "OK" else "")
+        for c in checks
     )
 
 

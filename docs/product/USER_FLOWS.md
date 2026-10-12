@@ -1388,6 +1388,10 @@ Future unsent execution stops according to state rules
 Already completed sends remain recorded
 ```
 
+## Implemented behaviour (ADR-0020)
+
+Pause is idempotent: pausing an already paused campaign returns it unchanged. The response reports how many emails were already past the send gate (queued, being sent or of unknown outcome) because a pause cannot recall them. While paused a manager can change the schedule, edit the wording of emails that have not been sent, add or restructure steps after the last one any lead reached (standard campaigns), and add leads. A personalized campaign only allows rewording a reference email whose personalized versions have not been written yet. If adding leads fails, a **Retry** button continues where it stopped, and resume stays blocked until it succeeds.
+
 ## Concurrency Consideration
 
 A pause request may occur while a worker is processing a message.
@@ -1403,6 +1407,10 @@ The product promise must be deterministic rather than dependent on timing accide
 ## Goal
 
 Continue an eligible paused campaign.
+
+## Implemented behaviour (ADR-0020)
+
+Resume is idempotent. It revalidates mailboxes (at least one able to send), the sending schedule, unsubscribe configuration and any unfinished lead additions, and answers with the list of problems if it cannot proceed. Waits keep elapsing while paused; on resume every unsent message is re-validated and re-timed by a reconcile pass, and work that became overdue is spread over the sending windows by the existing pacing instead of going out together. Nothing is sent earlier than its wait. Edits made while paused are applied to unsent emails by the same pass. Leads that already finished the sequence stay finished unless the user ticks **also send the new emails to leads who already finished the sequence** in the resume dialog (standard campaigns; only leads who have not replied, unsubscribed or bounced).
 
 ## Flow
 

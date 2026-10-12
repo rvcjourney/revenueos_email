@@ -464,6 +464,7 @@ class PersonalizationRepository:
                            e.frozen_variables, e.address_id,
                            ss.email_subject, ss.email_body_html, ss.email_preheader,
                            ss.position AS step_position,
+                           ss.version AS step_version,
                            seq.personalization_config,
                            sv.timezone, sv.weekday_set,
                            sv.window_start_local, sv.window_end_local
@@ -542,7 +543,8 @@ class PersonalizationRepository:
                            m.status AS message_status, m.due_at, m.anchor_at,
                            m.address_id,
                            c.status AS campaign_status, c.planning_status,
-                           e.state AS enrollment_state, e.next_step_id
+                           e.state AS enrollment_state, e.next_step_id,
+                           ss.version AS step_version
                     FROM message_generations g
                     JOIN messages m
                       ON m.workspace_id = g.workspace_id AND m.id = g.message_id
@@ -550,6 +552,8 @@ class PersonalizationRepository:
                       ON c.workspace_id = g.workspace_id AND c.id = g.campaign_id
                     JOIN campaign_enrollments e
                       ON e.workspace_id = g.workspace_id AND e.id = g.enrollment_id
+                    JOIN sequence_steps ss
+                      ON ss.workspace_id = g.workspace_id AND ss.id = g.step_id
                     WHERE g.workspace_id = :workspace_id AND g.id = :generation_id
                     FOR UPDATE OF g, m
                     """
@@ -590,6 +594,13 @@ class PersonalizationRepository:
                     frozen_sender_name = mb.sender_display_name,
                     rendered_at = pg_catalog.transaction_timestamp(),
                     due_at = :due_at,
+                    -- ADR-0020: stamp the campaign's current generation so a
+                    -- message generated after a resume stays claimable.
+                    schedule_generation = (
+                        SELECT c.schedule_generation FROM campaigns c
+                        WHERE c.workspace_id = m.workspace_id
+                          AND c.id = m.campaign_id
+                    ),
                     status = 'SCHEDULED'
                 FROM campaign_enrollments e, mailboxes mb
                 WHERE m.workspace_id = :workspace_id AND m.id = :message_id

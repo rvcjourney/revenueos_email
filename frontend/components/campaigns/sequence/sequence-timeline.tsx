@@ -45,6 +45,13 @@ type Props = {
   regeneratingStepId?: string | null;
   // Any AI drafting request is running, so every Regenerate button waits.
   generating?: boolean;
+  // Paused campaign (ADR-0020): steps at or before this position were reached by a
+  // lead. Their content and waits stay editable; their place in the sequence does
+  // not, and neither does deleting them. 0 for a draft.
+  lockedThrough?: number;
+  // Paused personalized campaign: only the wording of an email nobody has been sent a
+  // written version of can change. Adding, removing, moving and re-timing steps is off.
+  referenceOnly?: boolean;
 };
 
 function plainText(html: string | null): string {
@@ -71,6 +78,8 @@ export function SequenceTimeline({
   onRegenerateEmail,
   regeneratingStepId = null,
   generating = false,
+  lockedThrough = 0,
+  referenceOnly = false,
 }: Props) {
   const timings = React.useMemo(() => computeTimings(steps), [steps]);
   const problems = sequenceProblems(steps);
@@ -108,6 +117,14 @@ export function SequenceTimeline({
             const emailIndex = number - 1;
             const snippet = plainText(step.email_body_html);
             const nextIsWait = steps[index + 1]?.kind === "WAIT";
+            // A step leads already reached keeps its place; one after it can move.
+            const placeLocked = step.position <= lockedThrough;
+            const previousEmail = emailIndex > 0 ? emails[emailIndex - 1] : null;
+            const upLocked = placeLocked || (previousEmail?.position ?? 0) <= lockedThrough;
+            const showCounts =
+              !referenceOnly && lockedThrough > 0 && step.sent_count !== undefined;
+            const writtenCount = step.written_count ?? 0;
+            const stepFrozen = referenceOnly && writtenCount > 0;
             return (
               <li key={step.id} className="list-none">
                 <article
@@ -128,9 +145,9 @@ export function SequenceTimeline({
                     <div className="flex items-center gap-1">
                       <Button variant="outline" size="sm" onClick={() => onOpenEmail(step)}>
                         <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                        {readOnly ? "View" : "Edit"}
+                        {readOnly || stepFrozen ? "View" : "Edit"}
                       </Button>
-                      {!readOnly ? (
+                      {!readOnly && !referenceOnly ? (
                         <>
                           {onRegenerateEmail ? (
                             <Button
@@ -161,7 +178,7 @@ export function SequenceTimeline({
                             className="h-8 w-8"
                             aria-label={`Duplicate step ${number}`}
                             title="Duplicate"
-                            disabled={busy}
+                            disabled={busy || step.position < lockedThrough}
                             onClick={() => onDuplicate(step)}
                           >
                             <Copy className="h-3.5 w-3.5" aria-hidden="true" />
@@ -171,8 +188,8 @@ export function SequenceTimeline({
                             size="icon"
                             className="h-8 w-8"
                             aria-label={`Move step ${number} up`}
-                            title="Move up"
-                            disabled={busy || emailIndex === 0}
+                            disabled={busy || emailIndex === 0 || upLocked}
+                            title={placeLocked ? "Leads have already received this email" : "Move up"}
                             onClick={() => onMoveEmail(step, -1)}
                           >
                             <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
@@ -182,8 +199,8 @@ export function SequenceTimeline({
                             size="icon"
                             className="h-8 w-8"
                             aria-label={`Move step ${number} down`}
-                            title="Move down"
-                            disabled={busy || emailIndex === emails.length - 1}
+                            title={placeLocked ? "Leads have already received this email" : "Move down"}
+                            disabled={busy || emailIndex === emails.length - 1 || placeLocked}
                             onClick={() => onMoveEmail(step, 1)}
                           >
                             <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
@@ -193,8 +210,8 @@ export function SequenceTimeline({
                             size="icon"
                             className="h-8 w-8 text-red-600 hover:text-red-700"
                             aria-label={`Delete step ${number}`}
-                            title="Delete"
-                            disabled={busy}
+                            title={placeLocked ? "Leads have already received this email" : "Delete"}
+                            disabled={busy || placeLocked}
                             onClick={() => onDelete(step)}
                           >
                             <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -217,9 +234,27 @@ export function SequenceTimeline({
                       {snippet || <span className="text-slate-400">Empty body</span>}
                     </p>
                   </button>
+                  {referenceOnly ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      {writtenCount > 0
+                        ? `${writtenCount} personalized email${writtenCount === 1 ? "" : "s"} already written; this step can't be changed.`
+                        : `Nothing written yet${
+                            (step.unwritten_count ?? 0) > 0
+                              ? `: ${step.unwritten_count} will be written from this version.`
+                              : "."
+                          }`}
+                    </p>
+                  ) : null}
+                  {showCounts ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Sent to {step.sent_count} lead{step.sent_count === 1 ? "" : "s"}
+                      {" · "}
+                      {step.unsent_count} waiting. Changes apply to the ones waiting.
+                    </p>
+                  ) : null}
                 </article>
                 {/* Insert-between control sits on the connector after this email. */}
-                {!readOnly && nextIsWait ? (
+                {!readOnly && !referenceOnly && nextIsWait && step.position >= lockedThrough ? (
                   <div className="flex justify-center">
                     <button
                       type="button"
@@ -259,7 +294,7 @@ export function SequenceTimeline({
               <div className="flex flex-col items-center" role="group" aria-label="Wait">
                 <span className="h-4 w-px bg-slate-300" aria-hidden="true" />
                 <div className="flex items-center gap-1">
-                  {readOnly ? (
+                  {readOnly || referenceOnly ? (
                     <span
                       className={cn(
                         "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium",
@@ -310,7 +345,7 @@ export function SequenceTimeline({
                       )}
                     </Popover>
                   )}
-                  {!readOnly && isOrphan ? (
+                  {!readOnly && !referenceOnly && isOrphan && step.position > lockedThrough ? (
                     <Button
                       variant="ghost"
                       size="icon"
@@ -337,7 +372,7 @@ export function SequenceTimeline({
         })}
       </ol>
 
-      {!readOnly ? (
+      {!readOnly && !referenceOnly ? (
         <div className="flex justify-center pt-1">
           <Button variant="outline" size="sm" disabled={busy} onClick={onAddEmail}>
             <Plus className="h-3.5 w-3.5" aria-hidden="true" />
