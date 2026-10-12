@@ -37,6 +37,14 @@ class StorageObjectCorruptError(StorageError):
     """Permanent: downloaded bytes do not match the recorded digest."""
 
 
+class StorageBucketMissingError(StorageError):
+    """Permanent: the configured bucket does not exist (deployment setup gap).
+
+    Supabase reports this as HTTP 400 with statusCode "404" in the body, so it
+    cannot be told apart from other rejections by the HTTP status alone.
+    """
+
+
 class SupabaseStorageClient:
     """Thin wrapper over the Supabase Storage REST API.
 
@@ -157,7 +165,17 @@ class SupabaseStorageClient:
         if response.status_code >= 500:
             raise StorageUnavailableError(f"Storage {action} failed: {response.status_code}")
         if response.status_code >= 400:
-            raise StorageError(f"Storage {action} rejected: {response.status_code}")
+            # The body (e.g. "Bucket not found", "mime type not supported") is
+            # the only way to see why storage refused; it goes to the server log
+            # via the exception message and is never sent to the client.
+            body = response.text[:300]
+            if "bucket not found" in body.lower():
+                raise StorageBucketMissingError(
+                    f"Storage {action} rejected: bucket not found ({body})"
+                )
+            raise StorageError(
+                f"Storage {action} rejected: {response.status_code} {body}"
+            )
 
 
 def map_storage_error(exc: StorageError) -> AppError:

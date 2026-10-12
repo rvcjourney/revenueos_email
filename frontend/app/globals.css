@@ -112,6 +112,90 @@ select {
 .email-editor .ProseMirror h2 {
   font-size: 1.25em;
 }
+/* Inline images: resizable, optionally floated so text wraps beside them. */
+.email-editor .ProseMirror .email-image {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: bottom;
+  line-height: 0;
+}
+.email-editor .ProseMirror .email-image img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+.email-editor .ProseMirror .email-image[data-align="left"] {
+  float: left;
+  margin: 0 8px 4px 0;
+}
+.email-editor .ProseMirror .email-image[data-align="right"] {
+  float: right;
+  margin: 0 0 4px 8px;
+}
+.email-editor .ProseMirror .email-image.ProseMirror-selectednode img {
+  outline: 2px solid rgb(79 70 229);
+  outline-offset: 1px;
+}
+.email-editor .ProseMirror .email-image-handle,
+.email-editor .ProseMirror .email-image-bar {
+  display: none;
+}
+.email-editor .ProseMirror .email-image.ProseMirror-selectednode .email-image-handle {
+  display: block;
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: rgb(79 70 229);
+  border: 2px solid #fff;
+  cursor: nwse-resize;
+  touch-action: none;
+}
+.email-editor .ProseMirror .email-image[data-align="right"].ProseMirror-selectednode .email-image-handle {
+  right: auto;
+  left: -6px;
+  cursor: nesw-resize;
+}
+.email-editor .ProseMirror .email-image.ProseMirror-selectednode .email-image-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  position: absolute;
+  top: -34px;
+  left: 0;
+  z-index: 10;
+  padding: 2px;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(15 23 42 / 0.12);
+  line-height: 1;
+  white-space: nowrap;
+}
+.email-editor .ProseMirror .email-image-bar button {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: rgb(51 65 85);
+}
+.email-editor .ProseMirror .email-image-bar button:hover {
+  background: rgb(241 245 249);
+}
+.email-editor .ProseMirror .email-image-bar button[aria-pressed="true"] {
+  background: rgb(238 242 255);
+  color: rgb(67 56 202);
+  font-weight: 600;
+}
+.email-editor .ProseMirror .email-image-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: rgb(226 232 240);
+}
 .email-editor .ProseMirror p.is-editor-empty:first-child::before {
   content: attr(data-placeholder);
   float: left;

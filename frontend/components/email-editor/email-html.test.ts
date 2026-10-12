@@ -1,6 +1,8 @@
+import { Editor } from "@tiptap/core";
 import { describe, expect, it } from "vitest";
 
 import {
+  buildEmailExtensions,
   canonicalizeHtml,
   cidToEditorHtml,
   cidToPreviewHtml,
@@ -135,5 +137,39 @@ describe("inline image conversions", () => {
 
   it("keeps images through the visual editor round trip", () => {
     expect(roundTripsCleanly(stored)).toBe(true);
+  });
+});
+
+describe("inline image size and position", () => {
+  const sized = '<p><img src="cid:abc12345" alt="logo" width="240" align="left" hspace="8">Text</p>';
+
+  it("keeps width, align and the float gap through the visual editor", () => {
+    expect(roundTripsCleanly(sized)).toBe(true);
+  });
+
+  it("does not add align or a gap to an inline image", () => {
+    const html = '<p><img src="cid:abc12345" alt="" width="100"></p>';
+    expect(roundTripsCleanly(html)).toBe(true);
+  });
+
+  it("resizes and repositions the selected image from its option bar", () => {
+    const editor = new Editor({
+      extensions: buildEmailExtensions(),
+      content: '<p><img src="https://e.com/a.png" alt="a" width="240">Hi</p>',
+    });
+    editor.commands.setNodeSelection(1);
+    const click = (title: string) =>
+      (editor.view.dom.querySelector(`button[aria-label="${title}"]`) as HTMLButtonElement).click();
+
+    click("Large image");
+    expect(editor.getHTML()).toContain('width="480"');
+
+    click("Image on the left, text wraps on its right");
+    expect(editor.getHTML()).toContain('align="left"');
+    expect(editor.getHTML()).toContain('hspace="8"');
+
+    click("In line with the text");
+    expect(editor.getHTML()).not.toContain("align=");
+    editor.destroy();
   });
 });

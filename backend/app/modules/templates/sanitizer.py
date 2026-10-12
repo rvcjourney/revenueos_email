@@ -259,6 +259,10 @@ class _EmailHTMLParser(HTMLParser):
             elif tag == "img" and name in {"width", "height"}:
                 if _EMAIL_DIMENSION_RE.match(value.strip()):
                     parts.append(f'{name}="{value.strip()}"')
+            elif tag == "img" and name == "hspace":
+                # Gap beside an image that text wraps around (align="left").
+                if _EMAIL_SPAN_RE.match(value.strip()):
+                    parts.append(f'hspace="{value.strip()}"')
             elif name == "align" and _EMAIL_ALIGN_RE.match(value.strip()):
                 parts.append(f'align="{value.strip().lower()}"')
             elif tag in {"td", "th"} and name in {"colspan", "rowspan"}:

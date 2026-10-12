@@ -87,6 +87,14 @@ class TestEmailSanitizer:
             '<img src="https://e.com/a.png" alt="a" width="10" onerror="x()">'
         )
 
+    def test_img_keeps_size_and_wrap_attributes_but_not_arbitrary_ones(self) -> None:
+        out = sanitize_email_html(
+            '<img src="cid:abc-123" width="240" align="left" hspace="8" '
+            'vspace="999" onclick="x()">'
+        )
+        assert 'width="240"' in out and 'align="left"' in out and 'hspace="8"' in out
+        assert "vspace" not in out and "onclick" not in out
+
     def test_style_property_allow_list(self) -> None:
         out = sanitize_email_html(
             '<span style="color:red;position:absolute;'

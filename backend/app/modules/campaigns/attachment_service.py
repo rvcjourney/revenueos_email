@@ -25,6 +25,7 @@ from app.modules.campaigns.attachments import (
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import StepAttachmentOut, StepAttachmentUrlOut
 from app.modules.imports.storage import (
+    StorageBucketMissingError,
     StorageError,
     StorageObjectMissingError,
     StorageUnavailableError,
@@ -58,6 +59,16 @@ def to_attachment_out(row: RowMapping | dict[str, Any]) -> StepAttachmentOut:
 
 def _storage_error(exc: StorageError) -> AppError:
     """Client-safe classification; never leaks storage internals."""
+    # The detail stays in the server log: the client message is deliberately
+    # generic, so without this a failed upload cannot be diagnosed.
+    logger.warning("Attachment storage error: %s: %s", type(exc).__name__, exc)
+    if isinstance(exc, StorageBucketMissingError):
+        return AppError(
+            "attachment_storage_not_configured",
+            "File storage isn't set up for attachments yet. "
+            "Ask your administrator to create the attachments bucket.",
+            status_code=500,
+        )
     if isinstance(exc, StorageUnavailableError):
         return AppError(
             "attachment_storage_unavailable",

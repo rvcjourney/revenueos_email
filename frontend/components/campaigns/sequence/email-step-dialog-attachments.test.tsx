@@ -388,7 +388,7 @@ describe("inline images", () => {
     await chooseFile(user, /choose an image to insert/i, file("logo.png", 100, "image/png"));
     await waitFor(() =>
       expect(screen.getByLabelText("HTML source")).toHaveValue(
-        `<p>Hi there</p><img src="cid:${IMAGE.content_id}" alt="logo.png">`,
+        `<p>Hi there</p><img src="cid:${IMAGE.content_id}" alt="logo.png" width="240">`,
       ),
     );
   });
