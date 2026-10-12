@@ -458,6 +458,7 @@ class PersonalizationRepository:
                            g.sequence_id, g.step_id, g.enrollment_id,
                            g.attempt_count, g.max_attempts, g.transient_error_count,
                            m.status AS message_status, m.due_at, m.anchor_at,
+                           m.created_at AS message_created_at,
                            c.campaign_type, c.status AS campaign_status,
                            c.planning_status,
                            e.state AS enrollment_state, e.next_step_id,
@@ -617,6 +618,31 @@ class PersonalizationRepository:
                 "body_html": body_html,
                 "content_digest": content_digest,
                 "renderer_version": renderer_version,
+                "due_at": due_at,
+            },
+        ).first()
+        return row is not None
+
+    def retime_planned_message(
+        self, *, workspace_id: UUID, message_id: UUID, due_at: datetime
+    ) -> bool:
+        """Move a message that is still waiting to be written to the time its wait
+        now implies (ADR-0020: waits can be edited while a campaign is paused).
+        Guarded on `PLANNED` and not yet rendered, so a written or stopped message
+        is never touched. The timing columns are already granted to this role."""
+        row = self.session.execute(
+            text(
+                """
+                UPDATE messages
+                SET due_at = :due_at
+                WHERE workspace_id = :workspace_id AND id = :message_id
+                  AND status = 'PLANNED' AND rendered_at IS NULL
+                RETURNING id
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "message_id": str(message_id),
                 "due_at": due_at,
             },
         ).first()
@@ -797,7 +823,7 @@ class PersonalizationRepository:
             self.session.execute(
                 text(
                     """
-                    SELECT position, kind, wait_duration_minutes
+                    SELECT id, position, kind, wait_duration_minutes, updated_at
                     FROM sequence_steps
                     WHERE workspace_id = :workspace_id AND sequence_id = :sequence_id
                     ORDER BY position

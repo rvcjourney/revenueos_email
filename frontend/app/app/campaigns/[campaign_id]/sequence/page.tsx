@@ -118,8 +118,9 @@ export default function CampaignSequencePage() {
   // enforces both and answers state_conflict / forbidden otherwise.
   const pausedEdit = campaignStatus === "PAUSED" && sequence?.paused_edit_allowed === true;
   const lockedThrough = pausedEdit ? (sequence?.structure_locked_through ?? 0) : 0;
-  // A paused personalized campaign opens only the wording of references nobody has
-  // been sent a written version of; the rest of its setup and structure stay frozen.
+  // A paused personalized campaign is edited like a standard one (wording, waits, steps
+  // after the last one a lead reached); emails already written keep their version. Its
+  // setup (objective, company, style) and attachments stay frozen.
   const pausedHyper = pausedEdit && isHyper;
   const readOnly = pausedEdit
     ? false
@@ -262,7 +263,7 @@ export default function CampaignSequencePage() {
         day={timings.get(openStep.id)?.day ?? 1}
         previousEmailDay={previousEmail ? (timings.get(previousEmail.id)?.day ?? 1) : null}
         precedingWait={precedingWait}
-        readOnly={readOnly || (pausedHyper && (openStep.written_count ?? 0) > 0)}
+        readOnly={readOnly}
         canTestSend={canExecuteCampaign(activeWorkspace?.role_code)}
         referenceMode={isHyper}
         designedEmail={designedEmail}
@@ -294,9 +295,11 @@ export default function CampaignSequencePage() {
 
       {pausedHyper ? (
         <Alert variant="info">
-          This campaign is paused. You can improve the wording of an email whose personalized
-          versions haven&apos;t been written yet; versions already written, the waits and the
-          order of steps can&apos;t change. Edits take effect when you resume.
+          This campaign is paused. You can change the wording of any email and the waits, and
+          add, move or remove emails after the last one any lead has received. Personalized
+          versions already written keep their current text; only the ones written after you
+          resume use your changes. The campaign setup and attachments can&apos;t change. Edits
+          take effect when you resume.
         </Alert>
       ) : pausedEdit ? (
         <Alert variant="info">
@@ -399,7 +402,7 @@ export default function CampaignSequencePage() {
           scheduleNote={describeSchedule(latestSettings)}
           savingWaitId={savingWaitId}
           lockedThrough={lockedThrough}
-          referenceOnly={pausedHyper}
+          personalized={isHyper}
           onOpenEmail={(step) => setOpenStepId(step.id)}
           onDuplicate={(step) => duplicateMutation.mutate(step)}
           onDelete={onDelete}

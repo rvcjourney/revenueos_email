@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import RowMapping, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import WorkspaceContext
@@ -81,9 +82,9 @@ class SequenceService:
     ) -> tuple[RowMapping, bool]:
         """(campaign, paused_edit). DRAFT is edited as always. An activated,
         PAUSED campaign may be edited by campaigns.execute holders (ADR-0020); every
-        other state is frozen. A personalized campaign allows far less: callers
-        reject structure changes with `_refuse_hyper_structure`, and a step may only
-        be edited while none of its emails has been written."""
+        other state is frozen. A personalized campaign follows the same rules (its
+        emails that were already written keep their text), except that attachments
+        stay frozen -- see `_refuse_hyper_attachment_change`."""
         campaign = self.repo.get_campaign(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
@@ -109,15 +110,26 @@ class SequenceService:
     def _is_hyper(campaign: RowMapping) -> bool:
         return campaign.get("campaign_type") == "HYPER_PERSONALIZED"
 
-    def _refuse_hyper_structure(self, campaign: RowMapping, paused: bool) -> None:
-        """A personalized campaign writes every email from its step's reference just
-        before sending, so adding, removing, reordering or re-timing steps would
-        change who gets what. Only the wording of an unwritten reference may change."""
-        if paused and self._is_hyper(campaign):
+    def _refuse_hyper_attachment_change(
+        self,
+        context: WorkspaceContext,
+        campaign: RowMapping,
+        paused: bool,
+        step_id: UUID,
+        *,
+        action: str,
+    ) -> None:
+        """The attachments of a personalized campaign stay frozen while paused (the
+        database guard enforces it). A step that carries some therefore can't be
+        removed (they would go with it) or copied (they would be copied too)."""
+        if not (paused and self._is_hyper(campaign)):
+            return
+        if self.repo.list_step_attachments(
+            workspace_id=context.workspace_id, step_id=step_id
+        ):
             raise self._locked(
-                "Steps of a personalized campaign can't be added, removed, "
-                "reordered or re-timed once it has started. You can still improve "
-                "the wording of an email that hasn't been written yet."
+                "This email has attachments, and the attachments of a personalized "
+                f"campaign can't change once it has started, so it can't be {action}."
             )
 
     def _sequence_frontier(self, context: WorkspaceContext, sequence_id: UUID) -> int:
@@ -398,7 +410,6 @@ class SequenceService:
         payload: SequenceStepCreateIn,
     ) -> SequenceStepOut:
         campaign, paused = self._require_editable_campaign(context, campaign_id)
-        self._refuse_hyper_structure(campaign, paused)
         sequence = self._ensure_sequence(context, campaign_id)
         if paused:
             existing_steps = self.repo.list_steps_ordered(
@@ -518,7 +529,7 @@ class SequenceService:
         if existing is None or str(existing["campaign_id"]) != str(campaign_id):
             raise AppError("not_found", "Sequence step not found", status_code=404)
         if paused and self._is_hyper(campaign):
-            self._require_unwritten_reference(context, existing, payload)
+            self._refuse_inline_images_in_reference(payload)
 
         if existing["kind"] == "EMAIL":
             content_changing = (
@@ -637,12 +648,14 @@ class SequenceService:
         removes the WAIT before it (or the one after it when it is first), in the
         same transaction, so Email/Wait alternation is not left broken."""
         campaign, paused = self._require_editable_campaign(context, campaign_id)
-        self._refuse_hyper_structure(campaign, paused)
         sequence = self.repo.get_sequence(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
         if sequence is None:
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        self._refuse_hyper_attachment_change(
+            context, campaign, paused, step_id, action="removed"
+        )
         frontier = 0
         if paused:
             frontier = self._sequence_frontier(context, UUID(str(sequence["id"])))
@@ -674,15 +687,17 @@ class SequenceService:
                             "The wait before this email belongs to steps leads "
                             "have already reached, so it can't be removed."
                         )
-                    self.repo.delete_step(
+                    self._delete_step_row(
+                        UUID(str(sequence["id"])),
+                        neighbour["id"],
                         workspace_id=context.workspace_id,
-                        sequence_id=UUID(str(sequence["id"])),
-                        step_id=UUID(str(neighbour["id"])),
+                        paused=paused,
                     )
-        deleted = self.repo.delete_step(
+        deleted = self._delete_step_row(
+            UUID(str(sequence["id"])),
+            step_id,
             workspace_id=context.workspace_id,
-            sequence_id=UUID(str(sequence["id"])),
-            step_id=step_id,
+            paused=paused,
         )
         if not deleted:
             raise AppError("not_found", "Sequence step not found", status_code=404)
@@ -707,10 +722,12 @@ class SequenceService:
         together.
         """
         campaign, paused = self._require_editable_campaign(context, campaign_id)
-        self._refuse_hyper_structure(campaign, paused)
         source = self.repo.get_step(workspace_id=context.workspace_id, step_id=step_id)
         if source is None or str(source["campaign_id"]) != str(campaign_id):
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        self._refuse_hyper_attachment_change(
+            context, campaign, paused, step_id, action="copied"
+        )
         if source["kind"] != "EMAIL":
             raise AppError(
                 "validation_error",
@@ -789,8 +806,7 @@ class SequenceService:
         campaign_id: UUID,
         payload: SequenceStepsReorderIn,
     ) -> SequenceOut:
-        campaign, paused = self._require_editable_campaign(context, campaign_id)
-        self._refuse_hyper_structure(campaign, paused)
+        _, paused = self._require_editable_campaign(context, campaign_id)
         sequence = self.repo.get_sequence(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
@@ -845,26 +861,9 @@ class SequenceService:
             )
         return self.get_sequence(context, campaign_id)
 
-    def _require_unwritten_reference(
-        self,
-        context: WorkspaceContext,
-        step: RowMapping,
-        payload: SequenceStepUpdateIn,
-    ) -> None:
-        """Paused personalized campaign: only an EMAIL step's wording, and only while
-        none of its emails has been written (the database guard enforces the same)."""
-        if step["kind"] != "EMAIL" or payload.wait_duration_minutes is not None:
-            raise self._locked(
-                "Waits of a personalized campaign can't be changed once it has started."
-            )
-        if self.repo.count_written_step_messages(
-            workspace_id=context.workspace_id, step_id=UUID(str(step["id"]))
-        ):
-            raise self._locked(
-                "Emails for this step have already been written, so its wording "
-                "can't change. Steps whose emails haven't been written yet can "
-                "still be edited."
-            )
+    def _refuse_inline_images_in_reference(self, payload: SequenceStepUpdateIn) -> None:
+        """A personalized email is written from its reference, which can't carry
+        inline images (the attachments of a started campaign are frozen)."""
         body = payload.email_body_html
         if body is not None and extract_cid_references(body):
             raise AppError(
@@ -873,6 +872,26 @@ class SequenceService:
                 "personalized campaign.",
                 status_code=422,
             )
+
+    def _delete_step_row(
+        self, sequence_id: UUID, step_id: UUID, *, workspace_id: UUID, paused: bool
+    ) -> bool:
+        """Delete one step. While paused, a database refusal can only mean a lead
+        reached the step after the frontier was read (a message or enrollment now
+        points at it), so say that instead of surfacing a database error."""
+        try:
+            return self.repo.delete_step(
+                workspace_id=workspace_id,
+                sequence_id=sequence_id,
+                step_id=UUID(str(step_id)),
+            )
+        except IntegrityError as exc:
+            if not paused:
+                raise
+            raise self._locked(
+                "A lead has just reached this step, so it can't be removed. "
+                "Refresh and try again."
+            ) from exc
 
     def _validate_cid_references(
         self, context: WorkspaceContext, step_id: UUID | None, body_html: str | None

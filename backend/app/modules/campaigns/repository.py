@@ -619,22 +619,6 @@ class CampaignRepository:
             str(r[0]): (int(r[1]), int(r[2]), int(r[3]), int(r[4])) for r in rows
         }
 
-    def count_written_step_messages(
-        self, *, workspace_id: UUID, step_id: UUID
-    ) -> int:
-        """Messages of this step whose text has been written (rendered)."""
-        value = self.session.execute(
-            text(
-                """
-                SELECT count(*) FROM messages
-                WHERE workspace_id = :workspace_id AND step_id = :step_id
-                  AND rendered_at IS NOT NULL
-                """
-            ),
-            {"workspace_id": str(workspace_id), "step_id": str(step_id)},
-        ).scalar()
-        return int(value or 0)
-
     def get_step(
         self, *, workspace_id: UUID, step_id: UUID, for_update: bool = False
     ) -> RowMapping | None:

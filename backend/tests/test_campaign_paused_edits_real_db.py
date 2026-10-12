@@ -201,19 +201,21 @@ def test_member_cannot_edit_a_paused_campaigns_emails(session_factory, su, produ
     assert step_row(su, w.step2)["email_subject"] == "A different angle for {{company}}"
 
 
-def test_personalized_campaign_structure_stays_frozen_even_when_paused(session_factory, su, producer) -> None:
-    """A personalized campaign's steps can't be restructured or re-timed while paused
-    (only an unwritten reference's wording can change: test_campaign_hyper_paused_edits_real_db)."""
+def test_personalized_campaign_follows_the_same_structure_rules_when_paused(session_factory, su, producer) -> None:
+    """A personalized campaign is no longer special: steps no lead has reached can be removed
+    (details: test_campaign_hyper_paused_edits_real_db). Before migration 0046 this was refused."""
     w = seed_world(su, running=True, campaign_type="HYPER_PERSONALIZED", members=1, enroll_first=False)
     su.execute("SET session_replication_role = replica")
     su.execute("UPDATE public.campaigns SET status='PAUSED' WHERE id=%s", [w.campaign_id])
     su.execute("SET session_replication_role = origin")
     freeze(su, w)
-    with pytest.raises(AppError) as info:
-        edit(session_factory, w, "MANAGER", lambda svc, ctx: svc.delete_step(ctx, w.campaign_id, w.step2))
-    assert info.value.status_code == 409
-    with pytest.raises(psycopg.errors.CheckViolation):  # the trigger agrees
-        su.execute("DELETE FROM public.sequence_steps WHERE id=%s", [w.step2])
+    edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.delete_step(ctx, w.campaign_id, w.step2, with_adjacent_wait=True),
+    )
+    assert su.execute("SELECT count(*) FROM public.sequence_steps WHERE sequence_id=%s", [w.sequence_id]).fetchone() == (1,)
 
 
 # ---------------------------------------------------------------------------

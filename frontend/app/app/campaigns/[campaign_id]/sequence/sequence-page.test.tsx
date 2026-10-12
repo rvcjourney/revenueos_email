@@ -588,40 +588,45 @@ describe("CampaignSequencePage while the campaign is paused (ADR-0020)", () => {
       });
     });
 
-    it("opens only references that have not been written, and locks the structure", async () => {
+    it("is edited like a standard campaign and says which emails are already written", async () => {
       mockWorkspace("MANAGER");
       api.getSequence.mockResolvedValue(hyperSequence());
       const user = userEvent.setup();
       renderPage();
 
-      expect(await screen.findByText(/versions already written, the waits and the order of steps can't change/i)).toBeVisible();
+      expect(await screen.findByText(/Personalized versions already written keep their current text/i)).toBeVisible();
       const first = screen.getByRole("article", { name: "Step 1: Email" });
       const second = screen.getByRole("article", { name: "Step 2: Email" });
-      expect(within(first).getByText(/5 personalized emails already written/)).toBeVisible();
-      expect(within(first).getByRole("button", { name: /view/i })).toBeInTheDocument();
-      expect(within(second).getByText(/3 will be written from this version/)).toBeVisible();
+      expect(within(first).getByText(/5 personalized emails already written keep the current version/)).toBeVisible();
+      expect(within(second).getByText(/Nothing written yet\. 3 will be written from this version/)).toBeVisible();
+      // A step with written emails can still be reworded.
+      expect(within(first).getByRole("button", { name: /edit/i })).toBeInTheDocument();
       expect(within(second).getByRole("button", { name: /edit/i })).toBeInTheDocument();
 
-      // Nothing structural is offered.
-      expect(screen.queryByRole("button", { name: /^add step$/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /delete step/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /move step/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /duplicate step/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /insert a step/i })).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /edit wait/i })).not.toBeInTheDocument();
+      // Waits can be edited, and steps after the last reached one added, moved and removed.
+      expect(screen.getAllByRole("button", { name: /edit wait/i }).length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: /^add step$/i })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Delete step 2" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Duplicate step 2" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Move step 3 up" })).toBeEnabled();
+      // Steps leads have reached keep their place.
+      expect(screen.getByRole("button", { name: "Delete step 1" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Move step 1 down" })).toBeDisabled();
+      // The campaign setup is not part of this.
+      expect(screen.queryByRole("button", { name: /regenerate/i })).not.toBeInTheDocument();
 
-      await user.click(within(second).getByRole("button", { name: /edit/i }));
+      await user.click(within(first).getByRole("button", { name: /edit/i }));
       expect(await screen.findByRole("dialog", { name: /step editor/i })).toHaveTextContent("editable");
     });
 
-    it("shows a written step read-only", async () => {
-      mockWorkspace("MANAGER");
-      api.getSequence.mockResolvedValue(hyperSequence());
-      const user = userEvent.setup();
+    it("is read-only for someone who may not run campaigns", async () => {
+      mockWorkspace("MEMBER");
+      api.getSequence.mockResolvedValue({ ...hyperSequence(), paused_edit_allowed: false });
       renderPage();
-      const first = await screen.findByRole("article", { name: "Step 1: Email" });
-      await user.click(within(first).getByRole("button", { name: /view/i }));
-      expect(await screen.findByRole("dialog", { name: /step editor/i })).toHaveTextContent("read-only");
+      expect(
+        await screen.findByText(/Only a manager can edit the emails of a paused personalized campaign/i),
+      ).toBeVisible();
+      expect(screen.queryByRole("button", { name: /^add step$/i })).not.toBeInTheDocument();
     });
   });
 

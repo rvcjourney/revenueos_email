@@ -204,13 +204,17 @@ sending limit and release a safety hold, and it gives every existing mailbox a d
 sends (messages are deferred with reason `mailbox_limits_missing`). No script here applies it;
 apply it yourself like the others.
 
-**Pause, resume, edits while paused and adding leads (migrations 0040-0045).** All six are
+**Pause, resume, edits while paused and adding leads (migrations 0040-0046).** All seven are
 additive (0041 is a repair, see below) and prepared only; review each header (it is the migration
 review) and apply them one at a time, **in numeric order**: 0040 (pause bookkeeping columns), 0041
 (owner of the two frozen-sequence guards), 0042 (edits to an activated campaign's emails while
 paused), 0043 (leads added to a paused campaign), 0044 (reference-email edits for a paused
 personalized campaign; needs 0042), 0045 (the scheduler may read planning jobs so it can
-re-dispatch lost ones). Apply them **before** deploying this version of the backend, workers and
+re-dispatch lost ones), 0046 (a paused personalized campaign is edited like a standard one:
+waits, steps after the last reached one; needs 0044). Deploy the **worker** with 0046's code (the
+post-resume task re-times planned personalized follow-ups and the personalization writer follows
+edited waits); the post-resume task is the same one the resume already dispatches, so no new task
+name or queue is involved. Apply them **before** deploying this version of the backend, workers and
 scheduler. Deploy the **worker first** (new tasks), then the API, then the scheduler. Pause itself
 keeps working on a database that has not had 0040 yet (it then skips the bookkeeping columns), so
 the emergency stop never depends on a migration; every other piece of the feature needs its own.
@@ -229,7 +233,7 @@ save one edit of a DRAFT campaign's email step in the app before continuing with
 ownership`.
 
 **Is the database really up to date? The preflight now tells you.** The go-live preflight below
-checks, with read-only catalog queries, which of migrations 0021-0045 the database has (`Migration
+checks, with read-only catalog queries, which of migrations 0021-0046 the database has (`Migration
 NNNN`), that there are no gaps in the chain (`Migration chain`) and that the `app_*` guard and
 erasure functions have the right owner (`Function ownership`). A `FAIL` names the migration and what
 breaks without it. If it reports `Function ownership` problems, the production database was set up

@@ -244,6 +244,8 @@ class TestMigrationState:
         assert result["Migration 0041"].status == "OK"  # a chain-built database has the right owners
         assert result["Migration 0042"].status == "WARN"
         assert result["Migration 0043"].status == "WARN"
+        assert result["Migration 0046"].status == "WARN"
+        assert "0046_" in result["Migration 0046"].remedy
         assert result["Migration chain"].status == "OK"  # nothing later is applied
         assert result["Function ownership"].status == "OK", result["Function ownership"].detail
         assert result["Migration history table"].status == "INFO"

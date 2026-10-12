@@ -1,8 +1,8 @@
-"""Migrations 0040-0045 applied to a database that already holds campaign data.
+"""Migrations 0040-0046 applied to a database that already holds campaign data.
 
 Every other real-database test builds on an empty database with all migrations;
 this one proves the upgrade path: a campaign, its enrollment and message that
-exist at migration 0039 survive 0040-0045 untouched and keep working, the new
+exist at migration 0039 survive 0040-0046 untouched and keep working, the new
 columns get safe defaults, and the migrations refuse to run twice.
 """
 
@@ -39,7 +39,7 @@ def upgraded():
         before = conn.execute(
             "SELECT count(*), count(*) FILTER (WHERE status='PLANNED') FROM public.messages"
         ).fetchone()
-        apply_range(uri, 40, 45)
+        apply_range(uri, 40, 46)
         yield uri, conn, running, paused, before
         conn.close()
 
@@ -127,7 +127,7 @@ def test_the_activated_audience_can_still_be_enrolled_and_pause_columns_are_writ
 
 
 # 0041 (ownership repair) is idempotent by design and has its own test file.
-@pytest.mark.parametrize("number", [40, 42, 43, 44, 45])
+@pytest.mark.parametrize("number", [40, 42, 43, 44, 45, 46])
 def test_each_migration_refuses_to_run_twice(upgraded, number) -> None:
     uri = upgraded[0]
     with pytest.raises(psycopg.errors.RaiseException, match="already applied|exists"):
@@ -181,6 +181,50 @@ def test_0044_needs_0042_and_a_personalized_step_stays_frozen_until_it_is_applie
             assert conn.execute(
                 "SELECT email_subject FROM public.sequence_steps WHERE id=%s", [w.step2]
             ).fetchone() == ("x",)
+        finally:
+            conn.close()
+
+
+def test_0046_needs_0044_and_personalized_structure_stays_frozen_until_it_is_applied() -> (
+    None
+):
+    with throwaway_database(up_to=43) as uri:
+        with pytest.raises(psycopg.errors.RaiseException, match="0044"):
+            apply_range(uri, 46, 46)
+    with throwaway_database(up_to=45) as uri:
+        conn = psycopg.connect(uri, autocommit=True)
+        try:
+            w = seed_world(
+                conn,
+                running=True,
+                campaign_type="HYPER_PERSONALIZED",
+                members=1,
+                enroll_first=False,
+            )
+            conn.execute("SET session_replication_role = replica")
+            conn.execute(
+                "UPDATE public.campaign_sequences SET status='FROZEN', frozen_at=now(), content_digest=%s WHERE id=%s",
+                ["a" * 64, w.sequence_id],
+            )
+            conn.execute(
+                "UPDATE public.campaigns SET status='PAUSED' WHERE id=%s",
+                [w.campaign_id],
+            )
+            conn.execute("SET session_replication_role = origin")
+            # 0044 rules: a personalized step's waits and the step list are frozen.
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "UPDATE public.sequence_steps SET wait_duration_minutes=5 WHERE id=%s",
+                    [w.wait],
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute("DELETE FROM public.sequence_steps WHERE id=%s", [w.step2])
+            apply_range(uri, 46, 46)
+            conn.execute(
+                "UPDATE public.sequence_steps SET wait_duration_minutes=5 WHERE id=%s",
+                [w.wait],
+            )
+            conn.execute("DELETE FROM public.sequence_steps WHERE id=%s", [w.step2])
         finally:
             conn.close()
 

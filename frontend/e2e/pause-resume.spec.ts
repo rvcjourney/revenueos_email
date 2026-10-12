@@ -188,25 +188,29 @@ test("a failed add of leads can be retried, and resume is blocked until it succe
   await expect(page.getByRole("button", { name: "Pause campaign" })).toBeVisible();
 });
 
-test("a paused personalized campaign opens only unwritten references", async ({ page }) => {
+test("a paused personalized campaign is edited like a standard one", async ({ page }) => {
   await reset("hyper");
   await page.goto(sequenceUrl);
   await page.getByRole("button", { name: "Pause campaign" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Pause campaign" }).click();
-  await expect(page.getByText(/versions already written, the waits and the order of steps can't change/)).toBeVisible();
+  await expect(page.getByText(/Personalized versions already written keep their current text/)).toBeVisible();
 
   const first = page.getByRole("article", { name: "Step 1: Email" });
   const second = page.getByRole("article", { name: "Step 2: Email" });
-  await expect(first.getByText(/12 personalized emails already written/)).toBeVisible();
-  await expect(first.getByRole("button", { name: /view/i })).toBeVisible();
+  await expect(first.getByText(/12 personalized emails already written keep the current version/)).toBeVisible();
+  await expect(first.getByRole("button", { name: /edit/i })).toBeVisible();
   await expect(second.getByText(/20 will be written from this version/)).toBeVisible();
   await expect(second.getByRole("button", { name: /edit/i })).toBeVisible();
-  await expect(page.getByRole("button", { name: /^add step$/i })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /delete step/i })).toHaveCount(0);
+  // Waits and steps after the last reached one are editable; the reached step keeps its place.
+  expect(await page.getByRole("button", { name: /edit wait/i }).count()).toBeGreaterThan(0);
+  await expect(page.getByRole("button", { name: /^add step$/i })).toBeVisible();
+  // Both steps already have emails planned for leads, so neither can be removed; the
+  // unit tests cover the steps after the last reached one.
+  await expect(page.getByRole("button", { name: "Delete step 1" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Delete step 2" })).toBeDisabled();
   // The objective / company / email-style setup is not editable while paused.
   await expect(page.getByRole("button", { name: /regenerate/i })).toHaveCount(0);
   await expect(page.getByText(/No mock for/)).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /edit wait/i })).toHaveCount(0);
   await shot(page, "10-paused-personalized");
 
   // The finished-leads option is not offered for a personalized campaign.

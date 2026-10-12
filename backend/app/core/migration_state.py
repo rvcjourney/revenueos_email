@@ -355,6 +355,18 @@ MIGRATIONS: tuple[Migration, ...] = (
         "WARN",
         "automatic recovery of stuck planning jobs",
     ),
+    Migration(
+        46,
+        "personalized paused structure edits",
+        (
+            function_mentions(
+                "app_guard_frozen_sequence_steps()",
+                "personalized campaigns share the paused structure rules",
+            ),
+        ),
+        "WARN",
+        "adding, removing and re-timing steps of a paused personalized campaign",
+    ),
 )
 
 # Functions whose owner matters (SECURITY DEFINER bodies run with their owner's rights).

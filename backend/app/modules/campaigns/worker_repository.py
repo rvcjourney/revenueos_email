@@ -1335,6 +1335,117 @@ class CampaignWorkerRepository:
             )
         return row is not None
 
+    def fetch_unretimed_planned(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        limit: int,
+        after_id: UUID | None = None,
+    ) -> list[RowMapping]:
+        """Personalized follow-ups that are planned but not yet written, whose wait
+        was edited after they were planned (ADR-0020 amendment 2): a PENDING job
+        nobody has touched (no attempt, no live lease) for a PLANNED, unrendered
+        message that has an anchor, with a WAIT step before its step updated after the
+        job was last updated. The job's `updated_at` is bumped by `apply_retime`, which
+        is what makes a processed row stop matching.
+
+        Locks the generation first and the message second, the order the writer's
+        `lock_for_finalize` uses, so the two can never deadlock. SKIP LOCKED leaves
+        whatever the writer is working on to the writer."""
+        _safe_set_role(self.session, "app_worker_general")
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT g.id AS generation_id, g.step_id, m.id AS message_id,
+                           m.due_at, m.anchor_at
+                    FROM message_generations g
+                    JOIN messages m
+                      ON m.workspace_id = g.workspace_id AND m.id = g.message_id
+                    JOIN sequence_steps ss
+                      ON ss.workspace_id = g.workspace_id AND ss.id = g.step_id
+                    WHERE g.workspace_id = :workspace_id
+                      AND g.campaign_id = :campaign_id
+                      AND g.state = 'PENDING' AND g.attempt_count = 0
+                      AND (g.lease_owner IS NULL
+                           OR g.lease_expires_at < pg_catalog.transaction_timestamp())
+                      AND m.status = 'PLANNED' AND m.rendered_at IS NULL
+                      AND m.anchor_at IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM sequence_steps w
+                          WHERE w.workspace_id = g.workspace_id
+                            AND w.sequence_id = g.sequence_id
+                            AND w.kind = 'WAIT' AND w.position < ss.position
+                            AND w.updated_at > g.updated_at
+                      )
+                      AND (CAST(:after_id AS uuid) IS NULL
+                           OR g.id > CAST(:after_id AS uuid))
+                    ORDER BY g.id
+                    LIMIT :limit
+                    FOR UPDATE OF g, m SKIP LOCKED
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "limit": limit,
+                    "after_id": str(after_id) if after_id else None,
+                },
+            )
+            .mappings()
+            .all()
+        )
+        return list(rows)
+
+    def apply_retime(
+        self,
+        *,
+        workspace_id: UUID,
+        message_id: UUID,
+        generation_id: UUID,
+        due_at: Any,
+        next_attempt_at: Any,
+    ) -> bool:
+        """Move a planned follow-up and its job. Both statements are guarded on the
+        state the row was read in, so a message the writer finished meanwhile is left
+        alone. The job's `updated_at` is always bumped (the "done" marker), even when
+        the time did not change. Columns already granted to this role (0004, 0028)."""
+        _safe_set_role(self.session, "app_worker_general")
+        self.session.execute(
+            text(
+                """
+                UPDATE messages
+                SET due_at = :due_at
+                WHERE workspace_id = :workspace_id AND id = :message_id
+                  AND status = 'PLANNED' AND rendered_at IS NULL
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "message_id": str(message_id),
+                "due_at": due_at,
+            },
+        )
+        row = self.session.execute(
+            text(
+                """
+                UPDATE message_generations
+                SET next_attempt_at = :next_attempt_at,
+                    updated_at = pg_catalog.transaction_timestamp()
+                WHERE workspace_id = :workspace_id AND id = :generation_id
+                  AND state = 'PENDING' AND attempt_count = 0
+                RETURNING id
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "generation_id": str(generation_id),
+                "next_attempt_at": next_attempt_at,
+            },
+        ).first()
+        return row is not None
+
     def list_sequence_steps(
         self, *, workspace_id: UUID, sequence_id: UUID
     ) -> list[RowMapping]:

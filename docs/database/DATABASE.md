@@ -206,7 +206,11 @@ Name/description, creator FK, lifecycle status (seven-state closed set), version
 
 `kind` is `ACTIVATION` (the audience captured before activation, immutable once READY) or `SUPPLEMENT` (leads added while the campaign is PAUSED, captured with the same machinery, never modifying the activated audience). Immutable after insert. A supplement may only be created by `campaigns.execute` on a PAUSED activated campaign; enrollments from it are accepted by the enrollment guard only while the campaign is PAUSED and the supplement READY. Supplement ENROLL/RENDER planning jobs carry the supplement's `audience_id` and have their own unique key, so they never collide with the activation's jobs.
 
-### Reference edits for a paused personalized campaign (ADR-0020, migration 0044)
+### Structure edits for a paused personalized campaign (ADR-0020, migration 0046)
+
+0046 replaces `app_guard_frozen_sequence_steps` again: a FROZEN sequence of a PAUSED, activated campaign of **either** type (`STANDARD` or `HYPER_PERSONALIZED`) follows one rule: content and `wait_duration_minutes` free, `kind` never changes, INSERT / DELETE / position change only after the frontier. Attachments of a personalized campaign stay frozen (`app_guard_frozen_step_attachments` is untouched). `personalization_previews_step_fkey` is re-created `ON DELETE CASCADE`: previews are 7-day throw-away samples made before launch, and a cascading delete runs as the table owner, so the API gains no DELETE grant. The migration takes membership of `app_integrity_guard` for its own transaction only, like 0042 and 0044.
+
+### Reference edits for a paused personalized campaign (ADR-0020, migration 0044; superseded by 0046)
 
 `app_guard_frozen_sequence_steps` (SECURITY DEFINER, owned by `app_integrity_guard`) accepts an UPDATE of a step of a FROZEN sequence of a PAUSED, activated `HYPER_PERSONALIZED` campaign only if `kind`, `position` and `wait_duration_minutes` are unchanged and no message of that step has `rendered_at` set. INSERT, DELETE, reorder and every attachment change stay refused. STANDARD campaigns are unchanged from 0042. The guard functions use COALESCE-hardened comparisons so a NULL campaign type fails closed.
 

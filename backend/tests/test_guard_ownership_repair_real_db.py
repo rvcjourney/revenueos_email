@@ -4,7 +4,7 @@ On the production database every public.app_guard_* function is owned by `postgr
 (0003's ALTER OWNER never took effect), so 0042's ownership postcondition rolled it
 back. These tests rebuild that state locally, prove 0042 fails there with that exact
 message and changes nothing, prove 0041 repairs the two functions it must, and that
-0042-0045 then apply.
+0042-0046 then apply.
 """
 
 # ruff: noqa: E402, E501
@@ -74,7 +74,7 @@ def test_0042_rolls_back_on_postgres_owned_guards_and_0041_fixes_it() -> None:
         for name in _TWO:
             assert owners[name] == ("app_integrity_guard", True)
 
-        apply_range(uri, 42, 45)  # now the whole stack applies
+        apply_range(uri, 42, 46)  # now the whole stack applies
         owners = _owners(conn)
         for name in _TWO:
             assert owners[name] == ("app_integrity_guard", True)
@@ -219,11 +219,11 @@ def test_0042_without_the_temporary_membership_fails_for_a_non_superuser() -> No
             _run_as_mig(uri, without)
 
 
-def test_0042_to_0045_apply_for_a_non_superuser_and_leave_no_elevation() -> None:
+def test_0042_to_0046_apply_for_a_non_superuser_and_leave_no_elevation() -> None:
     with throwaway_database(up_to=41) as uri:
         with psycopg.connect(uri, autocommit=True) as conn:
             _become_a_managed_migration_user(conn)
-            for number in (42, 43, 44, 45):
+            for number in (42, 43, 44, 45, 46):
                 _run_as_mig(uri, _migration_text(number))
             owners = _owners(conn)
             for name in _TWO:

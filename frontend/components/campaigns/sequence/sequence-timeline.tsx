@@ -49,9 +49,10 @@ type Props = {
   // lead. Their content and waits stay editable; their place in the sequence does
   // not, and neither does deleting them. 0 for a draft.
   lockedThrough?: number;
-  // Paused personalized campaign: only the wording of an email nobody has been sent a
-  // written version of can change. Adding, removing, moving and re-timing steps is off.
-  referenceOnly?: boolean;
+  // Personalized campaign: each lead's email is written from this reference just before
+  // it is sent, so a paused editor says how many are already written (they keep their
+  // current version) and how many will use the new wording.
+  personalized?: boolean;
 };
 
 function plainText(html: string | null): string {
@@ -79,7 +80,7 @@ export function SequenceTimeline({
   regeneratingStepId = null,
   generating = false,
   lockedThrough = 0,
-  referenceOnly = false,
+  personalized = false,
 }: Props) {
   const timings = React.useMemo(() => computeTimings(steps), [steps]);
   const problems = sequenceProblems(steps);
@@ -122,9 +123,9 @@ export function SequenceTimeline({
             const previousEmail = emailIndex > 0 ? emails[emailIndex - 1] : null;
             const upLocked = placeLocked || (previousEmail?.position ?? 0) <= lockedThrough;
             const showCounts =
-              !referenceOnly && lockedThrough > 0 && step.sent_count !== undefined;
+              !personalized && lockedThrough > 0 && step.sent_count !== undefined;
             const writtenCount = step.written_count ?? 0;
-            const stepFrozen = referenceOnly && writtenCount > 0;
+            const unwrittenCount = step.unwritten_count ?? 0;
             return (
               <li key={step.id} className="list-none">
                 <article
@@ -145,9 +146,9 @@ export function SequenceTimeline({
                     <div className="flex items-center gap-1">
                       <Button variant="outline" size="sm" onClick={() => onOpenEmail(step)}>
                         <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                        {readOnly || stepFrozen ? "View" : "Edit"}
+                        {readOnly ? "View" : "Edit"}
                       </Button>
-                      {!readOnly && !referenceOnly ? (
+                      {!readOnly ? (
                         <>
                           {onRegenerateEmail ? (
                             <Button
@@ -234,15 +235,14 @@ export function SequenceTimeline({
                       {snippet || <span className="text-slate-400">Empty body</span>}
                     </p>
                   </button>
-                  {referenceOnly ? (
+                  {personalized && step.written_count !== undefined ? (
                     <p className="mt-2 text-xs text-slate-500">
                       {writtenCount > 0
-                        ? `${writtenCount} personalized email${writtenCount === 1 ? "" : "s"} already written; this step can't be changed.`
-                        : `Nothing written yet${
-                            (step.unwritten_count ?? 0) > 0
-                              ? `: ${step.unwritten_count} will be written from this version.`
-                              : "."
-                          }`}
+                        ? `${writtenCount} personalized email${writtenCount === 1 ? "" : "s"} already written keep${writtenCount === 1 ? "s" : ""} the current version.`
+                        : "Nothing written yet."}
+                      {unwrittenCount > 0
+                        ? ` ${unwrittenCount} will be written from this version.`
+                        : ""}
                     </p>
                   ) : null}
                   {showCounts ? (
@@ -254,7 +254,7 @@ export function SequenceTimeline({
                   ) : null}
                 </article>
                 {/* Insert-between control sits on the connector after this email. */}
-                {!readOnly && !referenceOnly && nextIsWait && step.position >= lockedThrough ? (
+                {!readOnly && nextIsWait && step.position >= lockedThrough ? (
                   <div className="flex justify-center">
                     <button
                       type="button"
@@ -294,7 +294,7 @@ export function SequenceTimeline({
               <div className="flex flex-col items-center" role="group" aria-label="Wait">
                 <span className="h-4 w-px bg-slate-300" aria-hidden="true" />
                 <div className="flex items-center gap-1">
-                  {readOnly || referenceOnly ? (
+                  {readOnly ? (
                     <span
                       className={cn(
                         "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium",
@@ -345,7 +345,7 @@ export function SequenceTimeline({
                       )}
                     </Popover>
                   )}
-                  {!readOnly && !referenceOnly && isOrphan && step.position > lockedThrough ? (
+                  {!readOnly && isOrphan && step.position > lockedThrough ? (
                     <Button
                       variant="ghost"
                       size="icon"
@@ -372,7 +372,7 @@ export function SequenceTimeline({
         })}
       </ol>
 
-      {!readOnly && !referenceOnly ? (
+      {!readOnly ? (
         <div className="flex justify-center pt-1">
           <Button variant="outline" size="sm" disabled={busy} onClick={onAddEmail}>
             <Plus className="h-3.5 w-3.5" aria-hidden="true" />

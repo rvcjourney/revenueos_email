@@ -290,6 +290,7 @@ class FakeRepo:
             "message_status": s.message["status"],
             "due_at": s.message["due_at"],
             "anchor_at": s.message["anchor_at"],
+            "message_created_at": s.message.get("created_at"),
             "campaign_type": s.campaign["campaign_type"],
             "campaign_status": s.campaign["status"],
             "planning_status": s.campaign["planning_status"],
@@ -311,6 +312,13 @@ class FakeRepo:
 
     def load_previous_email(self, **_: Any) -> dict[str, Any] | None:
         return self.s.previous
+
+    def retime_planned_message(self, *, due_at: datetime, **_: Any) -> bool:
+        m = self.s.message
+        if m["status"] != "PLANNED":
+            return False
+        m["due_at"] = due_at
+        return True
 
     def lock_for_finalize(self, **_: Any) -> dict[str, Any]:
         s = self.s

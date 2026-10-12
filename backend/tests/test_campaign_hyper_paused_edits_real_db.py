@@ -1,10 +1,11 @@
-"""Reference-email edits on a PAUSED personalized (HYPER_PERSONALIZED) campaign --
-ADR-0020 / migration 0044, against a REAL PostgreSQL (pgserver).
+"""Edits to a PAUSED personalized (HYPER_PERSONALIZED) campaign -- ADR-0020 /
+migrations 0044 and 0046, against a REAL PostgreSQL (pgserver).
 
 A personalized campaign writes each lead's email from its step's reference just
-before sending. While paused, a manager may improve the wording of a reference, but
-only for a step none of whose emails has been written; written emails, waits, step
-order and the set of steps stay frozen. The service and the database guard must agree.
+before sending. While paused a manager edits it like a standard campaign: the wording
+of any step, any wait, and steps after the last one a lead has reached. Emails already
+written keep their text. Steps leads have reached, and attachments, stay frozen. The
+service and the database guard must agree.
 """
 
 # ruff: noqa: E402, E501
@@ -167,6 +168,41 @@ def update_step(
     )
 
 
+def sequence(session_factory, w: World):
+    return edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.get_sequence(ctx, w.campaign_id),
+    )
+
+
+def add_email(session_factory, w: World, position: int):
+    return edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.add_step(
+            ctx,
+            w.campaign_id,
+            SequenceStepCreateIn(
+                kind="EMAIL",
+                position=position,
+                email_subject="One more nudge",
+                email_body_html="<p>Hi {{first_name}}, a last note.</p>",
+                leading_wait_minutes=60,
+            ),
+        ),
+    )
+
+
+def count_steps(su, w: World) -> int:
+    return su.execute(
+        "SELECT count(*) FROM public.sequence_steps WHERE sequence_id=%s",
+        [w.sequence_id],
+    ).fetchone()[0]
+
+
 # ---------------------------------------------------------------------------
 # what may change
 # ---------------------------------------------------------------------------
@@ -191,87 +227,131 @@ def test_a_step_with_nothing_written_can_have_its_reference_edited(
     assert audit_count(su, w, "campaign.sequence_edited_while_paused") == 1
 
 
-def test_planned_but_unwritten_messages_do_not_freeze_the_step(
+def test_a_step_can_be_reworded_even_when_some_of_its_emails_are_written(
+    session_factory, su, producer
+) -> None:
+    """The written email keeps its text; only emails written after the resume use the
+    new reference. The counts say how many of each there are."""
+    w = hyper_world(su)
+    written = message(su, w, 0, w.step1, written=True)
+    message(su, w, 1, w.step1, written=False)
+
+    update_step(session_factory, su, w, w.step1, email_subject="Better opener")
+
+    assert step_row(su, w.step1)["email_subject"] == "Better opener"
+    assert su.execute(
+        "SELECT content_subject FROM public.messages WHERE id=%s", [written]
+    ).fetchone() == ("Hi A",)
+    first = next(s for s in sequence(session_factory, w).steps if s.id == w.step1)
+    assert (first.written_count, first.unwritten_count) == (1, 1)
+    assert sequence(session_factory, w).paused_edit_allowed is True
+    # The database guard agrees on its own.
+    su.execute(
+        "UPDATE public.sequence_steps SET email_subject='x' WHERE id=%s", [w.step1]
+    )
+
+
+def test_a_written_email_itself_stays_frozen(session_factory, su, producer) -> None:
+    w = hyper_world(su)
+    written = message(su, w, 0, w.step1, written=True)
+    with pytest.raises(psycopg.errors.CheckViolation, match="snapshot is immutable"):
+        su.execute(
+            "UPDATE public.messages SET content_subject='changed' WHERE id=%s",
+            [written],
+        )
+
+
+def test_waits_can_be_changed_even_after_leads_passed_them(
     session_factory, su, producer
 ) -> None:
     w = hyper_world(su)
     message(su, w, 0, w.step1, written=False)
-    update_step(session_factory, su, w, w.step1, email_subject="Better opener")
-    assert step_row(su, w.step1)["email_subject"] == "Better opener"
-
-    seq = edit(
-        session_factory,
-        w,
-        "MANAGER",
-        lambda svc, ctx: svc.get_sequence(ctx, w.campaign_id),
+    message(su, w, 1, w.step2, written=False)  # leads have reached the last step
+    update_step(session_factory, su, w, w.wait, wait_duration_minutes=5)
+    assert step_row(su, w.wait)["wait_duration_minutes"] == 5
+    su.execute(
+        "UPDATE public.sequence_steps SET wait_duration_minutes=7 WHERE id=%s", [w.wait]
     )
-    first = next(s for s in seq.steps if s.id == w.step1)
-    assert (first.written_count, first.unwritten_count) == (0, 1)
-    assert seq.paused_edit_allowed is True
 
 
-def test_a_step_with_a_written_email_is_frozen_in_the_service_and_the_database(
+def test_the_type_and_place_of_a_step_leads_reached_never_change(
     session_factory, su, producer
 ) -> None:
     w = hyper_world(su)
-    message(su, w, 0, w.step1, written=True)
-
-    with pytest.raises(AppError) as info:
-        update_step(session_factory, su, w, w.step1, email_subject="Too late")
-    assert info.value.status_code == 409 and info.value.code == "step_locked"
-    assert step_row(su, w.step1)["email_subject"] != "Too late"
-    with pytest.raises(
-        psycopg.errors.CheckViolation, match="already been written"
-    ):  # the trigger agrees
+    message(su, w, 0, w.step1, written=False)
+    with pytest.raises(psycopg.errors.CheckViolation, match="cannot change"):
         su.execute(
-            "UPDATE public.sequence_steps SET email_subject='x' WHERE id=%s", [w.step1]
+            "UPDATE public.sequence_steps SET kind='WAIT', email_subject=NULL, email_body_html=NULL, wait_duration_minutes=5 WHERE id=%s",
+            [w.step1],
         )
-
-    # The other step is still open, and the counts say why.
-    update_step(session_factory, su, w, w.step2, email_subject="Still editable")
-    seq = edit(
-        session_factory,
-        w,
-        "MANAGER",
-        lambda svc, ctx: svc.get_sequence(ctx, w.campaign_id),
-    )
-    assert next(s for s in seq.steps if s.id == w.step1).written_count == 1
+    with pytest.raises(psycopg.errors.CheckViolation, match="already reached"):
+        su.execute("UPDATE public.sequence_steps SET position=9 WHERE id=%s", [w.step1])
 
 
-def test_waits_kinds_and_positions_never_change(session_factory, su, producer) -> None:
-    w = hyper_world(su)
-    with pytest.raises(AppError) as info:
-        update_step(session_factory, su, w, w.wait, wait_duration_minutes=5)
-    assert info.value.code == "step_locked"
-    for sql in (
-        "UPDATE public.sequence_steps SET wait_duration_minutes=5 WHERE id=%s",
-        "UPDATE public.sequence_steps SET kind='WAIT', email_subject=NULL, email_body_html=NULL, wait_duration_minutes=5 WHERE id=%s",
-    ):
-        with pytest.raises(psycopg.errors.CheckViolation):
-            su.execute(sql, [w.step2 if "kind" in sql else w.wait])
-    with pytest.raises(psycopg.errors.CheckViolation):
-        su.execute("UPDATE public.sequence_steps SET position=9 WHERE id=%s", [w.step2])
-
-
-def test_steps_cannot_be_added_removed_duplicated_or_reordered(
+def test_steps_after_the_last_reached_one_can_be_added_removed_copied_and_reordered(
     session_factory, su, producer
 ) -> None:
     w = hyper_world(su)
+    message(su, w, 0, w.step1, written=False)  # leads have reached step 1 only
+
+    added = add_email(session_factory, w, position=4)
+    assert count_steps(su, w) == 5 and added.position == 5
+
+    edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.delete_step(
+            ctx, w.campaign_id, added.id, with_adjacent_wait=True
+        ),
+    )
+    assert count_steps(su, w) == 3
+
+    edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.duplicate_step(ctx, w.campaign_id, w.step2),
+    )
+    steps = sequence(session_factory, w).steps
+    assert [s.kind for s in steps] == ["EMAIL", "WAIT", "EMAIL", "WAIT", "EMAIL"]
+
+    swapped = [
+        SequenceStepReorderEntry(step_id=steps[0].id, position=1),
+        SequenceStepReorderEntry(step_id=steps[1].id, position=2),
+        SequenceStepReorderEntry(step_id=steps[4].id, position=3),
+        SequenceStepReorderEntry(step_id=steps[3].id, position=4),
+        SequenceStepReorderEntry(step_id=steps[2].id, position=5),
+    ]
+    edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.reorder_steps(
+            ctx, w.campaign_id, SequenceStepsReorderIn(steps=swapped)
+        ),
+    )
+    assert step_row(su, steps[4].id)["position"] == 3
+    assert audit_count(su, w, "campaign.sequence_edited_while_paused") == 4
+
+
+def test_steps_leads_have_reached_stay_protected(session_factory, su, producer) -> None:
+    w = hyper_world(su)
+    message(su, w, 0, w.step1, written=False)
     ops = {
-        "add": lambda svc, ctx: svc.add_step(
+        "delete": lambda svc, ctx: svc.delete_step(ctx, w.campaign_id, w.step1),
+        "add before": lambda svc, ctx: svc.add_step(
             ctx,
             w.campaign_id,
             SequenceStepCreateIn(
                 kind="EMAIL",
-                position=4,
+                position=1,
                 email_subject="x",
                 email_body_html="<p>x</p>",
                 leading_wait_minutes=60,
             ),
         ),
-        "delete": lambda svc, ctx: svc.delete_step(ctx, w.campaign_id, w.step2),
-        "duplicate": lambda svc, ctx: svc.duplicate_step(ctx, w.campaign_id, w.step2),
-        "reorder": lambda svc, ctx: svc.reorder_steps(
+        "move": lambda svc, ctx: svc.reorder_steps(
             ctx,
             w.campaign_id,
             SequenceStepsReorderIn(
@@ -287,22 +367,106 @@ def test_steps_cannot_be_added_removed_duplicated_or_reordered(
         with pytest.raises(AppError) as info:
             edit(session_factory, w, "MANAGER", fn)
         assert info.value.code == "step_locked", name
-    assert (
-        su.execute(
-            "SELECT count(*) FROM public.sequence_steps WHERE sequence_id=%s",
-            [w.sequence_id],
-        ).fetchone()[0]
-        == 3
-    )
+    assert count_steps(su, w) == 3
     # And the database refuses the same things on its own.
-    with pytest.raises(psycopg.errors.CheckViolation):
-        su.execute("DELETE FROM public.sequence_steps WHERE id=%s", [w.step2])
-    with pytest.raises(psycopg.errors.CheckViolation):
+    with pytest.raises(psycopg.errors.CheckViolation, match="already reached"):
+        su.execute("DELETE FROM public.sequence_steps WHERE id=%s", [w.step1])
+    with pytest.raises(psycopg.errors.CheckViolation, match="already reached"):
         su.execute(
             "INSERT INTO public.sequence_steps (workspace_id, sequence_id, campaign_id, position, kind, email_subject, email_body_html) "
-            "VALUES (%s,%s,%s,4,'EMAIL','x','<p>x</p>')",
+            "VALUES (%s,%s,%s,1,'EMAIL','x','<p>x</p>')",
             [w.ws, w.sequence_id, w.campaign_id],
         )
+
+
+def test_the_resulting_sequence_must_stay_valid(session_factory, su, producer) -> None:
+    """Removing only the email of an Email/Wait pair would leave the sequence ending on a wait."""
+    w = hyper_world(su)
+    message(su, w, 0, w.step1, written=False)
+    with pytest.raises(AppError) as info:
+        edit(
+            session_factory,
+            w,
+            "MANAGER",
+            lambda svc, ctx: svc.delete_step(ctx, w.campaign_id, w.step2),
+        )
+    assert info.value.code == "sequence_invalid" and info.value.status_code == 422
+    assert count_steps(su, w) == 3
+
+
+def test_removing_a_step_takes_its_sample_previews_with_it(
+    session_factory, su, producer
+) -> None:
+    """Previews are made before launch and live for a week; they must not stop a step
+    from being removed (migration 0046 cascades them)."""
+    w = hyper_world(su)
+    message(su, w, 0, w.step1, written=False)
+    su.execute("SET session_replication_role = replica")
+    _insert(
+        su,
+        "personalization_previews",
+        id=uuid.uuid4(),
+        workspace_id=w.ws,
+        campaign_id=w.campaign_id,
+        batch_id=uuid.uuid4(),
+        audience_member_id=w.member_ids[0],
+        lead_id=w.lead_ids[0],
+        step_id=w.step2,
+        config_digest="a" * 64,
+        created_by=w.manager,
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+    su.execute("SET session_replication_role = origin")
+
+    edit(
+        session_factory,
+        w,
+        "MANAGER",
+        lambda svc, ctx: svc.delete_step(
+            ctx, w.campaign_id, w.step2, with_adjacent_wait=True
+        ),
+    )
+    assert count_steps(su, w) == 1
+    assert su.execute(
+        "SELECT count(*) FROM public.personalization_previews WHERE step_id=%s",
+        [w.step2],
+    ).fetchone() == (0,)
+
+
+def test_a_step_with_attachments_cannot_be_removed_or_copied(
+    session_factory, su, producer
+) -> None:
+    """The attachments of a personalized campaign stay frozen, and they would go with
+    (or be copied with) the step."""
+    w = hyper_world(su)
+    message(su, w, 0, w.step1, written=False)
+    su.execute("SET session_replication_role = replica")
+    _insert(
+        su,
+        "campaign_step_attachments",
+        workspace_id=w.ws,
+        campaign_id=w.campaign_id,
+        sequence_id=w.sequence_id,
+        step_id=w.step2,
+        disposition="ATTACHMENT",
+        content_id="attach12345",
+        storage_key="k",
+        filename="a.pdf",
+        content_type="application/pdf",
+        size_bytes=10,
+        sha256="c" * 64,
+    )
+    su.execute("SET session_replication_role = origin")
+    for fn in (
+        lambda svc, ctx: svc.delete_step(
+            ctx, w.campaign_id, w.step2, with_adjacent_wait=True
+        ),
+        lambda svc, ctx: svc.duplicate_step(ctx, w.campaign_id, w.step2),
+    ):
+        with pytest.raises(AppError) as info:
+            edit(session_factory, w, "MANAGER", fn)
+        assert info.value.code == "step_locked" and "attachments" in info.value.message
+    assert count_steps(su, w) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +496,7 @@ def test_member_cannot_edit_and_row_level_security_agrees(
 
 
 @pytest.mark.parametrize("status", ["RUNNING", "SCHEDULED"])
-def test_only_a_paused_campaign_opens_the_reference(
+def test_only_a_paused_campaign_opens_the_sequence(
     session_factory, su, producer, status: str
 ) -> None:
     w = hyper_world(su, status=status)
@@ -342,6 +506,8 @@ def test_only_a_paused_campaign_opens_the_reference(
         su.execute(
             "UPDATE public.sequence_steps SET email_subject='x' WHERE id=%s", [w.step2]
         )
+    with pytest.raises(psycopg.errors.CheckViolation, match="immutable"):
+        su.execute("DELETE FROM public.sequence_steps WHERE id=%s", [w.step2])
 
 
 def test_inline_images_are_refused_in_a_personalized_reference(
@@ -372,7 +538,7 @@ def test_attachments_of_a_personalized_campaign_stay_frozen(su) -> None:
         )
 
 
-def test_a_draft_standard_style_edit_is_unaffected_by_the_hyper_branch(su) -> None:
+def test_a_draft_edit_is_unaffected_by_the_paused_rules(su) -> None:
     """The replacement guard still treats a DRAFT sequence as freely editable."""
     w = seed_world(
         su,

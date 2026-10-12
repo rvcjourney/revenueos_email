@@ -1390,7 +1390,7 @@ Already completed sends remain recorded
 
 ## Implemented behaviour (ADR-0020)
 
-Pause is idempotent: pausing an already paused campaign returns it unchanged. The response reports how many emails were already past the send gate (queued, being sent or of unknown outcome) because a pause cannot recall them. While paused a manager can change the schedule, edit the wording of emails that have not been sent, add or restructure steps after the last one any lead reached (standard campaigns), and add leads. A personalized campaign only allows rewording a reference email whose personalized versions have not been written yet. If adding leads fails, a **Retry** button continues where it stopped, and resume stays blocked until it succeeds.
+Pause is idempotent: pausing an already paused campaign returns it unchanged. The response reports how many emails were already past the send gate (queued, being sent or of unknown outcome) because a pause cannot recall them. While paused a manager can change the schedule, edit the wording of emails that have not been sent, add or restructure steps after the last one any lead reached (standard campaigns), and add leads. A personalized campaign is edited the same way (wording of any step, waits, steps after the last one any lead reached); emails already written keep their version and only emails written after you resume use the new wording. Its setup (objective, company, style) and attachments stay locked. If adding leads fails, a **Retry** button continues where it stopped, and resume stays blocked until it succeeds.
 
 ## Concurrency Consideration
 

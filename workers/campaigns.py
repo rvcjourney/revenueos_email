@@ -19,6 +19,7 @@ from app.modules.campaigns.pacing import DuePlanner, MailboxPacing, pacing_from_
 from app.modules.campaigns.progression import ProgressionService
 from app.modules.campaigns.reconcile import ReconcileService
 from app.modules.campaigns.reopen import ReopenService
+from app.modules.campaigns.retime import RetimeService
 from app.modules.campaigns.scheduling import WindowCalendar
 from app.modules.campaigns.worker_repository import CampaignWorkerRepository
 from app.modules.personalization.version import CAMPAIGN_TYPE_HYPER
@@ -943,6 +944,72 @@ def reopen_completed_enrollments_chunk(
             )
 
 
+def _retime_phase(
+    task: Any,
+    *,
+    workspace_id: str,
+    campaign_id: str,
+    generation: int,
+    after_id: str | None,
+) -> None:
+    """Second phase of the post-resume pass (ADR-0020 amendment 2): move the
+    personalized follow-ups that are planned but not yet written to the time their
+    waits imply now. A no-op for a standard campaign and for a task that has been
+    superseded. A full batch re-queues itself from the last job it looked at."""
+    settings = Settings.current()
+    ws_uuid = UUID(workspace_id)
+    limit = BATCH_SIZE
+    with SessionLocal() as session:
+        set_transaction_context(session, workspace_id=ws_uuid)
+        service = RetimeService(
+            CampaignWorkerRepository(session),
+            lead_seconds=settings.personalization_lead_time_seconds,
+        )
+        try:
+            summary = service.retime_batch(
+                workspace_id=ws_uuid,
+                campaign_id=UUID(campaign_id),
+                generation=generation,
+                limit=limit,
+                after_id=UUID(after_id) if after_id else None,
+            )
+            session.commit()
+        except Exception:
+            logger.exception(
+                "CAMPAIGN_RETIME_FAILED workspace=%s campaign=%s generation=%s",
+                workspace_id,
+                campaign_id,
+                generation,
+            )
+            session.rollback()
+            return
+    if not summary.active or not summary.fetched:
+        return
+    # Counts only: never recipient data or content.
+    logger.info(
+        "CAMPAIGN_FOLLOWUPS_RETIMED workspace=%s campaign=%s generation=%s "
+        "fetched=%d retimed=%d unchanged=%d",
+        workspace_id,
+        campaign_id,
+        generation,
+        summary.fetched,
+        summary.retimed,
+        summary.unchanged,
+    )
+    if summary.fetched >= limit and summary.last_id is not None:
+        task.retry(
+            kwargs={
+                "workspace_id": workspace_id,
+                "campaign_id": campaign_id,
+                "generation": generation,
+                "phase": "RETIME",
+                "retime_after_id": str(summary.last_id),
+            },
+            countdown=1,
+            max_retries=task.request.retries + 1,
+        )
+
+
 @celery_app.task(
     name="campaigns.reconcile_resume_chunk",
     queue="campaigns",
@@ -957,6 +1024,8 @@ def reconcile_resume_chunk(
     after_due_at: str | None = None,
     after_id: str | None = None,
     offsets: dict[str, int] | None = None,
+    phase: str = "RECONCILE",
+    retime_after_id: str | None = None,
 ) -> None:
     """One bounded chunk of the post-resume reconcile pass (ADR-0020).
 
@@ -966,11 +1035,25 @@ def reconcile_resume_chunk(
     task does nothing once the campaign is no longer RUNNING at `generation`
     (a later pause or resume supersedes it). A full chunk re-queues itself from
     the last message it looked at, carrying the per-mailbox slot counters.
+
+    When the reconcile of scheduled messages is finished, a personalized campaign's
+    planned follow-ups are re-timed from the waits as they stand now (`phase="RETIME"`,
+    see `_retime_phase`); tasks queued before that phase existed default to RECONCILE.
     """
+    if phase == "RETIME":
+        _retime_phase(
+            self,
+            workspace_id=workspace_id,
+            campaign_id=campaign_id,
+            generation=generation,
+            after_id=retime_after_id,
+        )
+        return
     settings = Settings.current()
     ws_uuid = UUID(workspace_id)
     campaign_uuid = UUID(campaign_id)
     limit = BATCH_SIZE
+    start_retime = False
 
     with SessionLocal() as session:
         set_transaction_context(session, workspace_id=ws_uuid)
@@ -1052,6 +1135,15 @@ def reconcile_resume_chunk(
                 campaign_id,
                 generation,
             )
+            start_retime = True
+    if start_retime:
+        _retime_phase(
+            self,
+            workspace_id=workspace_id,
+            campaign_id=campaign_id,
+            generation=generation,
+            after_id=None,
+        )
 
 
 @celery_app.task(name="campaigns.retry_planning_job", queue="campaigns")
