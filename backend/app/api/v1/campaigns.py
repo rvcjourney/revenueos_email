@@ -31,6 +31,7 @@ from app.modules.campaigns.schemas import (
     AudienceOut,
     AudienceSelectIn,
     CampaignArchiveIn,
+    CampaignCountsOut,
     CampaignCreateIn,
     CampaignDetailOut,
     CampaignDuplicateIn,
@@ -42,6 +43,8 @@ from app.modules.campaigns.schemas import (
     CampaignReviewOut,
     CampaignSettingsCreateIn,
     CampaignSettingsOut,
+    CampaignSort,
+    CampaignType,
     CampaignUpdateIn,
     PauseIn,
     PreflightResult,
@@ -80,11 +83,32 @@ def list_campaigns(
     cursor: str | None = Query(default=None, max_length=512),
     q: str | None = Query(default=None, max_length=200),
     status_filter: str | None = Query(default=None, alias="status"),
+    type_filter: CampaignType | None = Query(default=None, alias="type"),
+    sort: CampaignSort | None = Query(default=None),
     context: WorkspaceContext = Depends(get_workspace_context),
     db: Session = Depends(get_db),
 ) -> CampaignPage:
     return CampaignService(db).list_campaigns(
-        context, limit=limit, cursor=cursor, query=q, status=status_filter
+        context,
+        limit=limit,
+        cursor=cursor,
+        query=q,
+        status=status_filter,
+        campaign_type=type_filter,
+        sort=sort,
+    )
+
+
+@router.get("/campaigns/counts", response_model=CampaignCountsOut)
+def count_campaigns(
+    q: str | None = Query(default=None, max_length=200),
+    type_filter: CampaignType | None = Query(default=None, alias="type"),
+    context: WorkspaceContext = Depends(get_workspace_context),
+    db: Session = Depends(get_db),
+) -> CampaignCountsOut:
+    """How many campaigns each status holds, for the list's status tabs."""
+    return CampaignService(db).count_campaigns(
+        context, query=q, campaign_type=type_filter
     )
 
 

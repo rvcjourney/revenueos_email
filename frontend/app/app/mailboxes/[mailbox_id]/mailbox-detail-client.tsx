@@ -340,7 +340,7 @@ export function MailboxDetailClient({ mailboxId: propId }: { mailboxId?: string 
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">
                 {mailbox.email_address}
               </h1>
               <span className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-800">

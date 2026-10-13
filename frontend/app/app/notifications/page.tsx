@@ -87,8 +87,8 @@ export default function NotificationsPage() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <p className="text-sm font-medium text-brand-700">Workspace Updates</p>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 mt-1">
+          <p className="text-xs font-semibold uppercase tracking-[0.08em] text-brand-600">Workspace Updates</p>
+          <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900 mt-1">
             Notifications
           </h1>
           <p className="mt-1 text-sm text-slate-600">

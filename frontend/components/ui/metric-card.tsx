@@ -24,14 +24,17 @@ export function MetricCard({
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[13px] font-medium text-slate-500">{label}</p>
+        <p className="text-[13px] font-semibold text-slate-500">{label}</p>
         {icon ? (
-          <span className="text-slate-400 [&>svg]:h-4 [&>svg]:w-4" aria-hidden="true">
+          <span
+            className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-50 text-brand-600 [&>svg]:h-4 [&>svg]:w-4"
+            aria-hidden="true"
+          >
             {icon}
           </span>
         ) : null}
       </div>
-      <p className="mt-1.5 text-2xl font-semibold tabular-nums tracking-tight text-slate-900">
+      <p className="mt-2 text-[26px] font-bold leading-8 tabular-nums tracking-tight text-slate-900">
         {value}
       </p>
       {hint ? <p className="mt-1 text-xs text-slate-500">{hint}</p> : null}

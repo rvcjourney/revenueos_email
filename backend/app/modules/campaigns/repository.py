@@ -62,6 +62,20 @@ def campaigns_have_pause_columns(session: Session) -> bool:
     return present
 
 
+# Campaign list orderings: sort name -> (key expression, direction, keyset
+# comparison). None is the original id order.
+_LIST_ORDERS: dict[str | None, tuple[str | None, str, str]] = {
+    None: (None, "ASC", ">"),
+    "updated_desc": ("updated_at", "DESC", "<"),
+    "created_desc": ("created_at", "DESC", "<"),
+    "name_asc": ("lower(name)", "ASC", ">"),
+}
+_LIST_KEY_PARAMS: dict[str | None, str] = {
+    "updated_desc": "CAST(:after_key AS timestamptz)",
+    "created_desc": "CAST(:after_key AS timestamptz)",
+    "name_asc": ":after_key",
+}
+
 class CampaignRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -170,12 +184,27 @@ class CampaignRepository:
         status: str | None,
         query: str | None,
         include_archived: bool = False,
+        campaign_type: str | None = None,
+        sort: str | None = None,
+        after_key: str | None = None,
     ) -> Sequence[RowMapping]:
+        # `sort` is one of _LIST_ORDERS' keys (validated by the caller); its SQL
+        # fragments are constants, never request text.
+        key_sql, direction, comparison = _LIST_ORDERS[sort]
         clauses = ["workspace_id = :workspace_id"]
         params: dict[str, Any] = {"workspace_id": str(workspace_id), "limit": limit}
-        if after_id is not None:
+        if after_id is not None and key_sql is None:
             clauses.append("id > :after_id")
             params["after_id"] = str(after_id)
+        elif after_id is not None:
+            # Keyset on (sort key, id): stable while rows are added or edited.
+            key_param = _LIST_KEY_PARAMS[sort]
+            clauses.append(f"({key_sql}, id) {comparison} ({key_param}, :after_id)")
+            params["after_id"] = str(after_id)
+            params["after_key"] = after_key
+        if campaign_type:
+            clauses.append("campaign_type = :campaign_type")
+            params["campaign_type"] = campaign_type
         if status:
             clauses.append("status = :status")
             params["status"] = status
@@ -185,6 +214,9 @@ class CampaignRepository:
             clauses.append("name ILIKE :query_pattern")
             params["query_pattern"] = f"%{query}%"
         where_sql = " AND ".join(clauses)
+        order_sql = (
+            "id ASC" if key_sql is None else f"{key_sql} {direction}, id {direction}"
+        )
         rows = (
             self.session.execute(
                 text(
@@ -192,7 +224,7 @@ class CampaignRepository:
                     SELECT *
                     FROM campaigns
                     WHERE {where_sql}
-                    ORDER BY id ASC
+                    ORDER BY {order_sql}
                     LIMIT :limit
                     """
                 ),
@@ -202,6 +234,44 @@ class CampaignRepository:
             .all()
         )
         return rows
+
+    def count_campaigns_by_status(
+        self,
+        *,
+        workspace_id: UUID,
+        query: str | None,
+        campaign_type: str | None,
+    ) -> dict[str, int]:
+        clauses = ["workspace_id = :workspace_id"]
+        params: dict[str, Any] = {"workspace_id": str(workspace_id)}
+        if campaign_type:
+            clauses.append("campaign_type = :campaign_type")
+            params["campaign_type"] = campaign_type
+        if query:
+            clauses.append("name ILIKE :query_pattern")
+            params["query_pattern"] = f"%{query}%"
+        rows = self.session.execute(
+            text(
+                f"""
+                SELECT status, count(*) AS total
+                FROM campaigns
+                WHERE {" AND ".join(clauses)}
+                GROUP BY status
+                """
+            ),
+            params,
+        ).all()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def member_display_names(self) -> dict[str, str]:
+        """Names of the selected workspace's members, from the same directory
+        function the Team page uses (so no wider read on profiles)."""
+        rows = self.session.execute(
+            text(
+                "SELECT user_id, display_name FROM public.app_list_workspace_members()"
+            )
+        ).all()
+        return {str(row[0]): row[1] for row in rows if row[1]}
 
     def update_campaign(
         self,

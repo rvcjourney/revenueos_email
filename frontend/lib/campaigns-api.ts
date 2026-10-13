@@ -5,6 +5,8 @@ import type {
   BulkItem,
   CampaignAudience,
   CampaignDetail,
+  CampaignCounts,
+  CampaignSort,
   CampaignType,
   CampaignMailbox,
   CampaignPage,
@@ -49,6 +51,8 @@ export async function listCampaigns(
     cursor?: string | null;
     q?: string | null;
     status?: string | null;
+    type?: CampaignType | null;
+    sort?: CampaignSort | null;
   } = {},
 ) {
   const path = appendSearch(workspacePath(workspaceId, "/campaigns"), {
@@ -56,8 +60,22 @@ export async function listCampaigns(
     cursor: params.cursor ?? undefined,
     q: params.q ?? undefined,
     status: params.status ?? undefined,
+    type: params.type ?? undefined,
+    sort: params.sort ?? undefined,
   });
   return (await apiRequest<CampaignPage>(path)).data;
+}
+
+// Campaigns per status under the same search and type filter as the list.
+export async function getCampaignCounts(
+  workspaceId: string,
+  params: { q?: string | null; type?: CampaignType | null } = {},
+) {
+  const path = appendSearch(workspacePath(workspaceId, "/campaigns/counts"), {
+    q: params.q ?? undefined,
+    type: params.type ?? undefined,
+  });
+  return (await apiRequest<CampaignCounts>(path)).data;
 }
 
 export async function createCampaign(

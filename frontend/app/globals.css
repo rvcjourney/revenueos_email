@@ -4,7 +4,7 @@
 
 :root {
   color-scheme: light;
-  --background: 248 250 252;
+  --background: 246 247 251;
   --foreground: 15 23 42;
 }
 
@@ -22,21 +22,51 @@ body {
   background: rgb(var(--background));
   color: rgb(var(--foreground));
   font-family: theme("fontFamily.sans");
-  font-feature-settings: "cv11", "ss01";
+  /* Plus Jakarta Sans has a narrow word space (0.17em); open it slightly so
+     small text stays easy to read. */
+  word-spacing: 0.06em;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
 ::selection {
-  background: rgb(199 210 254);
+  background: rgb(200 204 255);
   color: rgb(15 23 42);
+}
+
+/* Scrollbars: slim and quiet everywhere instead of the chunky OS default. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(203 213 225) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: rgb(203 213 225);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(148 163 184);
+}
+/* Strips of tabs and the navigation still scroll (wheel, touch, keyboard),
+   but show no bar at all. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
 }
 
 /* One consistent, visible keyboard focus treatment for anything that doesn't
    set its own ring (links, summary, custom controls). */
 :focus-visible {
-  outline: 2px solid rgb(79 70 229);
+  outline: 2px solid rgb(74 64 226);
   outline-offset: 2px;
 }
 

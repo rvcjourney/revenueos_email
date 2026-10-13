@@ -159,7 +159,7 @@ export function NewImportPageClient({
     <main className="mx-auto max-w-3xl space-y-6">
       {showHeading ? (
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+          <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">
             New Import
           </h1>
           <p className="mt-2 text-sm text-slate-500">

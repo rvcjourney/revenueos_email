@@ -230,7 +230,7 @@ export function LeadListDetailClient({ listId }: { listId: string }) {
           <>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-slate-200 text-sm">
-                <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                   <tr>
                     <th className="px-4 py-3">Lead</th>
                     <th className="px-4 py-3">Email</th>

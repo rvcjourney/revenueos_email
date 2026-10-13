@@ -18,6 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 CampaignType = Literal["STANDARD", "HYPER_PERSONALIZED"]
+# Optional orderings of the campaign list. With none given the list keeps its
+# original id order (and its original cursors).
+CampaignSort = Literal["updated_desc", "created_desc", "name_asc"]
 
 
 class CampaignCreateIn(BaseModel):
@@ -60,6 +63,10 @@ class CampaignListItem(BaseModel):
     is_activated: bool = False
     erased_at: datetime | None = None
     paused_at: datetime | None = None
+    start_at: datetime | None = None
+    # Display name of the member who created it; None when they have no name
+    # set or are no longer in the workspace directory.
+    creator_name: str | None = None
     version: int
     created_at: datetime
     updated_at: datetime
@@ -68,6 +75,13 @@ class CampaignListItem(BaseModel):
 class CampaignPage(BaseModel):
     items: list[CampaignListItem]
     next_cursor: str | None = None
+
+
+class CampaignCountsOut(BaseModel):
+    # Campaigns per status, for the statuses that have any.
+    by_status: dict[str, int]
+    not_archived: int
+    total: int
 
 
 class CampaignDetailOut(BaseModel):

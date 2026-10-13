@@ -34,13 +34,13 @@ export function PageHeader({
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
         <div className="min-w-0">
           {eyebrow ? (
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-brand-700">
+            <p className="mb-1.5 text-xs font-semibold uppercase tracking-[0.08em] text-brand-600">
               {eyebrow}
             </p>
           ) : null}
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{title}</h1>
+          <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">{title}</h1>
           {description ? (
-            <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500">{description}</p>
+            <p className="mt-1.5 max-w-3xl text-sm leading-6 text-slate-500">{description}</p>
           ) : null}
         </div>
         {actions ? (

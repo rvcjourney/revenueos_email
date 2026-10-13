@@ -128,6 +128,7 @@ export function SuppressionPageClient() {
   return (
     <main className="space-y-6">
       <PageHeader
+        eyebrow="Audience"
         title="Suppression List"
         description="Contacts that will never receive outreach (unsubscribed, bounced, or manually suppressed). Unsubscribe, bounce and complaint entries are permanent; only manually suppressed addresses can be released."
         back={{ href: "/app/leads", label: "Back to leads" }}
@@ -227,7 +228,7 @@ export function SuppressionPageClient() {
           <>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-slate-200 text-sm">
-                <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                   <tr>
                     <th className="px-4 py-3">Email</th>
                     <th className="px-4 py-3">Status</th>

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -10,6 +10,7 @@ import {
   Check,
   CheckCheck,
   ChevronDown,
+  ChevronsUpDown,
   Contact,
   CreditCard,
   HelpCircle,
@@ -21,15 +22,16 @@ import {
   Mail,
   Menu,
   Plus,
+  Search,
   Send,
   Settings,
   Sliders,
-  UserCircle,
   Users,
   X,
 } from "lucide-react";
 
 import { LogoMark, Logo } from "@/components/brand/logo";
+import { CommandPalette } from "@/components/shell/command-palette";
 import { Button } from "@/components/ui/button";
 import { ToastProvider } from "@/components/ui/toast";
 import { NewWorkspaceDialog } from "@/components/workspace/new-workspace-dialog";
@@ -44,6 +46,7 @@ import { canDeleteWorkspace } from "@/lib/permissions";
 import { signOutCurrentBrowser } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import { useWorkspace, WorkspaceProvider } from "@/lib/workspace-context";
+import { getMe } from "@/lib/workspaces-api";
 
 type NavItem = { href: string; label: string; icon: typeof Send };
 type NavGroup = { label: string | null; items: NavItem[] };
@@ -98,11 +101,11 @@ function SidebarNav({
 }) {
   const activeHref = activeNavHref(pathname);
   return (
-    <nav aria-label="Primary" className="flex-1 space-y-5 overflow-y-auto px-3 py-4">
+    <nav aria-label="Primary" className="scrollbar-none min-h-0 flex-1 space-y-5 overflow-y-auto px-3 py-4">
       {navigationGroups.map((group, index) => (
         <div key={group.label ?? index}>
           {group.label ? (
-            <p className="mb-1.5 px-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+            <p className="mb-1.5 px-3 text-[11px] font-semibold uppercase tracking-[0.1em] text-ink-400">
               {group.label}
             </p>
           ) : null}
@@ -117,22 +120,22 @@ function SidebarNav({
                   onClick={onNavigate}
                   aria-current={active ? "page" : undefined}
                   className={cn(
-                    "group relative flex h-10 items-center gap-3 rounded-lg px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
+                    "group relative flex h-10 items-center gap-3 rounded-lg px-3 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400",
                     active
-                      ? "bg-brand-50 text-brand-700"
-                      : "text-slate-600 hover:bg-slate-100 hover:text-slate-900",
+                      ? "bg-brand-600/25 text-white"
+                      : "text-ink-300 hover:bg-white/[0.06] hover:text-white",
                   )}
                 >
                   {active ? (
                     <span
                       aria-hidden="true"
-                      className="absolute inset-y-2 left-0 w-0.5 rounded-full bg-brand-600"
+                      className="absolute inset-y-2 left-0 w-[3px] rounded-full bg-brand-400"
                     />
                   ) : null}
                   <Icon
                     className={cn(
                       "h-[18px] w-[18px] shrink-0 transition-colors",
-                      active ? "text-brand-600" : "text-slate-400 group-hover:text-slate-600",
+                      active ? "text-brand-300" : "text-ink-400 group-hover:text-ink-300",
                     )}
                     aria-hidden="true"
                   />
@@ -147,6 +150,82 @@ function SidebarNav({
   );
 }
 
+function initialsOf(name: string) {
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return "?";
+  return (words[0][0] + (words.length > 1 ? words[words.length - 1][0] : "")).toUpperCase();
+}
+
+// Docked at the foot of the sidebar (and of the mobile drawer).
+function WorkspaceSwitcher({ onCreate }: { onCreate: () => void }) {
+  const router = useRouter();
+  const { workspaces, activeWorkspaceId, activeWorkspace, switchWorkspace } = useWorkspace();
+  const selectId = useId();
+
+  function handleWorkspaceChange(event: React.ChangeEvent<HTMLSelectElement>) {
+    switchWorkspace(event.target.value);
+    // Never carry a foreign resource id (e.g. a campaign id from the old
+    // workspace) across the switch -- always land on a workspace-neutral
+    // route.
+    router.push("/app/dashboard");
+  }
+
+  return (
+    <div className="shrink-0 border-t border-white/[0.08] p-3">
+      <div className="flex items-center gap-2 rounded-xl bg-white/[0.05] p-2">
+        <span
+          aria-hidden="true"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand-600 text-xs font-bold text-white"
+        >
+          {initialsOf(activeWorkspace?.workspace_name ?? "")}
+        </span>
+        <div className="relative min-w-0 flex-1">
+          <label htmlFor={selectId} className="sr-only">
+            Select workspace
+          </label>
+          <select
+            id={selectId}
+            value={activeWorkspaceId ?? ""}
+            onChange={handleWorkspaceChange}
+            className="block w-full cursor-pointer appearance-none truncate rounded bg-transparent pr-5 text-sm font-semibold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 [&>option]:text-slate-900"
+          >
+            {workspaces.map((workspace) => (
+              <option key={workspace.workspace_id} value={workspace.workspace_id}>
+                {workspace.workspace_name}
+              </option>
+            ))}
+          </select>
+          <ChevronsUpDown
+            className="pointer-events-none absolute right-0 top-0.5 h-4 w-4 text-ink-400"
+            aria-hidden="true"
+          />
+          {activeWorkspace ? (
+            <p className="truncate text-xs text-ink-400">Role: {activeWorkspace.role_code}</p>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          aria-label="New workspace"
+          title="New workspace"
+          onClick={onCreate}
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ink-300 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400"
+        >
+          <Plus className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Everything the search overlay can jump to, including the settings pages that
+// only live in the header menu.
+const paletteDestinations = [
+  ...allNavItems,
+  { href: "/app/notifications", label: "Notifications", icon: Bell },
+  { href: "/app/settings/usage", label: "Usage & Quotas", icon: CreditCard },
+  { href: "/app/settings/notifications", label: "Notification Settings", icon: Sliders },
+];
+
 type OpenMenu = "notifications" | "settings" | "user" | null;
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
@@ -159,11 +238,11 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     activeWorkspace,
     isLoading,
     error: workspaceError,
-    switchWorkspace,
   } = useWorkspace();
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [newWorkspaceDialogOpen, setNewWorkspaceDialogOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const headerActionsRef = useRef<HTMLDivElement>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const notificationsOpen = openMenu === "notifications";
@@ -202,6 +281,15 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     },
   });
 
+  // Only decorates the user chip; the shell works without it.
+  const { data: profile } = useQuery({
+    queryKey: ["me"],
+    queryFn: getMe,
+    enabled: Boolean(activeWorkspaceId),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+
   const unreadCount = unreadData?.unread_count ?? 0;
 
   useEffect(() => {
@@ -214,7 +302,20 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     setOpenMenu(null);
     setDrawerOpen(false);
+    setPaletteOpen(false);
   }, [pathname]);
+
+  // Ctrl/Cmd+K opens search from anywhere in the app.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen(true);
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // Header menus close on outside click and Escape.
   useEffect(() => {
@@ -262,7 +363,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   if (isLoading) {
     return (
-      <div className="grid min-h-screen place-items-center bg-slate-50">
+      <div className="grid min-h-screen place-items-center bg-[rgb(var(--background))]">
         <div className="flex flex-col items-center gap-3">
           <LogoMark className="h-10 w-10 animate-pulse" />
           <Loader2
@@ -278,7 +379,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     const sessionExpired =
       workspaceError instanceof ApiError && workspaceError.status === 401;
     return (
-      <div className="grid min-h-screen place-items-center bg-slate-50 px-4">
+      <div className="grid min-h-screen place-items-center bg-[rgb(var(--background))] px-4">
         <div className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-card">
           <Logo size="sm" className="mb-4" />
           <h1 className="text-base font-semibold text-slate-900">
@@ -330,23 +431,17 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     router.refresh();
   }
 
-  function handleWorkspaceChange(event: React.ChangeEvent<HTMLSelectElement>) {
-    switchWorkspace(event.target.value);
-    // Never carry a foreign resource id (e.g. a campaign id from the old
-    // workspace) across the switch -- always land on a workspace-neutral
-    // route.
-    router.push("/app/dashboard");
-  }
-
   function toggleMenu(menu: Exclude<OpenMenu, null>) {
     setOpenMenu((current) => (current === menu ? null : menu));
   }
+
+  const userName = profile?.display_name || profile?.email || null;
 
   const menuItemClasses =
     "flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm font-medium text-slate-700 transition-colors hover:bg-slate-100 focus-visible:bg-slate-100 focus-visible:outline-none";
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
+    <div className="min-h-screen bg-[rgb(var(--background))] text-slate-900">
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[70] focus:rounded-md focus:bg-white focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-brand-700 focus:shadow-overlay"
@@ -354,23 +449,24 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         Skip to content
       </a>
 
-      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 flex-col border-r border-slate-200 bg-white lg:flex">
-        <div className="flex h-16 shrink-0 items-center border-b border-slate-100 px-5">
+      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 flex-col bg-ink-900 lg:flex">
+        <div className="flex h-16 shrink-0 items-center border-b border-white/[0.08] px-5">
           <Link
             href="/app/dashboard"
             aria-label="Outly dashboard"
-            className="rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+            className="rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400"
           >
-            <Logo />
+            <Logo tone="light" />
           </Link>
         </div>
         <SidebarNav pathname={pathname} />
+        <WorkspaceSwitcher onCreate={() => setNewWorkspaceDialogOpen(true)} />
       </aside>
 
       {drawerOpen ? (
         <div className="fixed inset-0 z-50 lg:hidden">
           <div
-            className="absolute inset-0 bg-slate-900/50 animate-fade-in"
+            className="absolute inset-0 bg-ink-950/60 animate-fade-in"
             onMouseDown={() => setDrawerOpen(false)}
             aria-hidden="true"
           />
@@ -379,35 +475,40 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             role="dialog"
             aria-modal="true"
             aria-label="Navigation"
-            className="relative flex h-full w-72 max-w-[85vw] flex-col bg-white shadow-overlay animate-slide-in-left"
+            className="relative flex h-full w-72 max-w-[85vw] flex-col bg-ink-900 shadow-overlay animate-slide-in-left"
           >
-            <div className="flex h-16 shrink-0 items-center justify-between border-b border-slate-100 pl-5 pr-3">
-              <Logo />
-              <Button
+            <div className="flex h-16 shrink-0 items-center justify-between border-b border-white/[0.08] pl-5 pr-3">
+              <Logo tone="light" />
+              <button
                 type="button"
-                variant="ghost"
-                size="icon"
                 aria-label="Close navigation"
                 onClick={() => setDrawerOpen(false)}
+                className="flex h-9 w-9 items-center justify-center rounded-lg text-ink-300 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400"
               >
                 <X className="h-4 w-4" aria-hidden="true" />
-              </Button>
+              </button>
             </div>
             <SidebarNav pathname={pathname} onNavigate={() => setDrawerOpen(false)} />
+            <WorkspaceSwitcher
+              onCreate={() => {
+                setDrawerOpen(false);
+                setNewWorkspaceDialogOpen(true);
+              }}
+            />
           </div>
         </div>
       ) : null}
 
       <div className="lg:pl-64">
         <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-3 border-b border-slate-200 bg-white/90 px-4 backdrop-blur sm:px-6 lg:px-8">
-          <div className="flex min-w-0 items-center gap-2 sm:gap-3">
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
             <Button
               type="button"
               variant="ghost"
               size="icon"
               aria-label="Open navigation"
               aria-expanded={drawerOpen}
-              className="lg:hidden"
+              className="shrink-0 lg:hidden"
               onClick={() => setDrawerOpen(true)}
             >
               <Menu className="h-5 w-5" aria-hidden="true" />
@@ -415,51 +516,23 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             <Link
               href="/app/dashboard"
               aria-label="Outly dashboard"
-              className="rounded-md lg:hidden"
+              className="shrink-0 rounded-md lg:hidden"
             >
               <LogoMark />
             </Link>
-            <div className="min-w-0">
-              <label htmlFor="workspace-select" className="sr-only">
-                Select workspace
-              </label>
-              <div className="flex items-center gap-1.5">
-                <div className="relative min-w-0">
-                  <select
-                    id="workspace-select"
-                    value={activeWorkspaceId ?? ""}
-                    onChange={handleWorkspaceChange}
-                    className="h-9 w-full max-w-[220px] cursor-pointer appearance-none truncate rounded-lg border border-slate-200 bg-white py-0 pl-3 pr-8 text-sm font-semibold text-slate-900 shadow-sm transition-colors hover:border-slate-300 focus-visible:border-brand-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/30"
-                  >
-                    {workspaces.map((workspace) => (
-                      <option key={workspace.workspace_id} value={workspace.workspace_id}>
-                        {workspace.workspace_name}
-                      </option>
-                    ))}
-                  </select>
-                  <ChevronDown
-                    className="pointer-events-none absolute right-2.5 top-2.5 h-4 w-4 text-slate-400"
-                    aria-hidden="true"
-                  />
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  aria-label="New workspace"
-                  title="New workspace"
-                  className="h-9 w-9 shrink-0"
-                  onClick={() => setNewWorkspaceDialogOpen(true)}
-                >
-                  <Plus className="h-4 w-4" aria-hidden="true" />
-                </Button>
-              </div>
-              {activeWorkspace ? (
-                <p className="mt-0.5 hidden truncate text-xs text-slate-500 sm:block">
-                  Role: {activeWorkspace.role_code}
-                </p>
-              ) : null}
-            </div>
+            <button
+              type="button"
+              aria-label="Search"
+              aria-haspopup="dialog"
+              onClick={() => setPaletteOpen(true)}
+              className="flex h-10 min-w-0 flex-1 items-center gap-2.5 rounded-lg border border-slate-200 bg-slate-50/80 px-3 text-left text-sm text-slate-400 transition-colors hover:border-slate-300 hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:max-w-md lg:max-w-xl"
+            >
+              <Search className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="min-w-0 flex-1 truncate">Search campaigns, leads and pages</span>
+              <kbd className="hidden shrink-0 rounded border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-slate-500 md:block">
+                Ctrl K
+              </kbd>
+            </button>
           </div>
           <div ref={headerActionsRef} className="flex items-center gap-1">
             {/* Notifications Popover */}
@@ -663,15 +736,35 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                 aria-expanded={userMenuOpen}
                 aria-haspopup="menu"
                 onClick={() => toggleMenu("user")}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-brand-600 text-white shadow-sm transition-colors hover:bg-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2"
+                className="flex h-10 items-center gap-2 rounded-full p-0.5 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 md:pr-2"
               >
-                <UserCircle className="h-5 w-5" aria-hidden="true" />
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-brand-600 text-xs font-bold text-white">
+                  {initialsOf(userName ?? "")}
+                </span>
+                {userName ? (
+                  <span className="hidden max-w-[10rem] truncate text-sm font-semibold text-slate-800 md:block">
+                    {userName}
+                  </span>
+                ) : null}
+                <ChevronDown className="hidden h-4 w-4 text-slate-400 md:block" aria-hidden="true" />
               </button>
               {userMenuOpen ? (
                 <div
                   role="menu"
-                  className="absolute right-0 z-50 mt-2 w-44 rounded-xl border border-slate-200 bg-white p-1 shadow-overlay animate-pop-in"
+                  className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-slate-200 bg-white p-1 shadow-overlay animate-pop-in"
                 >
+                  {profile ? (
+                    <div className="border-b border-slate-100 px-3 py-2">
+                      {profile.display_name ? (
+                        <p className="truncate text-sm font-semibold text-slate-900">
+                          {profile.display_name}
+                        </p>
+                      ) : null}
+                      {profile.email ? (
+                        <p className="truncate text-xs text-slate-500">{profile.email}</p>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <button
                     role="menuitem"
                     type="button"
@@ -694,6 +787,12 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           {children}
         </div>
       </div>
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        workspaceId={activeWorkspaceId}
+        destinations={paletteDestinations}
+      />
       <NewWorkspaceDialog
         open={newWorkspaceDialogOpen}
         onRequestClose={() => setNewWorkspaceDialogOpen(false)}

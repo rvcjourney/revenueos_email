@@ -510,9 +510,20 @@ export type CampaignListItem = {
   erased_at?: string | null;
   // Set only while PAUSED (absent on a server that predates pause metadata).
   paused_at?: string | null;
+  // Absent on a server that predates the list's owner and start time.
+  start_at?: string | null;
+  creator_name?: string | null;
   version: number;
   created_at: string;
   updated_at: string;
+};
+
+export type CampaignSort = "updated_desc" | "created_desc" | "name_asc";
+
+export type CampaignCounts = {
+  by_status: Partial<Record<CampaignStatus, number>>;
+  not_archived: number;
+  total: number;
 };
 
 export type CampaignPage = {

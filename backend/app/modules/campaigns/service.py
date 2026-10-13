@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from uuid import UUID
 
 from sqlalchemy import RowMapping
@@ -11,6 +13,7 @@ from app.core.errors import AppError
 from app.core.permissions import has_permission
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import (
+    CampaignCountsOut,
     CampaignCreateIn,
     CampaignDetailOut,
     CampaignDuplicateIn,
@@ -18,7 +21,7 @@ from app.modules.campaigns.schemas import (
     CampaignPage,
     CampaignUpdateIn,
 )
-from app.modules.leads.pagination import decode_cursor, encode_cursor, normalize_limit
+from app.modules.leads.pagination import encode_cursor, normalize_limit
 from app.modules.personalization.version import (
     CAMPAIGN_TYPE_HYPER,
     CAMPAIGN_TYPE_STANDARD,
@@ -33,6 +36,44 @@ _ALLOWED_STATUS_FILTERS = {
     "COMPLETED",
     "ARCHIVED",
 }
+
+
+_SORT_KEY_COLUMNS = {
+    "updated_desc": "updated_at",
+    "created_desc": "created_at",
+    "name_asc": "name",
+}
+
+
+def _encode_sorted_cursor(sort: str, row: RowMapping) -> str:
+    value = row[_SORT_KEY_COLUMNS[sort]]
+    key = value.lower() if sort == "name_asc" else value.isoformat()
+    payload = json.dumps(
+        {"id": str(row["id"]), "s": sort, "k": key}, separators=(",", ":")
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_list_cursor(
+    cursor: str | None, sort: str | None
+) -> tuple[str | None, UUID | None]:
+    """(sort key, id) to continue after. A cursor only continues the ordering
+    that issued it; any other one is rejected like a malformed cursor, rather
+    than quietly resuming somewhere unrelated."""
+    if not cursor:
+        return None, None
+    try:
+        padded = cursor + ("=" * (-len(cursor) % 4))
+        data = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if data.get("s") != sort:
+            raise ValueError("cursor belongs to another ordering")
+        if sort is not None and not isinstance(data["k"], str):
+            raise ValueError("cursor has no sort key")
+        return data.get("k"), UUID(str(data["id"]))
+    except Exception as exc:
+        raise AppError(
+            "validation_error", "Cursor is invalid", status_code=422
+        ) from exc
 
 
 def _require_personalization_enabled() -> None:
@@ -98,9 +139,11 @@ class CampaignService:
         cursor: str | None,
         query: str | None,
         status: str | None,
+        campaign_type: str | None = None,
+        sort: str | None = None,
     ) -> CampaignPage:
         effective_limit = normalize_limit(limit)
-        after_id = decode_cursor(cursor)
+        after_key, after_id = _decode_list_cursor(cursor, sort)
 
         clean_status = status if status in _ALLOWED_STATUS_FILTERS else None
         clean_query = query.strip() if query else None
@@ -114,15 +157,46 @@ class CampaignService:
             status=clean_status,
             query=clean_query,
             include_archived=status == "ALL",
+            campaign_type=campaign_type,
+            sort=sort,
+            after_key=after_key,
         )
         has_more = len(rows) > effective_limit
         page_rows = rows[:effective_limit]
 
-        items = [self._to_list_item(row) for row in page_rows]
-        next_cursor = (
-            encode_cursor(page_rows[-1]["id"]) if has_more and page_rows else None
-        )
+        names = self.repo.member_display_names() if page_rows else {}
+        items = [
+            self._to_list_item(row, creator_name=names.get(str(row["creator_id"])))
+            for row in page_rows
+        ]
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = (
+                encode_cursor(last["id"])
+                if sort is None
+                else _encode_sorted_cursor(sort, last)
+            )
         return CampaignPage(items=items, next_cursor=next_cursor)
+
+    def count_campaigns(
+        self,
+        context: WorkspaceContext,
+        *,
+        query: str | None,
+        campaign_type: str | None = None,
+    ) -> CampaignCountsOut:
+        by_status = self.repo.count_campaigns_by_status(
+            workspace_id=context.workspace_id,
+            query=query.strip() if query else None,
+            campaign_type=campaign_type,
+        )
+        total = sum(by_status.values())
+        return CampaignCountsOut(
+            by_status=by_status,
+            not_archived=total - by_status.get("ARCHIVED", 0),
+            total=total,
+        )
 
     def update_campaign(
         self, context: WorkspaceContext, campaign_id: UUID, payload: CampaignUpdateIn
@@ -266,7 +340,9 @@ class CampaignService:
 
         return self.get_campaign(context, new_campaign_id)
 
-    def _to_list_item(self, row: RowMapping) -> CampaignListItem:
+    def _to_list_item(
+        self, row: RowMapping, *, creator_name: str | None = None
+    ) -> CampaignListItem:
         return CampaignListItem(
             id=row["id"],
             workspace_id=row["workspace_id"],
@@ -280,6 +356,8 @@ class CampaignService:
             is_activated=row.get("activation_id") is not None,
             erased_at=row.get("erased_at"),
             paused_at=row.get("paused_at"),
+            start_at=row.get("start_at"),
+            creator_name=creator_name,
             version=row["version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

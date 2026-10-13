@@ -186,6 +186,7 @@ export function LeadListsPageClient() {
   return (
     <main className="space-y-6">
       <PageHeader
+        eyebrow="Audience"
         title="Lead Lists"
         description="Reusable collections of workspace leads."
         back={{ href: "/app/leads", label: "Back to leads" }}
@@ -201,12 +202,11 @@ export function LeadListsPageClient() {
 
       {actionError ? <Alert>{actionError}</Alert> : null}
 
-      <div className="flex items-center gap-2">
+      <div className="w-full sm:w-48">
         <Select
           aria-label="List status"
           value={status}
           onChange={(event) => updateStatus(event.target.value)}
-          className="w-auto"
         >
           <option value="ACTIVE">Active</option>
           <option value="ARCHIVED">Archived</option>
@@ -277,7 +277,7 @@ export function LeadListsPageClient() {
           <>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-slate-200 text-sm">
-                <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                   <tr>
                     {mayManage ? (
                       <th className="w-10 px-4 py-3">

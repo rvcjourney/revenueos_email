@@ -201,6 +201,7 @@ export function LeadsPageClient() {
   return (
     <main className="space-y-6">
       <PageHeader
+        eyebrow="Audience"
         title="Leads"
         description="Workspace contacts for outreach and reusable lists."
         actions={
@@ -364,7 +365,7 @@ export function LeadsPageClient() {
           <>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-slate-200 text-sm">
-                <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                   <tr>
                     {mayManage ? (
                       <th className="w-10 px-4 py-3">
@@ -405,7 +406,19 @@ export function LeadsPageClient() {
                         </td>
                       ) : null}
                       <td className="px-4 py-3 font-medium text-slate-900">
-                        <Link href={`/app/leads/${lead.id}`}>
+                        <Link
+                          href={`/app/leads/${lead.id}`}
+                          className="inline-flex items-center gap-3 hover:text-brand-700"
+                        >
+                          <span
+                            aria-hidden="true"
+                            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-50 text-[11px] font-bold uppercase text-brand-700"
+                          >
+                            {lead.erased_at
+                              ? "–"
+                              : (lead.first_name?.[0] ?? lead.email[0] ?? "") +
+                                (lead.last_name?.[0] ?? "")}
+                          </span>
                           {lead.erased_at
                             ? "Erased lead"
                             : fullName(lead.first_name, lead.last_name)}

@@ -10,11 +10,16 @@ vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
 }));
 
-const { listCampaigns, bulkArchiveCampaigns } = vi.hoisted(() => ({
+const { listCampaigns, bulkArchiveCampaigns, getCampaignCounts } = vi.hoisted(() => ({
   listCampaigns: vi.fn(),
   bulkArchiveCampaigns: vi.fn(),
+  getCampaignCounts: vi.fn(),
 }));
-vi.mock("@/lib/campaigns-api", () => ({ listCampaigns, bulkArchiveCampaigns }));
+vi.mock("@/lib/campaigns-api", () => ({
+  listCampaigns,
+  bulkArchiveCampaigns,
+  getCampaignCounts,
+}));
 
 const { useWorkspace } = vi.hoisted(() => ({ useWorkspace: vi.fn() }));
 vi.mock("@/lib/workspace-context", () => ({ useWorkspace }));
@@ -96,8 +101,40 @@ describe("CampaignsPageClient bulk archive and role capabilities", () => {
       cursor: null,
       q: null,
       status: null,
+      type: null,
+      sort: "updated_desc",
     });
     expect(screen.getByText("Not archived")).toBeInTheDocument();
+  });
+
+  it("shows how many campaigns each status holds, and none when counts are unavailable", async () => {
+    asRole("MANAGER");
+    listCampaigns.mockResolvedValue({ items: [item("c1", "One")], next_cursor: null });
+    getCampaignCounts.mockResolvedValue({ by_status: { PAUSED: 3 }, not_archived: 5, total: 7 });
+    const withCounts = renderPage();
+    expect(await screen.findByRole("button", { name: "Not archived 5" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Paused 3" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Draft 0" })).toBeInTheDocument();
+    expect(getCampaignCounts).toHaveBeenCalledWith("ws-1", { q: null, type: null });
+    withCounts.unmount();
+
+    getCampaignCounts.mockRejectedValue(new Error("not supported"));
+    renderPage();
+    await screen.findByText("One");
+    expect(screen.getByRole("button", { name: "Paused" })).toBeInTheDocument();
+  });
+
+  it("keeps the type filter and sort in the URL, back on the first page", async () => {
+    asRole("MANAGER");
+    listCampaigns.mockResolvedValue({ items: [item("c1", "One")], next_cursor: null });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("One");
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Filter by type" }), "Hyper-personalized");
+    expect(push).toHaveBeenLastCalledWith("/app/campaigns?type=HYPER_PERSONALIZED");
+    await user.selectOptions(screen.getByRole("combobox", { name: "Sort campaigns" }), "Name A to Z");
+    expect(push).toHaveBeenLastCalledWith("/app/campaigns?sort=name_asc");
   });
 
   it("passes each role's capabilities down to the cards", async () => {
