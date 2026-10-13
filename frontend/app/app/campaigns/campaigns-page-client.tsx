@@ -10,7 +10,6 @@ import {
   CampaignCard,
   CampaignCardSkeleton,
 } from "@/components/campaigns/campaign-card";
-import { CreateCampaignPanel } from "@/components/campaigns/create-campaign-panel";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -28,7 +27,6 @@ import { errorMessage } from "@/lib/errors";
 import { canDraftCampaign, canEraseData, canExecuteCampaign } from "@/lib/permissions";
 import { useSelection } from "@/lib/use-selection";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
-import { cn } from "@/lib/utils";
 import { useWorkspace } from "@/lib/workspace-context";
 import type { CampaignSort, CampaignStatus, CampaignType } from "@/types/domain";
 
@@ -56,7 +54,7 @@ const SORT_OPTIONS: { value: CampaignSort; label: string }[] = [
 const DEFAULT_SORT: CampaignSort = "updated_desc";
 
 function statusLabel(status: CampaignStatus | "ALL") {
-  return status === "ALL" ? "Not archived" : status.charAt(0) + status.slice(1).toLowerCase();
+  return status === "ALL" ? "All campaigns" : status.charAt(0) + status.slice(1).toLowerCase();
 }
 
 export function CampaignsPageClient() {
@@ -189,7 +187,6 @@ export function CampaignsPageClient() {
         actions={createButton}
       />
 
-      <div className={cn("grid items-start gap-6", mayDraft && "xl:grid-cols-[minmax(0,1fr)_19rem]")}>
       {/* One surface for filter, search, list and paging. It must not clip
           overflow: the row action menus open past its edge. */}
       <section
@@ -337,7 +334,6 @@ export function CampaignsPageClient() {
                       selectable={selectMode}
                       selected={selection.selected.has(c.id)}
                       onToggleSelect={selection.toggle}
-                      density={mayDraft ? "tight" : "roomy"}
                     />
                   ))
                 : null}
@@ -363,12 +359,6 @@ export function CampaignsPageClient() {
           </>
         )}
       </section>
-      {mayDraft ? (
-        <div className="hidden xl:sticky xl:top-24 xl:block">
-          <CreateCampaignPanel />
-        </div>
-      ) : null}
-      </div>
 
       <ConfirmDialog
         open={confirmBulk}

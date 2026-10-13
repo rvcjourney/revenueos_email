@@ -22,20 +22,6 @@ import { formatDateTime, formatNumber, formatRelativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { CampaignListItem } from "@/types/domain";
 
-// The row goes side by side once the list is wide enough. `roomy` is a list
-// with no panel beside it, which reaches that width on a smaller screen.
-const rowWide = {
-  roomy: "xl:grid-cols-[minmax(0,1fr)_auto_auto] xl:gap-x-8",
-  tight: "min-[1700px]:grid-cols-[minmax(0,1fr)_auto_auto] min-[1700px]:gap-x-8",
-};
-const statsWide = {
-  roomy: "xl:col-span-1 xl:col-start-2 xl:row-start-1 xl:w-[23rem] xl:border-t-0 xl:pt-0",
-  tight:
-    "min-[1700px]:col-span-1 min-[1700px]:col-start-2 min-[1700px]:row-start-1 min-[1700px]:w-[23rem] min-[1700px]:border-t-0 min-[1700px]:pt-0",
-};
-const actionsWide = { roomy: "xl:col-start-3", tight: "min-[1700px]:col-start-3" };
-type Density = keyof typeof rowWide;
-
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     // dt/dd stay in semantic order; the value is shown above its label.
@@ -161,7 +147,6 @@ export function CampaignCard({
   selectable = false,
   selected = false,
   onToggleSelect,
-  density = "roomy",
 }: {
   campaign: CampaignListItem;
   workspaceId: string;
@@ -171,7 +156,6 @@ export function CampaignCard({
   selectable?: boolean;
   selected?: boolean;
   onToggleSelect?: (id: string) => void;
-  density?: Density;
 }) {
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -272,7 +256,8 @@ export function CampaignCard({
       aria-label={campaign.name}
       className={cn(
         "group relative grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-4 rounded-xl border bg-white p-4 transition-[border-color,box-shadow] duration-150 sm:px-5",
-        rowWide[density],
+        // The row goes side by side once the list is wide enough.
+        "xl:grid-cols-[minmax(0,1fr)_auto_auto] xl:gap-x-8",
         selected
           ? "border-brand-300 bg-brand-50/40"
           : "border-slate-200 hover:border-slate-300 hover:shadow-card-hover",
@@ -334,7 +319,7 @@ export function CampaignCard({
       <div
         className={cn(
           "col-span-2 row-start-2 border-t border-slate-100 pt-3.5",
-          statsWide[density],
+          "xl:col-span-1 xl:col-start-2 xl:row-start-1 xl:w-[23rem] xl:border-t-0 xl:pt-0",
         )}
       >
         <CampaignStats workspaceId={workspaceId} campaign={campaign} />
@@ -345,7 +330,7 @@ export function CampaignCard({
           // While its menu is open the row's actions rise above later rows,
           // whose own actions would otherwise paint over the menu.
           "relative z-10 col-start-2 row-start-1 flex items-center gap-1 has-[[aria-expanded=true]]:z-30",
-          actionsWide[density],
+          "xl:col-start-3",
         )}
       >
         {/* Phones drop the button: the row itself opens the campaign. */}

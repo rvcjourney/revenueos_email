@@ -104,7 +104,7 @@ describe("CampaignsPageClient bulk archive and role capabilities", () => {
       type: null,
       sort: "updated_desc",
     });
-    expect(screen.getByText("Not archived")).toBeInTheDocument();
+    expect(screen.getByText("All campaigns")).toBeInTheDocument();
   });
 
   it("shows how many campaigns each status holds, and none when counts are unavailable", async () => {
@@ -112,7 +112,7 @@ describe("CampaignsPageClient bulk archive and role capabilities", () => {
     listCampaigns.mockResolvedValue({ items: [item("c1", "One")], next_cursor: null });
     getCampaignCounts.mockResolvedValue({ by_status: { PAUSED: 3 }, not_archived: 5, total: 7 });
     const withCounts = renderPage();
-    expect(await screen.findByRole("button", { name: "Not archived 5" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "All campaigns 5" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Paused 3" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Draft 0" })).toBeInTheDocument();
     expect(getCampaignCounts).toHaveBeenCalledWith("ws-1", { q: null, type: null });
