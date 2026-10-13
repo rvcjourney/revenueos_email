@@ -80,4 +80,4 @@ Schema migrations are owned exclusively by `supabase/migrations/`.
 python scripts/check_migrations.py
 ```
 
-Do not use Alembic or SQLAlchemy schema auto-creation for this project.
+Do not use Alembic or SQLAlchemy schema auto-creation for this project
