@@ -29,6 +29,7 @@ from app.modules.personalization.text_utils import (
     find_urls_with_spans,
     html_to_text,
     significant_tokens,
+    split_paragraphs,
     word_shingles,
 )
 from app.modules.templates.sanitizer import sanitize_email_html
@@ -57,6 +58,9 @@ _UNSAFE_RE = re.compile(
     r"100%\s+guarantee|risk[- ]free)\b",
     re.IGNORECASE,
 )
+# A reference whose first paragraph is a greeting line ("Hi Rahul,") fixes the
+# first paragraph of every email written from it (ADR-0025).
+_GREETING_RE = re.compile(r"^(hi|hello|hey|dear)\b[^\n]{0,80}$", re.IGNORECASE)
 _PLACEHOLDER_MARK_RE = re.compile(r"\{\{|\}\}|\[\[|\]\]|<[a-z/][^>]*>", re.IGNORECASE)
 
 # What each code tells the model on the next attempt. Codes only; the rejected
@@ -103,6 +107,7 @@ CODE_GUIDANCE: dict[str, str] = {
     "filler_followup": (
         "Avoid filler such as 'just following up'; add new value instead."
     ),
+    "greeting_changed": "Start with exactly the greeting line of the reference.",
     **SHAPE_GUIDANCE,
 }
 
@@ -162,8 +167,15 @@ def _objective_text(objective: PersonalizationConfig) -> str:
             objective.target,
             objective.problem_solved,
             *objective.must_mention,
+            # The sender's own words, like the objective: a number or link the
+            # reviewer asked for is supported (ADR-0025).
+            objective.feedback or "",
         ]
     )
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split()).lower()
 
 
 def _normalize_subject(subject: str) -> str:
@@ -210,6 +222,14 @@ def validate_generation(
     # reference being personalized.
     for code in shape_codes(paragraphs):
         flag(code)
+    reference_first = split_paragraphs(ctx.reference_text)[:1]
+    if (
+        paragraphs
+        and reference_first
+        and _GREETING_RE.match(reference_first[0])
+        and _squash(paragraphs[0]) != _squash(reference_first[0])
+    ):
+        flag("greeting_changed")
     if paragraphs and len(body_text.split()) > max_words_for_reference(
         len(ctx.reference_text.split())
     ):

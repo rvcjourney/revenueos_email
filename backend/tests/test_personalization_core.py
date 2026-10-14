@@ -573,3 +573,90 @@ class TestServiceAttempt:
 def test_prompt_version_is_part_of_the_frozen_identity() -> None:
     assert PROMPT_VERSION
     assert datetime.now(UTC)  # module import sanity
+
+
+class TestFeedback:
+    """ADR-0025: reviewer feedback on samples."""
+
+    def test_absent_feedback_leaves_the_stored_form_and_digest_unchanged(
+        self,
+    ) -> None:
+        config = PersonalizationConfig.model_validate(CONFIG)
+        assert "feedback" not in config.canonical()
+        assert config.generation_objective() == config.objective_core()
+        with_none = PersonalizationConfig.model_validate({**CONFIG, "feedback": "  "})
+        assert with_none.canonical() == config.canonical()
+
+    def test_feedback_is_stored_digested_and_reaches_only_the_per_lead_prompt(
+        self,
+    ) -> None:
+        plain = PersonalizationConfig.model_validate(CONFIG)
+        noted = PersonalizationConfig.model_validate(
+            {**CONFIG, "feedback": "Shorter.\n\nMention Pune."}
+        )
+        assert noted.canonical()["feedback"] == "Shorter.\n\nMention Pune."
+        assert "feedback" not in noted.objective_core()  # reference drafting
+        assert noted.generation_objective()["feedback"] == "Shorter.\n\nMention Pune."
+        digest = lambda c: compute_approval_digest(  # noqa: E731
+            config=c.canonical(), steps=_STEPS, model="m"
+        )
+        assert digest(plain) != digest(noted)
+
+    def test_feedback_limits(self) -> None:
+        with pytest.raises(ValidationError):
+            PersonalizationConfig.model_validate({**CONFIG, "feedback": "x" * 4001})
+        with pytest.raises(ValidationError):
+            PersonalizationConfig.model_validate({**CONFIG, "feedback": "a\x00b"})
+
+    def test_the_feedback_rule_is_added_only_with_feedback(self) -> None:
+        request = TestPromptBuilder()._request
+        assert build_chat_messages(request())[0]["content"] == SYSTEM_PROMPT
+        noted = build_chat_messages(
+            request(objective={**CONFIG, "feedback": "Shorter."})
+        )
+        assert noted[0]["content"].startswith(SYSTEM_PROMPT)
+        assert "objective.feedback" in noted[0]["content"]
+        # The feedback text itself stays in the data, never in the instructions.
+        assert "Shorter." not in noted[0]["content"]
+        assert json.loads(noted[1]["content"])["data"]["objective"]["feedback"] == (
+            "Shorter."
+        )
+
+    def test_a_number_the_reviewer_asked_for_is_supported(self) -> None:
+        stated = _with(
+            paragraphs=(
+                GOOD.paragraphs[0],
+                GOOD.paragraphs[1] + " Teams save 12 hours a week.",
+                *GOOD.paragraphs[2:],
+            )
+        )
+        assert "unsupported_number" in validate_generation(stated, _ctx()).codes
+        noted = PersonalizationConfig.model_validate(
+            {**CONFIG, "feedback": "Say teams save 12 hours a week."}
+        )
+        codes = validate_generation(stated, _ctx(objective=noted)).codes
+        assert "unsupported_number" not in codes
+
+
+class TestGreeting:
+    """ADR-0025: the reference's greeting line is kept exactly."""
+
+    def test_the_reference_greeting_passes_in_any_spacing_or_case(self) -> None:
+        assert "greeting_changed" not in validate_generation(GOOD, _ctx()).codes
+        spaced = _with(paragraphs=("hi  sarah,", *GOOD.paragraphs[1:]))
+        assert "greeting_changed" not in validate_generation(spaced, _ctx()).codes
+
+    @pytest.mark.parametrize("greeting", ["Hey Sarah,", "Hi Sara,", "Hi there,"])
+    def test_a_changed_greeting_is_rejected(self, greeting: str) -> None:
+        changed = _with(paragraphs=(greeting, *GOOD.paragraphs[1:]))
+        assert "greeting_changed" in validate_generation(changed, _ctx()).codes
+
+    def test_a_dropped_greeting_is_rejected(self) -> None:
+        dropped = _with(paragraphs=GOOD.paragraphs[1:])
+        assert "greeting_changed" in validate_generation(dropped, _ctx()).codes
+
+    def test_no_rule_when_the_reference_has_no_greeting(self) -> None:
+        no_greeting = REF_TEXT.split("\n\n", 1)[1]
+        changed = _with(paragraphs=("Hey Sarah,", *GOOD.paragraphs[1:]))
+        codes = validate_generation(changed, _ctx(reference_text=no_greeting)).codes
+        assert "greeting_changed" not in codes

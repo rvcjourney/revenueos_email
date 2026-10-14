@@ -710,3 +710,160 @@ def test_samples_can_be_read_and_approved_through_the_api(
         as_actor(lambda s: s.samples(context, first.campaign_id)).approval_status
         == "APPROVED"
     )
+
+
+def test_feedback_rewrites_the_samples_and_approval_needs_the_latest(
+    engine, su, actor, smtp_ok, personalization_on
+) -> None:
+    """ADR-0025: feedback is saved in the objective (so the digest covers it),
+    new samples are written for the same recipient, a repeat changes nothing,
+    and only the latest samples, as read, can be approved."""
+    from app.modules.integrations import revenueos_approval
+    from app.modules.integrations.revenueos_approval import (
+        RevenueOSApprovalService,
+        RevenueOSFeedbackIn,
+    )
+    from app.modules.integrations.revenueos_start import RevenueOSCampaignStartOut
+    from app.modules.personalization.schemas import ApproveIn
+
+    person = auth_user(su)
+    payload = hyper_body("HYPER-FEEDBACK")
+    ticks = iter([0.0, 20.0, 40.0])
+    first = launch(
+        engine, actor, person, payload, sleep=lambda _: None, clock=lambda: next(ticks)
+    )
+    finish_capture(su, first.campaign_id)
+    producer = MagicMock()
+    with patch("app.services.task_dispatch.get_task_producer", return_value=producer):
+        launch(engine, actor, person, payload)
+    campaign_id = first.campaign_id
+    context = WorkspaceContext(
+        workspace_id=first.workspace_id, user_id=actor, role_code="OWNER"
+    )
+
+    def as_actor(action):
+        with Session(engine) as session:
+            session.execute(text("SET LOCAL ROLE app_api"))
+            session.execute(
+                text("SELECT set_config('app.user_id', :u, true)"), {"u": str(actor)}
+            )
+            session.execute(
+                text("SELECT set_config('app.workspace_id', :w, true)"),
+                {"w": str(first.workspace_id)},
+            )
+            with patch(
+                "app.services.task_dispatch.get_task_producer", return_value=producer
+            ):
+                value = action(RevenueOSApprovalService(session))
+            session.commit()
+        return value
+
+    def finish_samples() -> None:
+        su.execute(
+            "UPDATE public.personalization_previews SET state = 'OK', "
+            "subject = 'A quick idea for Acme', body_html = '<p>Hi Asha,</p>', "
+            "completed_at = now() WHERE campaign_id = %s AND state = 'PENDING'",
+            [campaign_id],
+        )
+
+    def stored_feedback():
+        return scalar(
+            su,
+            "SELECT personalization_config->>'feedback' FROM public.campaign_sequences"
+            " WHERE campaign_id = %s",
+            campaign_id,
+        )
+
+    def preview_count() -> int:
+        return scalar(
+            su,
+            "SELECT count(*) FROM public.personalization_previews "
+            "WHERE campaign_id = %s",
+            campaign_id,
+        )
+
+    finish_samples()
+    v1 = as_actor(lambda s: s.samples(context, campaign_id))
+    assert v1.samples_status == "ready" and v1.batch_id is not None
+    assert [r.first_name for r in v1.recipients] == ["Asha"]
+    assert [e.email_number for e in v1.recipients[0].emails] == [1]
+    member = v1.recipients[0].audience_member_id
+
+    note = RevenueOSFeedbackIn(batch_id=v1.batch_id, feedback=" Shorter, please. ")
+    round1 = as_actor(lambda s: s.feedback(context, campaign_id, note))
+    assert round1.duplicate is False and round1.batch_id != v1.batch_id
+    assert round1.samples_status == "generating"
+    assert stored_feedback() == "Shorter, please."
+    assert preview_count() == 2
+
+    # A repeat (lost reply) writes and spends nothing more.
+    again = as_actor(lambda s: s.feedback(context, campaign_id, note))
+    assert again.duplicate is True and again.batch_id == round1.batch_id
+    assert stored_feedback() == "Shorter, please." and preview_count() == 2
+
+    # The first samples can no longer be approved: not the latest, and stale.
+    old = ApproveIn(batch_id=v1.batch_id, config_digest=v1.config_digest)
+    with pytest.raises(AppError) as excinfo:
+        as_actor(lambda s: s.approve_and_start(context, campaign_id, old))
+    assert excinfo.value.code == "batch_not_latest"
+
+    finish_samples()
+    v2 = as_actor(lambda s: s.samples(context, campaign_id))
+    assert v2.batch_id == round1.batch_id and v2.samples_status == "ready"
+    assert v2.config_digest != v1.config_digest
+    assert [r.audience_member_id for r in v2.recipients] == [member]
+
+    # Feedback on an earlier version is refused; a second round adds to the first.
+    with pytest.raises(AppError) as excinfo:
+        as_actor(
+            lambda s: s.feedback(
+                context,
+                campaign_id,
+                RevenueOSFeedbackIn(batch_id=uuid.uuid4(), feedback="x"),
+            )
+        )
+    assert excinfo.value.code == "batch_not_latest"
+    round2 = as_actor(
+        lambda s: s.feedback(
+            context,
+            campaign_id,
+            RevenueOSFeedbackIn(batch_id=v2.batch_id, feedback="Mention Pune."),
+        )
+    )
+    assert stored_feedback() == "Shorter, please.\n\nMention Pune."
+    finish_samples()
+    v3 = as_actor(lambda s: s.samples(context, campaign_id))
+    assert v3.batch_id == round2.batch_id
+
+    with pytest.raises(AppError) as excinfo:
+        as_actor(
+            lambda s: s.approve_and_start(
+                context,
+                campaign_id,
+                ApproveIn(batch_id=v3.batch_id, config_digest=v2.config_digest),
+            )
+        )
+    assert excinfo.value.code == "approval_stale"
+
+    started = RevenueOSCampaignStartOut(
+        status="started", campaign_id=campaign_id, campaign_status="RUNNING"
+    )
+    with patch.object(revenueos_approval, "RevenueOSStartService") as start:
+        start.return_value.start.return_value = started
+        result = as_actor(
+            lambda s: s.approve_and_start(
+                context,
+                campaign_id,
+                ApproveIn(batch_id=v3.batch_id, config_digest=v3.config_digest),
+            )
+        )
+    assert result.status == "started"
+    assert (
+        scalar(
+            su,
+            "SELECT batch_id FROM public.campaign_personalization_approvals "
+            "WHERE campaign_id = %s",
+            campaign_id,
+        )
+        == v3.batch_id
+    )

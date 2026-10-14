@@ -599,3 +599,100 @@ def test_hyper_does_not_need_the_auto_start_switch(
     )
 
     assert response.status_code == 201
+
+
+FOUR = [{"email": f"lead{i}@acme.com", "first_name": f"P{i}"} for i in range(5)]
+
+
+def _hyper(**overrides: Any) -> RevenueOSLaunchIn:
+    return _payload(
+        campaign_type="HYPER_PERSONALIZED",
+        objective=OBJECTIVE,
+        recipients=FOUR,
+        **overrides,
+    )
+
+
+def test_sample_recipients_must_be_hyper_recipients_and_distinct() -> None:
+    # ADR-0025. Matched case-insensitively and stored lower-cased.
+    payload = _hyper(sample_recipients=[" Lead1@Acme.com", "lead3@acme.com"])
+    assert payload.sample_recipients == ["lead1@acme.com", "lead3@acme.com"]
+    for bad in (
+        ["someone@else.com"],
+        ["lead1@acme.com", "LEAD1@acme.com"],
+        [],
+        [f"lead{i}@acme.com" for i in range(5)],
+    ):
+        with pytest.raises(ValidationError):
+            _hyper(sample_recipients=bad)
+    with pytest.raises(ValidationError):
+        _payload(sample_recipients=["lead@acme.com"])
+
+
+def test_sample_recipients_are_part_of_the_hash_only_when_present() -> None:
+    chosen = _hyper(sample_recipients=["lead1@acme.com"])
+    assert _payload_hash(chosen) != _payload_hash(_hyper())
+    assert _payload_hash(chosen) != _payload_hash(
+        _hyper(sample_recipients=["lead2@acme.com"])
+    )
+    # A HYPER launch without the key hashes exactly as before it existed.
+    plain = _hyper()
+    expected = hashlib.sha256(
+        json.dumps(
+            {
+                "campaign": plain.campaign.model_dump(mode="json"),
+                "emails": [e.model_dump(mode="json") for e in plain.emails],
+                "schedule": plain.schedule.model_dump(mode="json"),
+                "recipients": sorted(r["email"] for r in FOUR),
+                "objective": plain.objective.canonical(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert _payload_hash(plain) == expected
+
+
+def _members(*emails: str | None) -> list[dict[str, Any]]:
+    return [
+        {"id": uuid.uuid4(), "frozen_variables": {"email": e} if e else {}}
+        for e in emails
+    ]
+
+
+@pytest.mark.parametrize(
+    ("chosen", "expected"),
+    [
+        # In the order asked, matching the stored address in any case.
+        (["lead3@acme.com", "lead1@acme.com"], [3, 1]),
+        # A chosen recipient that was not accepted is skipped.
+        (["lead9@acme.com", "lead2@acme.com"], [2]),
+        # None accepted: the first accepted recipient, as without the key.
+        (["lead9@acme.com"], [0]),
+        (None, [0]),
+    ],
+)
+def test_samples_are_requested_for_the_chosen_recipients(
+    chosen: list[str] | None, expected: list[int]
+) -> None:
+    service = RevenueOSLaunchService(MagicMock())
+    members = _members(*(f"Lead{i}@acme.com" for i in range(4)))
+    service.repo = MagicMock()
+    service.repo.get_campaign.return_value = {
+        "status": "DRAFT",
+        "draft_audience_id": AUDIENCE,
+    }
+    service.repo.get_latest_audience.return_value = {"id": AUDIENCE, "status": "READY"}
+    service.repo.list_accepted_audience_members.side_effect = lambda **kw: members[
+        : kw["limit"]
+    ]
+
+    with patch.object(revenueos_launch, "PersonalizationApiService") as api:
+        waiting = service._request_samples_once(CTX, _result(), chosen)
+
+    assert waiting is False
+    sent = api.return_value.create_previews.call_args.args[2]
+    assert sent.audience_member_ids == [members[i]["id"] for i in expected]
+
+
+AUDIENCE = uuid.uuid4()

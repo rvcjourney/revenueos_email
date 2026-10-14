@@ -119,11 +119,19 @@ class PersonalizationConfig(BaseModel):
     email_format: EmailFormat | None = None
     company: CompanyProfile | None = None
     brand: BrandKit | None = None
+    # A reviewer's notes on earlier samples (ADR-0025). Part of the stored
+    # config, so the approval digest covers it and every lead's email uses it.
+    feedback: str | None = Field(default=None, max_length=4000)
 
     @field_validator("objective", "offer", "cta", "target", "problem_solved", "tone")
     @classmethod
     def _no_control_chars(cls, value: str) -> str:
         return _clean(value)
+
+    @field_validator("feedback")
+    @classmethod
+    def _feedback(cls, value: str | None) -> str | None:
+        return (_clean(value) or None) if value is not None else None
 
     @field_validator("must_mention", "never_say")
     @classmethod
@@ -151,6 +159,15 @@ class PersonalizationConfig(BaseModel):
         """Only the fields the per-lead prompt is built from."""
         full = self.canonical()
         return {name: full[name] for name in _OBJECTIVE_CORE_FIELDS}
+
+    def generation_objective(self) -> dict[str, Any]:
+        """The per-lead prompt's objective: the core, plus the reviewer's feedback
+        only when there is some, so the prompt of every campaign without feedback
+        is byte-identical to before (ADR-0025)."""
+        core = self.objective_core()
+        if self.feedback:
+            core["feedback"] = self.feedback
+        return core
 
 
 def config_size_bytes(canonical: Mapping[str, Any]) -> int:

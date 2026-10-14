@@ -63,8 +63,15 @@ class PreviewCreateIn(BaseModel):
     audience_member_ids: list[UUID] = Field(min_length=1, max_length=1)
 
 
+class RevenueOSPreviewCreateIn(PreviewCreateIn):
+    # RevenueOS names 3-4 different leads so its reviewer sees the range
+    # (ADR-0025). Still only leads it picked: the server never fans out.
+    audience_member_ids: list[UUID] = Field(min_length=1, max_length=4)
+
+
 class PreviewRecipientOut(BaseModel):
     audience_member_id: UUID
+    email: str | None = None
     first_name: str | None = None
     last_name: str | None = None
     company: str | None = None

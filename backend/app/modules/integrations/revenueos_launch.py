@@ -50,7 +50,7 @@ from app.modules.mailboxes.repository import MailboxRepository
 from app.modules.mailboxes.schemas import SmtpConnectRequest
 from app.modules.personalization.api_service import PersonalizationApiService
 from app.modules.personalization.config_schema import PersonalizationConfig
-from app.modules.personalization.schemas import PreviewCreateIn
+from app.modules.personalization.schemas import RevenueOSPreviewCreateIn
 from app.schemas.leads import LeadCreateIn, LeadListCreateIn, LeadProfileIn
 
 logger = logging.getLogger(__name__)
@@ -119,6 +119,11 @@ class RevenueOSLaunchIn(BaseModel):
     # HYPER_PERSONALIZED only, and required for it: what the campaign is
     # trying to achieve. `emails` are then the reference templates.
     objective: PersonalizationConfig | None = None
+    # HYPER_PERSONALIZED only: the 3-4 recipients (by email) whose sample emails
+    # RevenueOS will review (ADR-0025). Omitted: the first accepted recipient.
+    sample_recipients: list[str] | None = Field(
+        default=None, min_length=1, max_length=4
+    )
 
     @field_validator("reference", "client_reference")
     @classmethod
@@ -149,6 +154,18 @@ class RevenueOSLaunchIn(BaseModel):
             raise ValueError("a HYPER_PERSONALIZED campaign needs an objective")
         if not self.is_hyper and self.objective is not None:
             raise ValueError("objective is only for a HYPER_PERSONALIZED campaign")
+        if self.sample_recipients is not None:
+            if not self.is_hyper:
+                raise ValueError(
+                    "sample_recipients is only for a HYPER_PERSONALIZED campaign"
+                )
+            known = {r.email.strip().lower() for r in self.recipients}
+            wanted = [email.strip().lower() for email in self.sample_recipients]
+            if len(set(wanted)) != len(wanted):
+                raise ValueError("sample_recipients must not repeat an email")
+            if any(email not in known for email in wanted):
+                raise ValueError("every sample_recipients email must be a recipient")
+            self.sample_recipients = wanted
         return self
 
 
@@ -212,6 +229,9 @@ def _payload_hash(payload: RevenueOSLaunchIn) -> str:
         # Added only when present, so a STANDARD launch stored before this
         # key existed keeps its hash and still replays.
         content["objective"] = payload.objective.canonical()
+    if payload.sample_recipients is not None:
+        # Same rule: a launch stored before this key existed keeps its hash.
+        content["sample_recipients"] = payload.sample_recipients
     encoded = json.dumps(
         content,
         sort_keys=True,
@@ -279,7 +299,9 @@ class RevenueOSLaunchService:
         # and nothing below may undo what was stored above.
         self.session.commit()
         if payload.is_hyper:
-            self._request_samples(context, result, sleep, clock)
+            self._request_samples(
+                context, result, sleep, clock, payload.sample_recipients
+            )
         else:
             self._start(context, result, sleep, clock)
         return result
@@ -513,10 +535,11 @@ class RevenueOSLaunchService:
         result: RevenueOSLaunchOut,
         sleep: Callable[[float], None],
         clock: Callable[[], float],
+        sample_recipients: list[str] | None = None,
     ) -> None:
         """Hyper-personalized: confirm the captured audience and ask for sample
-        emails for its first recipient. Approving them and starting stays with a
-        person (owner decision, ADR-0023). Safe to repeat."""
+        emails for the chosen recipients, or its first one (ADR-0025). Approving
+        and starting is a separate call (ADR-0024). Safe to repeat."""
         assert result.campaign_id is not None
         deadline = clock() + _START_WAIT_SECONDS
         while True:
@@ -526,7 +549,7 @@ class RevenueOSLaunchService:
                 workspace_id=context.workspace_id,
             )
             try:
-                waiting = self._request_samples_once(context, result)
+                waiting = self._request_samples_once(context, result, sample_recipients)
             except AppError as exc:
                 self.session.rollback()
                 result.start_status = "failed"
@@ -544,7 +567,10 @@ class RevenueOSLaunchService:
             sleep(_START_POLL_SECONDS)
 
     def _request_samples_once(
-        self, context: WorkspaceContext, result: RevenueOSLaunchOut
+        self,
+        context: WorkspaceContext,
+        result: RevenueOSLaunchOut,
+        sample_recipients: list[str] | None = None,
     ) -> bool:
         """True while the audience is still being captured."""
         campaign_id = result.campaign_id
@@ -580,8 +606,17 @@ class RevenueOSLaunchService:
             workspace_id=context.workspace_id,
             audience_id=audience_id,
             after_ordinal=None,
-            limit=1,
+            limit=_MAX_RECIPIENTS if sample_recipients else 1,
         )
+        if sample_recipients:
+            by_email = {
+                str((m["frozen_variables"] or {}).get("email") or "").lower(): m
+                for m in members
+            }
+            # A chosen recipient that was not accepted (suppressed, invalid)
+            # is skipped; with none left, the first accepted one is used.
+            chosen = [by_email[e] for e in sample_recipients if e in by_email]
+            members = chosen or members[:1]
         if not members:
             raise AppError(
                 "validation_error",
@@ -593,9 +628,9 @@ class RevenueOSLaunchService:
         PersonalizationApiService(self.session).create_previews(
             context,
             campaign_id,
-            PreviewCreateIn(
+            RevenueOSPreviewCreateIn(
                 batch_id=uuid.uuid5(uuid.NAMESPACE_URL, f"revenueos:{campaign_id}"),
-                audience_member_ids=[UUID(str(members[0]["id"]))],
+                audience_member_ids=[UUID(str(m["id"])) for m in members],
             ),
         )
         result.start_status = "awaiting_approval"

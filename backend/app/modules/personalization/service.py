@@ -163,7 +163,7 @@ class PersonalizationService:
 
         request = GenerationRequest(
             workspace_ref=str(inputs.workspace_id),
-            objective=inputs.objective.objective_core(),
+            objective=inputs.objective.generation_objective(),
             reference_subject=rendered_subject,
             reference_paragraphs=split_paragraphs(reference_text),
             recipient=context.recipient,

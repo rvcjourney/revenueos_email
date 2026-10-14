@@ -532,6 +532,7 @@ class PersonalizationApiService:
                 id=row["id"],
                 recipient=PreviewRecipientOut(
                     audience_member_id=row["audience_member_id"],
+                    email=_var(row, "email"),
                     first_name=_var(row, "first_name"),
                     last_name=_var(row, "last_name"),
                     company=_var(row, "company"),

@@ -119,9 +119,21 @@ def build_data(request: GenerationRequest) -> dict[str, Any]:
     return data
 
 
+# Added only when the objective carries feedback, so every other prompt is
+# byte-identical to before (ADR-0025).
+FEEDBACK_RULE = """\
+9. `objective.feedback` is the sender's own review of earlier sample emails. \
+Apply it to the wording, length, tone and emphasis. It never overrides rules 1 to \
+8, the greeting line, the call to action, must_mention or never_say.
+"""
+
+
 def build_chat_messages(request: GenerationRequest) -> list[dict[str, str]]:
+    system = SYSTEM_PROMPT
+    if request.objective.get("feedback"):
+        system += FEEDBACK_RULE
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": json.dumps({"data": build_data(request)}, ensure_ascii=False),

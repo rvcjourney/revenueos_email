@@ -15,6 +15,8 @@ from app.core.permissions import has_permission
 from app.db.context import set_transaction_context
 from app.modules.integrations.revenueos_approval import (
     RevenueOSApprovalService,
+    RevenueOSFeedbackIn,
+    RevenueOSFeedbackOut,
     RevenueOSSamplesOut,
 )
 from app.modules.integrations.revenueos_intake import (
@@ -43,6 +45,7 @@ from app.modules.integrations.supabase_auth_admin import (
     EnsuredUser,
     SupabaseAuthAdminClient,
 )
+from app.modules.personalization.schemas import ApproveIn
 
 router = APIRouter()
 # Routes that are not scoped to one workspace (they create it).
@@ -316,6 +319,8 @@ def get_revenueos_samples(
 )
 def approve_revenueos_campaign(
     campaign_id: UUID,
+    # The batch and digest the reviewer read (ADR-0025). Omitted: the latest.
+    payload: ApproveIn | None = None,
     context: WorkspaceContext = Depends(get_revenueos_context),
     db: Session = Depends(get_db),
 ) -> RevenueOSCampaignStartOut:
@@ -327,4 +332,26 @@ def approve_revenueos_campaign(
             "You do not have permission to perform this action",
             status_code=403,
         )
-    return RevenueOSApprovalService(db).approve_and_start(context, campaign_id)
+    return RevenueOSApprovalService(db).approve_and_start(context, campaign_id, payload)
+
+
+@router.post(
+    "/integrations/revenueos/campaigns/{campaign_id}/feedback",
+    response_model=RevenueOSFeedbackOut,
+)
+def revenueos_sample_feedback(
+    campaign_id: UUID,
+    payload: RevenueOSFeedbackIn,
+    context: WorkspaceContext = Depends(get_revenueos_context),
+    db: Session = Depends(get_db),
+) -> RevenueOSFeedbackOut:
+    """Add a reviewer's feedback to the objective and write new samples for the
+    same recipients (ADR-0025). Starts nothing, so it needs no start switch."""
+    # Same rule as editing the objective and generating samples in the app.
+    if not has_permission(context.role_code, "campaigns.draft"):
+        raise AppError(
+            "forbidden",
+            "You do not have permission to perform this action",
+            status_code=403,
+        )
+    return RevenueOSApprovalService(db).feedback(context, campaign_id, payload)
