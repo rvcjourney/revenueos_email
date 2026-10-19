@@ -48,15 +48,22 @@ class RateControllerRuntime:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         logger.info("Rate controller startup")
-        try:
-            self.bootstrap_once()
-        except Exception:
-            logger.exception("Rate controller initial bootstrap failed")
+        bootstrapped = False
         while not self.stopped.is_set():
-            try:
-                self.reconcile_once()
-            except Exception:
-                logger.exception("Error in rate controller reconcile tick")
+            # Retry the initial bootstrap every tick until it succeeds: Redis or
+            # the DB can be unreachable at boot, and a single failed attempt left
+            # rate_control RECOVERING (no sends at all) until a manual restart.
+            if not bootstrapped:
+                try:
+                    self.bootstrap_once()
+                    bootstrapped = True
+                except Exception:
+                    logger.exception("Rate controller bootstrap failed; retrying")
+            else:
+                try:
+                    self.reconcile_once()
+                except Exception:
+                    logger.exception("Error in rate controller reconcile tick")
             self.stopped.wait(self.settings.rate_controller_reconcile_poll_seconds)
         logger.info("Rate controller shutdown complete")
 
