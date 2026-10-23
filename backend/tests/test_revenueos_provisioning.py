@@ -75,8 +75,10 @@ def test_payload_defaults_to_admin_and_an_email_named_workspace() -> None:
         {"workspace_name": "   "},
         # The acting user owns the workspace; OWNER is never granted.
         {"role": "OWNER"},
-        # A password is neither accepted nor returned.
-        {"password": "hunter2"},
+        # Too short, too long, or padded with spaces.
+        {"password": "short"},
+        {"password": "x" * 73},
+        {"password": " leading-space"},
     ],
 )
 def test_payload_rejects_invalid_input(overrides: dict[str, Any]) -> None:
@@ -104,7 +106,10 @@ def test_bootstrap_key_fits_the_ledger_for_the_longest_reference() -> None:
 
 
 def test_response_has_no_field_that_could_carry_a_password() -> None:
-    assert not any("pass" in name for name in RevenueOSUserProvisionOut.model_fields)
+    # Only whether one was set, never the value.
+    fields = RevenueOSUserProvisionOut.model_fields
+    assert [name for name in fields if "pass" in name] == ["password_set"]
+    assert fields["password_set"].annotation == bool | None
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +168,8 @@ def test_route_provisions_as_the_configured_acting_user(
     assert response.status_code == 201
     body = response.json()
     assert body["workspace_id"] == str(WORKSPACE) and body["user_id"] == str(PERSON)
-    assert body["duplicate"] is False and "password" not in response.text
-    auth_admin.return_value.ensure_user.assert_called_once_with("cam@motm.tech")
+    assert body["duplicate"] is False and body["password_set"] is None
+    auth_admin.return_value.ensure_user.assert_called_once_with("cam@motm.tech", None)
     kwargs = service.return_value.provision.call_args.kwargs
     assert kwargs["actor_id"] == ACTOR
     assert kwargs["user"] == EnsuredUser(user_id=PERSON, created=True)
@@ -460,3 +465,117 @@ def test_an_existing_account_never_gets_a_new_password() -> None:
     assert user == EnsuredUser(user_id=PERSON, created=False)
     put.assert_not_called()
     patch_call.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Password chosen by RevenueOS
+# ---------------------------------------------------------------------------
+
+
+def test_payload_accepts_a_password_and_keeps_it_secret() -> None:
+    payload = _payload(password="Correct-Horse-9")
+    assert payload.password is not None
+    assert payload.password.get_secret_value() == "Correct-Horse-9"
+    assert "Correct-Horse-9" not in repr(payload)
+    assert "Correct-Horse-9" not in payload.model_dump_json()
+    # It is not part of the reference's identity.
+    assert _payload_hash(payload) == _payload_hash(_payload())
+
+
+def test_a_sent_password_wins_over_the_email_setting() -> None:
+    with patch("httpx.post", return_value=_response(200, {"id": str(PERSON)})) as post:
+        _admin(password_is_email=True).ensure_user("cam@motm.tech", "Correct-Horse-9")
+
+    assert post.call_args.kwargs["json"]["password"] == "Correct-Horse-9"
+
+
+def test_a_weak_password_is_reported_as_such() -> None:
+    from app.modules.integrations.supabase_auth_admin import AuthAdminWeakPasswordError
+
+    refused = _response(422, {"error_code": "weak_password", "msg": "weak"})
+    with (
+        patch("httpx.post", return_value=refused),
+        pytest.raises(AuthAdminWeakPasswordError),
+    ):
+        _admin().ensure_user("cam@motm.tech", "password1")
+
+
+def test_route_passes_the_password_and_reports_whether_it_was_set(
+    configured: None, auth_admin: MagicMock, service: MagicMock
+) -> None:
+    client, _ = _client()
+
+    response = client.post(URL, json=_body(password="Correct-Horse-9"), headers=HEADERS)
+
+    assert response.status_code == 201
+    assert response.json()["password_set"] is True
+    assert "Correct-Horse-9" not in response.text
+    auth_admin.return_value.ensure_user.assert_called_once_with(
+        "cam@motm.tech", "Correct-Horse-9"
+    )
+
+
+def test_an_existing_account_keeps_its_password(
+    configured: None, auth_admin: MagicMock, service: MagicMock
+) -> None:
+    auth_admin.return_value.ensure_user.return_value = EnsuredUser(
+        user_id=PERSON, created=False
+    )
+    client, _ = _client()
+
+    response = client.post(URL, json=_body(password="Correct-Horse-9"), headers=HEADERS)
+
+    assert response.json()["password_set"] is False
+
+
+def test_without_a_password_nothing_is_reported(
+    configured: None, auth_admin: MagicMock, service: MagicMock
+) -> None:
+    client, _ = _client()
+
+    response = client.post(URL, json=_body(), headers=HEADERS)
+
+    assert response.json()["password_set"] is None
+    auth_admin.return_value.ensure_user.assert_called_once_with("cam@motm.tech", None)
+
+
+def test_a_rejected_body_never_echoes_a_password(
+    configured: None, auth_admin: MagicMock, service: MagicMock
+) -> None:
+    client, _ = _client()
+    smtp = {
+        "host": "smtp.gmail.com",
+        "security_mode": "STARTTLS",
+        "port": 25,
+        "username": "s@acme.com",
+        "password": "Smtp-Secret-123",
+        "email_address": "s@acme.com",
+    }
+
+    short = client.post(URL, json=_body(password="Secret7"), headers=HEADERS)
+    bad_smtp = client.post(URL, json=_body(smtp=smtp), headers=HEADERS)
+    missing = client.post(
+        URL,
+        json={"email": "cam@motm.tech", "password": "Login-Secret-123"},
+        headers=HEADERS,
+    )
+
+    for response in (short, bad_smtp, missing):
+        assert response.status_code == 422
+        for secret in ("Secret7", "Smtp-Secret-123", "Login-Secret-123"):
+            assert secret not in response.text
+
+
+def test_weak_password_answers_422_with_its_own_code(
+    configured: None, auth_admin: MagicMock, service: MagicMock
+) -> None:
+    from app.modules.integrations.supabase_auth_admin import AuthAdminWeakPasswordError
+
+    auth_admin.return_value.ensure_user.side_effect = AuthAdminWeakPasswordError("x")
+    client, _ = _client()
+
+    response = client.post(URL, json=_body(password="password1"), headers=HEADERS)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "weak_password"
+    service.return_value.provision.assert_not_called()

@@ -16,7 +16,7 @@ import logging
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import RowMapping, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -32,6 +32,29 @@ from app.modules.mailboxes.service import MailboxService
 logger = logging.getLogger(__name__)
 
 PROVISION_OPERATION = "revenueos.user_provision"
+
+
+# Supabase Auth accepts at most 72 bytes (bcrypt); the app's own reset form
+# asks for at least 8 characters.
+PASSWORD_MIN_CHARS = 8
+PASSWORD_MAX_BYTES = 72
+
+
+def check_initial_password(value: SecretStr | None) -> SecretStr | None:
+    """The first password of an account RevenueOS creates (ADR-0020).
+
+    Kept as SecretStr so it is masked in repr, logs and model dumps. The
+    error messages never contain the value."""
+    if value is None:
+        return None
+    secret = value.get_secret_value()
+    if len(secret) < PASSWORD_MIN_CHARS:
+        raise ValueError(f"password must be at least {PASSWORD_MIN_CHARS} characters")
+    if len(secret.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise ValueError(f"password must be at most {PASSWORD_MAX_BYTES} bytes")
+    if secret != secret.strip():
+        raise ValueError("password must not start or end with a space")
+    return value
 
 
 def clean_user_email(value: str) -> str:
@@ -58,6 +81,10 @@ class RevenueOSUserProvisionIn(BaseModel):
     workspace_name: str | None = Field(default=None, min_length=1, max_length=200)
     # OWNER is never granted: the acting user owns the workspace.
     role: Literal["ADMIN", "MANAGER", "MEMBER", "VIEWER"] = "ADMIN"
+    # The first password of a NEW account. An account that already exists
+    # keeps its password. Never stored, logged or returned, and not part of
+    # the reference's identity.
+    password: SecretStr | None = None
     # The sending mailbox, as entered on the Mailboxes > Connect SMTP form.
     # Omitted: mailboxes are left alone. It is not part of the reference's
     # identity, so the same reference may send new details later.
@@ -75,6 +102,11 @@ class RevenueOSUserProvisionIn(BaseModel):
     @classmethod
     def _email(cls, value: str) -> str:
         return clean_user_email(value)
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, value: SecretStr | None) -> SecretStr | None:
+        return check_initial_password(value)
 
     @field_validator("workspace_name")
     @classmethod
@@ -101,6 +133,9 @@ class RevenueOSUserProvisionOut(BaseModel):
     role: str
     # True when this request created the account; False when it already existed.
     user_created: bool
+    # True when the request's password became the new account's password.
+    # False when a password was sent but the account already existed.
+    password_set: bool | None = None
     # True when this reference was already provisioned and nothing new was created.
     duplicate: bool
     # Set only when the request carried an `smtp` block.

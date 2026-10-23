@@ -29,6 +29,10 @@ class AuthAdminRejectedError(AuthAdminError):
     """Permanent: the service-role key or the email address was refused."""
 
 
+class AuthAdminWeakPasswordError(AuthAdminRejectedError):
+    """Permanent: the project's password policy refused the password."""
+
+
 # Bounds the email lookup for an already-registered address; the admin API
 # offers no lookup by email, only paging.
 _PAGE_SIZE = 200
@@ -53,7 +57,7 @@ class SupabaseAuthAdminClient:
     def _base_url(self) -> str:
         return f"{self._settings.supabase_url.rstrip('/')}/auth/v1/admin"
 
-    def ensure_user(self, email: str) -> EnsuredUser:
+    def ensure_user(self, email: str, password: str | None = None) -> EnsuredUser:
         """Return the account for `email`, creating it when it does not exist.
 
         A new account is confirmed (it never receives a confirmation email) and
@@ -63,13 +67,17 @@ class SupabaseAuthAdminClient:
         With REVENUEOS_INITIAL_PASSWORD_IS_EMAIL the first password is the
         email address instead (owner decision, ADR-0020): the person can log
         in at once, and so can anyone who knows the address until they change
-        it. An account that already exists is never given a new password.
+        it.
+
+        A `password` from the request takes precedence over both. In every
+        case an account that already exists is never given a new password.
         """
-        password = (
-            email
-            if self._settings.revenueos_initial_password_is_email
-            else secrets.token_urlsafe(32)
-        )
+        if password is None:
+            password = (
+                email
+                if self._settings.revenueos_initial_password_is_email
+                else secrets.token_urlsafe(32)
+            )
         try:
             response = httpx.post(
                 f"{self._base_url()}/users",
@@ -88,6 +96,10 @@ class SupabaseAuthAdminClient:
             return EnsuredUser(user_id=self._user_id(response), created=True)
         if self._is_email_exists(response):
             return EnsuredUser(user_id=self._find_user_id(email), created=False)
+        if response.status_code in (400, 422) and (
+            self._json(response).get("error_code") == "weak_password"
+        ):
+            raise AuthAdminWeakPasswordError("create user: weak password")
         self._raise_for_status(response, action="create user")
         raise AuthAdminError(f"create user: unexpected {response.status_code}")
 

@@ -102,7 +102,7 @@ def test_payload_starts_by_default_and_normalises_the_user_email() -> None:
         {"recipients": [{"email": f"l{i}@acme.com"} for i in range(501)]},
         {"user": {"email": "not-an-email"}},
         {"user": {"email": "cam@motm.tech", "role": "OWNER"}},
-        {"user": {"email": "cam@motm.tech", "password": "x"}},
+        {"user": {"email": "cam@motm.tech", "password": "short"}},
         {"emails": [{"subject": "a", "body_html": "<p>a</p>", "wait_days_before": 2}]},
         {
             "emails": [
@@ -346,7 +346,7 @@ def test_route_launches_as_the_acting_user(
     assert response.status_code == 201
     assert response.json()["start_status"] == "started"
     assert response.json()["campaign_id"] == str(CAMPAIGN_ID)
-    admin.return_value.ensure_user.assert_called_once_with("cam@motm.tech")
+    admin.return_value.ensure_user.assert_called_once_with("cam@motm.tech", None)
     kwargs = service.return_value.launch.call_args.kwargs
     assert kwargs["actor_id"] == ACTOR
     assert kwargs["user"] == EnsuredUser(user_id=PERSON, created=True)
@@ -696,3 +696,24 @@ def test_samples_are_requested_for_the_chosen_recipients(
 
 
 AUDIENCE = uuid.uuid4()
+
+
+def test_launch_user_accepts_a_password_and_reports_whether_it_was_set(
+    monkeypatch: pytest.MonkeyPatch, collaborators: tuple[MagicMock, MagicMock]
+) -> None:
+    _configure(monkeypatch, provisioning="true", auto_start="true")
+    admin, _ = collaborators
+    client, _ = _client()
+
+    response = client.post(
+        URL,
+        json=_body(user={"email": "cam@motm.tech", "password": "Correct-Horse-9"}),
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 201
+    assert response.json()["password_set"] is True
+    assert "Correct-Horse-9" not in response.text
+    admin.return_value.ensure_user.assert_called_once_with(
+        "cam@motm.tech", "Correct-Horse-9"
+    )

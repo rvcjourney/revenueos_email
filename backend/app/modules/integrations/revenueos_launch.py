@@ -19,7 +19,14 @@ from collections.abc import Callable
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -40,6 +47,7 @@ from app.modules.integrations.revenueos_intake import (
 from app.modules.integrations.revenueos_provisioning import (
     RevenueOSProvisioningService,
     RevenueOSUserProvisionIn,
+    check_initial_password,
     clean_user_email,
 )
 from app.modules.integrations.revenueos_start import RevenueOSStartService
@@ -72,11 +80,18 @@ class LaunchUserIn(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     workspace_name: str | None = Field(default=None, min_length=1, max_length=200)
     role: Literal["ADMIN", "MANAGER", "MEMBER", "VIEWER"] = "ADMIN"
+    # The first password of a NEW account; see RevenueOSUserProvisionIn.
+    password: SecretStr | None = None
 
     @field_validator("email")
     @classmethod
     def _email(cls, value: str) -> str:
         return clean_user_email(value)
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, value: SecretStr | None) -> SecretStr | None:
+        return check_initial_password(value)
 
 
 class LaunchRecipientIn(LeadProfileIn):
@@ -184,6 +199,9 @@ class RevenueOSLaunchOut(BaseModel):
     user_id: UUID
     email: str
     user_created: bool
+    # True when the request's password became the new account's password.
+    # False when a password was sent but the account already existed.
+    password_set: bool | None = None
     workspace_id: UUID
     workspace_name: str
     role: str

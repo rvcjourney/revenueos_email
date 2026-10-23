@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Response, status
+from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -42,6 +43,7 @@ from app.modules.integrations.supabase_auth_admin import (
     AuthAdminError,
     AuthAdminRejectedError,
     AuthAdminUnavailableError,
+    AuthAdminWeakPasswordError,
     EnsuredUser,
     SupabaseAuthAdminClient,
 )
@@ -147,11 +149,18 @@ def prepare_revenueos_user(
     it by email.
     """
     settings = Settings.current()
-    user = _ensure_account(settings, payload.email)
+    user = _ensure_account(settings, payload.email, payload.password)
     return ProvisionRequest(actor_id=actor_id, payload=payload, user=user)
 
 
-def _ensure_account(settings: Settings, email: str) -> EnsuredUser:
+def _password_set(password: SecretStr | None, user: EnsuredUser) -> bool | None:
+    """Whether the request's password is now the account's password."""
+    return None if password is None else user.created
+
+
+def _ensure_account(
+    settings: Settings, email: str, password: SecretStr | None = None
+) -> EnsuredUser:
     if (
         not settings.revenueos_provisioning_enabled
         or not settings.supabase_service_role_key
@@ -162,12 +171,21 @@ def _ensure_account(settings: Settings, email: str) -> EnsuredUser:
             status_code=503,
         )
     try:
-        return SupabaseAuthAdminClient(settings).ensure_user(email)
+        return SupabaseAuthAdminClient(settings).ensure_user(
+            email, password.get_secret_value() if password is not None else None
+        )
     except AuthAdminUnavailableError as exc:
         raise AppError(
             "service_unavailable",
             "The account service is temporarily unavailable. Please retry.",
             status_code=503,
+        ) from exc
+    except AuthAdminWeakPasswordError as exc:
+        raise AppError(
+            "weak_password",
+            "The password does not meet the account password policy. "
+            "Use a longer or stronger one.",
+            status_code=422,
         ) from exc
     except AuthAdminRejectedError as exc:
         raise AppError(
@@ -199,6 +217,7 @@ def provision_revenueos_user(
     result = RevenueOSProvisioningService(db).provision(
         actor_id=prepared.actor_id, payload=prepared.payload, user=prepared.user
     )
+    result.password_set = _password_set(prepared.payload.password, prepared.user)
     if result.duplicate:
         response.status_code = status.HTTP_200_OK
     return result
@@ -271,7 +290,7 @@ def prepare_revenueos_launch(
             "auto_start false to store a draft",
             status_code=503,
         )
-    user = _ensure_account(settings, payload.user.email)
+    user = _ensure_account(settings, payload.user.email, payload.user.password)
     return LaunchRequest(actor_id=actor_id, payload=payload, user=user)
 
 
@@ -291,6 +310,7 @@ def launch_revenueos_campaign(
     result = RevenueOSLaunchService(db).launch(
         actor_id=prepared.actor_id, payload=prepared.payload, user=prepared.user
     )
+    result.password_set = _password_set(prepared.payload.user.password, prepared.user)
     if result.duplicate:
         response.status_code = status.HTTP_200_OK
     return result

@@ -45,6 +45,39 @@ def error_body(
     }
 
 
+_SECRET_KEY_MARKER = "password"
+_REDACTED = "[redacted]"
+
+
+def _redact_secrets(value: Any) -> Any:
+    """A copy of `value` with every field whose name contains "password"
+    replaced. Validation errors echo the submitted input, and requests such
+    as the RevenueOS launch carry login and SMTP passwords."""
+    if isinstance(value, dict):
+        return {
+            key: _REDACTED
+            if _SECRET_KEY_MARKER in str(key).lower()
+            else _redact_secrets(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secrets(item) for item in value]
+    return value
+
+
+def _safe_validation_errors(errors: Sequence[Any]) -> list[Any]:
+    safe = []
+    for error in errors:
+        error = dict(error)
+        loc = [str(part).lower() for part in error.get("loc", ())]
+        if any(_SECRET_KEY_MARKER in part for part in loc):
+            error["input"] = _REDACTED
+        elif "input" in error:
+            error["input"] = _redact_secrets(error["input"])
+        safe.append(error)
+    return safe
+
+
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
@@ -76,7 +109,7 @@ def install_error_handlers(app: FastAPI) -> None:
                 "validation_error",
                 "Request validation failed",
                 request_id=request_id,
-                details=jsonable_encoder(exc.errors()),
+                details=jsonable_encoder(_safe_validation_errors(exc.errors())),
             ),
         )
 
