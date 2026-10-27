@@ -246,6 +246,9 @@ class TestMigrationState:
         assert result["Migration 0043"].status == "WARN"
         assert result["Migration 0046"].status == "WARN"
         assert "0046_" in result["Migration 0046"].remedy
+        # The send worker reads reply_to_message_id: blocking.
+        assert result["Migration 0048"].status == "FAIL"
+        assert "0048_" in result["Migration 0048"].remedy
         assert result["Migration chain"].status == "OK"  # nothing later is applied
         assert result["Function ownership"].status == "OK", result["Function ownership"].detail
         assert result["Migration history table"].status == "INFO"

@@ -170,6 +170,8 @@ export async function addSequenceStep(
     email_subject?: string | null;
     email_body_html?: string | null;
     email_preheader?: string | null;
+    // EMAIL follow-ups only: reply in the previous email's thread (ADR-0021).
+    email_same_thread?: boolean;
     source_template_version_id?: string | null;
     // EMAIL only: insert a WAIT of this many minutes directly before the new
     // step, in the same transaction.
@@ -193,6 +195,8 @@ export async function updateSequenceStep(
     email_body_html?: string | null;
     // "" clears the pre-header; omit to leave it unchanged.
     email_preheader?: string | null;
+    // Omit to leave it unchanged.
+    email_same_thread?: boolean;
     source_template_version_id?: string | null;
     wait_duration_minutes?: number | null;
   },

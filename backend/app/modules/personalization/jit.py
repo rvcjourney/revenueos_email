@@ -33,6 +33,7 @@ from app.modules.campaigns.follow_up_timing import (
     intended_follow_up_due,
     wait_edited_after,
 )
+from app.modules.campaigns.message_rendering import reply_subject
 from app.modules.campaigns.scheduling import project_into_window
 from app.modules.personalization.budget import RpmLimiter
 from app.modules.personalization.config_schema import parse_config
@@ -116,6 +117,24 @@ class _Item:
     retry_codes: tuple[str, ...]
     work: Mapping[str, Any]
     previous: PreviousEmail | None
+    # Same-thread follow-up (ADR-0021): the subject it takes, or why it can't.
+    thread_subject: str | None = None
+    thread_unavailable: str | None = None
+
+
+def _thread_subject(
+    work: Mapping[str, Any], previous: PreviousEmail | None
+) -> tuple[str | None, str | None]:
+    """(subject, reason it is unavailable) of a follow-up sent in the same thread.
+    The parent stored when it was planned (messages.reply_to_message_id) decides;
+    without one (the lead changed mailbox) the previous sent email does; with
+    neither the model's own subject is kept and the reason recorded."""
+    if not work.get("email_same_thread"):
+        return None, None
+    source = work.get("parent_subject") or (previous.subject if previous else None)
+    if source:
+        return reply_subject(source), None
+    return None, "previous_subject_missing"
 
 
 def _backoff(base: int, cap: int, n: int) -> float:
@@ -233,6 +252,7 @@ class GenerationRunner:
                     workspace_id=workspace_id, generation_id=generation_id
                 )
                 previous = self._load_previous(repo, workspace_id, work, now)
+                thread_subject, thread_unavailable = _thread_subject(work, previous)
                 items.append(
                     _Item(
                         generation_id=generation_id,
@@ -244,6 +264,8 @@ class GenerationRunner:
                         retry_codes=tuple(row["last_failure_codes"] or ()),
                         work=dict(work),
                         previous=previous,
+                        thread_subject=thread_subject,
+                        thread_unavailable=thread_unavailable,
                     )
                 )
         return items
@@ -310,12 +332,14 @@ class GenerationRunner:
             workspace_id=workspace_id,
             frozen_variables=work["frozen_variables"] or {},
             objective=config,
-            reference_subject=work["email_subject"],
+            # A threaded step may have no subject of its own.
+            reference_subject=work["email_subject"] or "",
             reference_body_html=work["email_body_html"],
             reference_preheader=work["email_preheader"],
             step_position=int(work["step_position"]),
             previous=item.previous,
             retry_codes=item.retry_codes,
+            thread_subject=item.thread_subject,
         )
         try:
             outcome = self._service.attempt(inputs)
@@ -743,6 +767,12 @@ class GenerationRunner:
                 )
                 summary.superseded += 1
                 return
+            if item.thread_unavailable is not None:
+                repo.record_same_thread_unavailable(
+                    workspace_id=workspace_id,
+                    message_id=item.message_id,
+                    reason=item.thread_unavailable,
+                )
             fallback = outcome.kind == "FALLBACK"
             repo.finish_attempt(
                 workspace_id=workspace_id,

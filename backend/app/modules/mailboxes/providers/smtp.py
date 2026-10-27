@@ -240,6 +240,9 @@ class SmtpProvider(EmailProvider):
         self,
         credential: Mapping[str, Any],
         envelope: OutboundMessageEnvelope,
+        *,
+        # Only Graph uses it (a send-time budget); the others ignore it.
+        authorization_deadline: datetime | None = None,
     ) -> ProviderSendResult:
         validate_header_value("To", envelope.to_address)
         validate_header_value("From", envelope.from_address)

@@ -251,21 +251,26 @@ class ReconcileService:
         transport identity (rfc_message_id), never claimed, no live attempt. A
         message past that point keeps exactly what it was approved with. The
         digest is computed by the same function the send gate recomputes it with,
-        so a re-rendered message always passes the gate's integrity check."""
+        so a re-rendered message always passes the gate's integrity check.
+
+        A step sent in the same thread (ADR-0021) has no subject of its own: only
+        its body is re-rendered, and the frozen "Re: ..." subject is kept."""
+        threaded = bool(row.get("email_same_thread"))
         if (
             row["rfc_message_id"] is not None
             or row["dispatch_origin"] is not None
             or row["has_live_attempt"]
-            or row["email_subject"] is None
+            or (row["email_subject"] is None and not threaded)
             or int(row["renderer_version"]) != 1
         ):
             return None
         rendered = render_step_content(
-            subject=row["email_subject"],
+            subject=row["email_subject"] or "",
             body_html=row["email_body_html"] or "",
             preheader=row["email_preheader"],
             frozen_variables=row["frozen_variables"] or {},
             renderer_version=int(row["renderer_version"]),
+            thread_subject=row["content_subject"] if threaded else None,
         )
         if rendered.content_digest == row["content_digest"]:
             return None

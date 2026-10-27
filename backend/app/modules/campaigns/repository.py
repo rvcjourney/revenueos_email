@@ -799,6 +799,7 @@ class CampaignRepository:
         wait_duration_minutes: int | None,
         source_template_version_id: UUID | None,
         email_preheader: str | None = None,
+        email_same_thread: bool = False,
     ) -> RowMapping:
         existing = self.list_steps_ordered(
             workspace_id=workspace_id, sequence_id=sequence_id
@@ -823,13 +824,15 @@ class CampaignRepository:
                         (id, workspace_id, sequence_id, campaign_id, position, kind,
                          email_subject, email_body_html, email_preheader,
                          email_variable_schema,
-                         wait_duration_minutes, source_template_version_id)
+                         wait_duration_minutes, source_template_version_id,
+                         email_same_thread)
                     VALUES
                         (:id, :workspace_id, :sequence_id, :campaign_id, :position,
                          :kind,
                          :email_subject, :email_body_html, :email_preheader,
                          CAST(:email_variable_schema AS jsonb),
-                         :wait_duration_minutes, :source_template_version_id)
+                         :wait_duration_minutes, :source_template_version_id,
+                         :email_same_thread)
                     RETURNING *
                     """
                 ),
@@ -843,6 +846,7 @@ class CampaignRepository:
                     "email_subject": email_subject,
                     "email_body_html": email_body_html,
                     "email_preheader": email_preheader,
+                    "email_same_thread": email_same_thread,
                     "email_variable_schema": (
                         json.dumps(email_variable_schema)
                         if email_variable_schema is not None
@@ -876,6 +880,7 @@ class CampaignRepository:
         source_template_version_id_provided: bool,
         email_preheader: str | None = None,
         email_preheader_provided: bool = False,
+        email_same_thread: bool | None = None,
     ) -> RowMapping | None:
         existing = self.get_step(
             workspace_id=workspace_id, step_id=step_id, for_update=True
@@ -915,6 +920,11 @@ class CampaignRepository:
                 if email_preheader_provided
                 else existing["email_preheader"]
             )
+            new_same_thread = (
+                email_same_thread
+                if email_same_thread is not None
+                else existing["email_same_thread"]
+            )
             row = (
                 self.session.execute(
                     text(
@@ -923,6 +933,7 @@ class CampaignRepository:
                         SET email_subject = :email_subject,
                             email_body_html = :email_body_html,
                             email_preheader = :email_preheader,
+                            email_same_thread = :email_same_thread,
                             email_variable_schema =
                                 CAST(:email_variable_schema AS jsonb),
                             source_template_version_id = :source_template_version_id
@@ -938,6 +949,7 @@ class CampaignRepository:
                         "email_subject": new_subject,
                         "email_body_html": new_body,
                         "email_preheader": new_preheader,
+                        "email_same_thread": new_same_thread,
                         "email_variable_schema": (
                             json.dumps(new_schema) if new_schema is not None else None
                         ),

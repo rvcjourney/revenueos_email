@@ -607,6 +607,8 @@ export type SequenceStep = {
   email_subject: string | null;
   email_body_html: string | null;
   email_preheader?: string | null;
+  // Follow-up sent as a reply to the previous email, with its subject (ADR-0021).
+  email_same_thread?: boolean;
   attachments?: StepAttachment[];
   email_variable_schema: Record<string, unknown> | null;
   wait_duration_minutes: number | null;

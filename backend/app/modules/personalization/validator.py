@@ -123,6 +123,10 @@ class ValidationContext:
     facts: Mapping[str, Fact]
     previous: PreviousEmail | None = None
     require_fact_use: bool = True
+    # A follow-up sent in the same thread (ADR-0021) gets the previous email's
+    # subject: the model's subject is discarded, so it is neither checked nor
+    # counted towards anything else.
+    subject_fixed: bool = False
 
 
 @dataclass(frozen=True)
@@ -202,15 +206,16 @@ def validate_generation(
         if code not in codes:
             codes.append(code)
 
-    subject = (output.subject or "").strip()
-    if not subject:
-        flag("empty_subject")
-    if len(subject) > MAX_SUBJECT_CHARS:
-        flag("subject_too_long")
-    if _SUBJECT_CONTROL_RE.search(output.subject or ""):
-        flag("subject_control_chars")
-    if _PLACEHOLDER_MARK_RE.search(subject):
-        flag("subject_placeholder")
+    subject = "" if ctx.subject_fixed else (output.subject or "").strip()
+    if not ctx.subject_fixed:
+        if not subject:
+            flag("empty_subject")
+        if len(subject) > MAX_SUBJECT_CHARS:
+            flag("subject_too_long")
+        if _SUBJECT_CONTROL_RE.search(output.subject or ""):
+            flag("subject_control_chars")
+        if _PLACEHOLDER_MARK_RE.search(subject):
+            flag("subject_placeholder")
 
     paragraphs = tuple(p.strip() for p in output.paragraphs if p and p.strip())
     if not paragraphs:
@@ -313,7 +318,9 @@ def validate_generation(
             >= FOLLOWUP_SIMILARITY_MAX
         ):
             flag("repeats_previous")
-        if _normalize_subject(subject) == _normalize_subject(ctx.previous.subject):
+        if not ctx.subject_fixed and _normalize_subject(subject) == _normalize_subject(
+            ctx.previous.subject
+        ):
             flag("subject_repeated")
         if _FILLER_RE.search(combined):
             flag("filler_followup")

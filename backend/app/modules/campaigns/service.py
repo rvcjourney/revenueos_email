@@ -293,6 +293,7 @@ class CampaignService:
                     email_subject=step["email_subject"],
                     email_body_html=step["email_body_html"],
                     email_preheader=step["email_preheader"],
+                    email_same_thread=bool(step.get("email_same_thread")),
                     email_variable_schema=step["email_variable_schema"],
                     wait_duration_minutes=step["wait_duration_minutes"],
                     source_template_version_id=(

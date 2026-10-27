@@ -62,6 +62,13 @@ class LoadedSendContext:
     # ADR-0020 resume fence. None for controlled-test sends (no campaign).
     message_schedule_generation: int | None = None
     campaign_schedule_generation: int | None = None
+    # A follow-up sent in the same thread (ADR-0021): the message it replies to,
+    # that message's Message-ID, every ancestor's Message-ID oldest first, and the
+    # parent's provider thread. All empty for any other message.
+    reply_to_message_id: UUID | None = None
+    thread_in_reply_to: str | None = None
+    thread_references: tuple[str, ...] = ()
+    thread_provider_id: str | None = None
 
 
 @dataclass(frozen=True)

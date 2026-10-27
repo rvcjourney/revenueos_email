@@ -126,6 +126,9 @@ class SequenceStepCreateIn(BaseModel):
     email_body_html: str | None = Field(default=None, max_length=200_000)
     # "" clears; None means "not provided".
     email_preheader: str | None = Field(default=None, max_length=255)
+    # EMAIL follow-ups only: send as a reply to the previous email (ADR-0021);
+    # the subject is then "Re: " + that email's subject.
+    email_same_thread: bool = False
     source_template_version_id: UUID | None = None
     # EMAIL only: also insert a WAIT of this many minutes directly before the
     # new step, atomically, so alternation can never be left half-built.
@@ -140,6 +143,8 @@ class SequenceStepUpdateIn(BaseModel):
     email_body_html: str | None = Field(default=None, max_length=200_000)
     # "" clears the pre-header; None leaves it unchanged.
     email_preheader: str | None = Field(default=None, max_length=255)
+    # None leaves it unchanged.
+    email_same_thread: bool | None = None
     source_template_version_id: UUID | None = None
     wait_duration_minutes: int | None = Field(default=None, gt=0, le=525_600)
 
@@ -179,6 +184,7 @@ class SequenceStepOut(BaseModel):
     email_subject: str | None = None
     email_body_html: str | None = None
     email_preheader: str | None = None
+    email_same_thread: bool = False
     attachments: list[StepAttachmentOut] = Field(default_factory=list)
     email_variable_schema: dict[str, Any] | None = None
     wait_duration_minutes: int | None = None

@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from app.core.errors import AppError
-from app.modules.campaigns.message_rendering import render_step_content
+from app.modules.campaigns.message_rendering import render_step_content, reply_subject
 from app.modules.campaigns.pacing import (
     MailboxPacing,
     SpreadPlanner,
@@ -289,15 +289,36 @@ class ProgressionService:
                 summary.spread += 1
 
             hyper = ctx.get("campaign_type") == CAMPAIGN_TYPE_HYPER
+            # ADR-0021: the parent is the email the lead was just sent (the row's
+            # SENT message). A reply must come from the same mailbox; if the lead
+            # was moved to another one it goes out unthreaded with the same subject.
+            # Personalized follow-ups store it too: the writer takes the subject
+            # from it.
+            threaded = bool(plan.step.get("email_same_thread"))
+            reply_to: UUID | None = None
+            if threaded and str(row["message_mailbox_id"]) == str(
+                row["assigned_mailbox_id"]
+            ):
+                reply_to = UUID(str(row["message_id"]))
+            elif threaded:
+                logger.info(
+                    "Same-thread follow-up planned unthreaded: mailbox changed",
+                    extra={"enrollment_id": str(enrollment_id)},
+                )
             rendered = (
                 None
                 if hyper
                 else render_step_content(
-                    subject=plan.step["email_subject"],
+                    subject=plan.step["email_subject"] or "",
                     body_html=plan.step["email_body_html"],
                     preheader=plan.step.get("email_preheader"),
                     frozen_variables=row["frozen_variables"] or {},
                     renderer_version=1,
+                    thread_subject=(
+                        reply_subject(row["message_subject"] or "")
+                        if threaded
+                        else None
+                    ),
                 )
             )
             message_id = self.repo.insert_followup_message(
@@ -309,6 +330,7 @@ class ProgressionService:
                 mailbox_id=UUID(str(row["assigned_mailbox_id"])),
                 address_id=address_id,
                 schedule_generation=int(ctx["schedule_generation"]),
+                reply_to_message_id=reply_to,
             )
             if message_id is not None and hyper:
                 # The follow-up is written just in time by the personalization

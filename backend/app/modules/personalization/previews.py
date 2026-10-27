@@ -18,6 +18,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from app.modules.campaigns.message_rendering import reply_subject
 from app.modules.personalization.budget import RpmLimiter
 from app.modules.personalization.config_schema import parse_config
 from app.modules.personalization.ports import ModelError, PreviousEmail
@@ -161,12 +162,20 @@ class PreviewRunner:
                 workspace_id=workspace_id,
                 frozen_variables=row["frozen_variables"] or {},
                 objective=objective,
-                reference_subject=row["email_subject"],
+                reference_subject=row["email_subject"] or "",
                 reference_body_html=row["email_body_html"],
                 reference_preheader=row["email_preheader"],
                 step_position=int(row["step_position"]),
                 previous=previous,
                 retry_codes=retry_codes,
+                # A same-thread step replies to this lead's previous sample
+                # (ADR-0021). A batch holds every email step in order and a failed
+                # step fails the ones after it, so that sample always exists here.
+                thread_subject=(
+                    reply_subject(previous.subject)
+                    if row.get("email_same_thread") and previous is not None
+                    else None
+                ),
             )
             try:
                 outcome = self._service.attempt(inputs)

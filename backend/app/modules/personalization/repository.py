@@ -464,8 +464,10 @@ class PersonalizationRepository:
                            e.state AS enrollment_state, e.next_step_id,
                            e.frozen_variables, e.address_id,
                            ss.email_subject, ss.email_body_html, ss.email_preheader,
+                           ss.email_same_thread,
                            ss.position AS step_position,
                            ss.version AS step_version,
+                           parent.content_subject AS parent_subject,
                            seq.personalization_config,
                            sv.timezone, sv.weekday_set,
                            sv.window_start_local, sv.window_end_local
@@ -482,6 +484,10 @@ class PersonalizationRepository:
                       ON seq.workspace_id = g.workspace_id AND seq.id = g.sequence_id
                     JOIN campaign_settings_versions sv
                       ON sv.workspace_id = c.workspace_id AND sv.id = c.current_settings_id
+                    -- ADR-0021: the parent stored at planning is the only source.
+                    LEFT JOIN messages parent
+                      ON parent.workspace_id = m.workspace_id
+                     AND parent.id = m.reply_to_message_id
                     WHERE g.workspace_id = :workspace_id AND g.id = :generation_id
                     """
                 ),
@@ -527,6 +533,32 @@ class PersonalizationRepository:
             )
             .mappings()
             .first()
+        )
+
+    def record_same_thread_unavailable(
+        self, *, workspace_id: UUID, message_id: UUID, reason: str
+    ) -> None:
+        """A same-thread follow-up written without the previous email's subject
+        (ADR-0021 D5): the same audit action the send worker records."""
+        self.session.execute(
+            text(
+                """
+                INSERT INTO audit_events
+                    (id, workspace_id, actor_kind, actor_id, action, target_type,
+                     target_id, after_state, reason)
+                VALUES
+                    (:id, :workspace_id, 'SYSTEM', NULL,
+                     'message.same_thread_unavailable', 'message', :message_id,
+                     CAST(:after_state AS jsonb), :reason)
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "workspace_id": str(workspace_id),
+                "message_id": str(message_id),
+                "after_state": json.dumps({"stage": "personalization"}),
+                "reason": reason,
+            },
         )
 
     def lock_for_finalize(
@@ -773,7 +805,7 @@ class PersonalizationRepository:
                     SELECT p.id, p.audience_member_id, p.step_id, p.config_digest,
                            ss.position AS step_position, ss.email_subject,
                            ss.email_body_html, ss.email_preheader,
-                           am.frozen_variables
+                           ss.email_same_thread, am.frozen_variables
                     FROM personalization_previews p
                     JOIN sequence_steps ss
                       ON ss.workspace_id = p.workspace_id AND ss.id = p.step_id

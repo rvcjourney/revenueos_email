@@ -11,6 +11,8 @@ export type StepDraft = {
   // Text of the "Start this step on Day N" field; only meaningful when the step
   // has a preceding wait.
   day: string;
+  // Send as a reply to the previous email, with its subject (ADR-0021).
+  sameThread: boolean;
 };
 
 export function draftFromStep(step: SequenceStep, day: number): StepDraft {
@@ -19,6 +21,7 @@ export function draftFromStep(step: SequenceStep, day: number): StepDraft {
     preheader: step.email_preheader ?? "",
     bodyHtml: step.email_body_html ?? "",
     day: String(day),
+    sameThread: step.email_same_thread ?? false,
   };
 }
 
@@ -33,7 +36,8 @@ export function useStepDraft(initial: StepDraft) {
     draft.subject !== baseline.subject ||
     draft.preheader !== baseline.preheader ||
     draft.bodyHtml !== baseline.bodyHtml ||
-    draft.day !== baseline.day;
+    draft.day !== baseline.day ||
+    draft.sameThread !== baseline.sameThread;
 
   const update = React.useCallback(
     (patch: Partial<StepDraft>) => setDraft((prev) => ({ ...prev, ...patch })),

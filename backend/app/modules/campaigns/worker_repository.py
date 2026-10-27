@@ -1231,9 +1231,10 @@ class CampaignWorkerRepository:
                     SELECT m.id, m.status, m.due_at, m.anchor_at, m.next_retry_at,
                            m.mailbox_id, m.step_id, m.schedule_generation,
                            m.content_digest, m.renderer_version, m.rfc_message_id,
-                           m.dispatch_origin,
+                           m.dispatch_origin, m.content_subject,
                            e.frozen_variables,
                            ss.email_subject, ss.email_body_html, ss.email_preheader,
+                           ss.email_same_thread,
                            EXISTS (
                                SELECT 1 FROM message_attempts a
                                WHERE a.workspace_id = m.workspace_id
@@ -1455,7 +1456,8 @@ class CampaignWorkerRepository:
                 text(
                     """
                     SELECT id, position, kind, wait_duration_minutes,
-                           email_subject, email_body_html, email_preheader
+                           email_subject, email_body_html, email_preheader,
+                           email_same_thread
                     FROM sequence_steps
                     WHERE workspace_id = :workspace_id AND sequence_id = :sequence_id
                     ORDER BY position ASC
@@ -1491,6 +1493,8 @@ class CampaignWorkerRepository:
                            e.assigned_mailbox_id, e.frozen_variables,
                            e.frozen_destination, e.next_step_id,
                            m.status AS message_status, m.accepted_at,
+                           m.id AS message_id, m.content_subject AS message_subject,
+                           m.mailbox_id AS message_mailbox_id,
                            mb.original_address AS sender_address,
                            mb.sender_display_name AS sender_name
                     FROM campaign_enrollments e
@@ -1537,12 +1541,15 @@ class CampaignWorkerRepository:
         mailbox_id: UUID,
         address_id: UUID,
         schedule_generation: int,
+        reply_to_message_id: UUID | None = None,
     ) -> UUID | None:
         """PLANNED message for a later step. None when a message for this
         (enrollment, step) already exists -- the unique key makes a retried or
         raced insert converge instead of duplicating. The campaign's current
         schedule_generation is stamped so the scheduler (which only claims
-        messages matching it) will pick this one up."""
+        messages matching it) will pick this one up. `reply_to_message_id` is the
+        message a same-thread follow-up replies to (ADR-0021); the database
+        requires it to be of the same mailbox."""
         _safe_set_role(self.session, "app_worker_general")
         new_id = uuid.uuid4()
         inserted = self.session.execute(
@@ -1551,11 +1558,11 @@ class CampaignWorkerRepository:
                 INSERT INTO messages
                     (id, workspace_id, purpose, campaign_id, enrollment_id,
                      sequence_id, step_id, mailbox_id, address_id,
-                     schedule_generation, status)
+                     schedule_generation, status, reply_to_message_id)
                 VALUES
                     (:id, :workspace_id, 'CAMPAIGN', :campaign_id, :enrollment_id,
                      :sequence_id, :step_id, :mailbox_id, :address_id,
-                     :schedule_generation, 'PLANNED')
+                     :schedule_generation, 'PLANNED', :reply_to_message_id)
                 ON CONFLICT DO NOTHING
                 RETURNING id
                 """
@@ -1570,6 +1577,9 @@ class CampaignWorkerRepository:
                 "mailbox_id": str(mailbox_id),
                 "address_id": str(address_id),
                 "schedule_generation": schedule_generation,
+                "reply_to_message_id": (
+                    str(reply_to_message_id) if reply_to_message_id else None
+                ),
             },
         ).first()
         return new_id if inserted is not None else None

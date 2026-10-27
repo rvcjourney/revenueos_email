@@ -28,3 +28,4 @@ Threading follow-ups under the first email's subject (the validators still requi
 - Stricter validation can reject more attempts, which raises retries and token use per email; the prompts state the limits up front to keep that low.
 - Reference emails already stored keep their wording; use "Regenerate" to rewrite them with the playbook. A user-written reference that violates the shape rules still works, but per-lead output is held to the rules regardless of its reference.
 - Output quality still depends on the model; the checks guarantee shape and length, not tone. Validator thresholds should be tuned on real outputs.
+- Amended by [ADR-0021](0021-follow-up-same-thread.md): the distinct-subject rule applies only to steps not sent in the same thread.

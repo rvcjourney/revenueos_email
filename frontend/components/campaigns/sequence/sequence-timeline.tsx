@@ -20,6 +20,7 @@ import {
   sequenceProblems,
 } from "@/components/campaigns/sequence/duration";
 import { DurationEditor } from "@/components/campaigns/sequence/duration-input";
+import { replySubject } from "@/components/campaigns/sequence/same-thread";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Popover } from "@/components/ui/popover";
@@ -125,6 +126,7 @@ export function SequenceTimeline({
             const showCounts =
               !personalized && lockedThrough > 0 && step.sent_count !== undefined;
             const writtenCount = step.written_count ?? 0;
+            const threaded = emailIndex > 0 && step.email_same_thread === true;
             const unwrittenCount = step.unwritten_count ?? 0;
             return (
               <li key={step.id} className="list-none">
@@ -142,6 +144,11 @@ export function SequenceTimeline({
                       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
                         {index === 0 ? "Day 1 · at start" : `Day ${timing?.day ?? 1}`}
                       </span>
+                      {threaded ? (
+                        <span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs font-medium text-brand-700">
+                          Same thread
+                        </span>
+                      ) : null}
                     </div>
                     <div className="flex items-center gap-1">
                       <Button variant="outline" size="sm" onClick={() => onOpenEmail(step)}>
@@ -227,9 +234,11 @@ export function SequenceTimeline({
                     className="mt-3 block w-full rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-600"
                   >
                     <p className="truncate text-sm font-medium text-slate-900">
-                      {step.email_subject?.trim() || (
-                        <span className="text-slate-400">(no subject)</span>
-                      )}
+                      {threaded
+                        ? replySubject(emails.slice(0, emailIndex), personalized)
+                        : step.email_subject?.trim() || (
+                            <span className="text-slate-400">(no subject)</span>
+                          )}
                     </p>
                     <p className="mt-0.5 line-clamp-2 text-sm text-slate-500">
                       {snippet || <span className="text-slate-400">Empty body</span>}

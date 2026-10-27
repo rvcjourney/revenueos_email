@@ -639,3 +639,72 @@ describe("CampaignSequencePage while the campaign is paused (ADR-0020)", () => {
     expect(await screen.findByText(/Pause it to edit emails that haven't been sent/i)).toBeVisible();
   });
 });
+
+describe("CampaignSequencePage: same-thread follow-ups", () => {
+  it("creates a new follow-up in the same thread", async () => {
+    mockWorkspace("MEMBER");
+    api.getSequence.mockResolvedValue(threeEmails());
+    api.addSequenceStep.mockResolvedValue(makeStep("e4", 7, "EMAIL"));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole("button", { name: /^add step$/i }));
+    await waitFor(() =>
+      expect(api.addSequenceStep).toHaveBeenCalledWith(
+        "ws-1",
+        "camp-1",
+        expect.objectContaining({ position: 6, email_same_thread: true }),
+      ),
+    );
+  });
+
+  it("does not thread the first email", async () => {
+    mockWorkspace("MEMBER");
+    api.getSequence.mockResolvedValue(emptySequence);
+    api.addSequenceStep.mockResolvedValue(makeStep("new", 1, "EMAIL"));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole("button", { name: /add email step/i }));
+    await waitFor(() =>
+      expect(api.addSequenceStep).toHaveBeenCalledWith(
+        "ws-1",
+        "camp-1",
+        expect.objectContaining({ position: 1, email_same_thread: false }),
+      ),
+    );
+  });
+
+  it("badges threaded steps and shows the subject they reply with", async () => {
+    mockWorkspace("MEMBER");
+    api.getSequence.mockResolvedValue(
+      makeSequence([
+        makeStep("e1", 1, "EMAIL"),
+        makeStep("w1", 2, "WAIT"),
+        makeStep("e2", 3, "EMAIL", { email_same_thread: true }),
+      ]),
+    );
+    renderPage();
+
+    const second = await screen.findByRole("article", { name: "Step 2: Email" });
+    expect(within(second).getByText("Same thread")).toBeInTheDocument();
+    expect(within(second).getByText("Re: Subject e1")).toBeInTheDocument();
+    const first = screen.getByRole("article", { name: "Step 1: Email" });
+    expect(within(first).queryByText("Same thread")).not.toBeInTheDocument();
+  });
+
+  it("explains a move that would leave a threaded email first", async () => {
+    mockWorkspace("MEMBER");
+    api.getSequence.mockResolvedValue(threeEmails());
+    api.reorderSequenceSteps.mockRejectedValue(
+      new ApiError("server text", 422, "same_thread_requires_previous_email", null),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole("button", { name: /move step 2 up/i }));
+    expect(
+      await screen.findByText(/the first email can't be sent in the same thread/i),
+    ).toBeInTheDocument();
+  });
+});

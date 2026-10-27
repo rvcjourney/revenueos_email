@@ -220,6 +220,14 @@ keeps working on a database that has not had 0040 yet (it then skips the bookkee
 the emergency stop never depends on a migration; every other piece of the feature needs its own.
 Details: [ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md).
 
+**Follow-ups in the same thread (migration 0048).** Apply **after 0046 and 0047** and **before**
+deploying the backend, workers and scheduler of this version: the send worker, progression and the
+step editor read `messages.reply_to_message_id` and `sequence_steps.email_same_thread`, so this
+code on a database without 0048 fails every send (the preflight reports `Migration 0048` as FAIL).
+The migration alone changes nothing visible (the switch defaults off). It replaces
+`app_guard_frozen_sequence_steps` like 0046 does, so the same `app_integrity_guard` elevation
+applies. Details: [ADR-0021](../adr/0021-follow-up-same-thread.md).
+
 **Database whose `app_guard_*` functions are owned by `postgres` (production, 2026-10-09).** 0042
 and 0044 assert that the two frozen-sequence guards are owned by `app_integrity_guard` and roll
 back with `0042 postcondition failed: ... is not SECURITY DEFINER owned by app_integrity_guard`
@@ -233,7 +241,7 @@ save one edit of a DRAFT campaign's email step in the app before continuing with
 ownership`.
 
 **Is the database really up to date? The preflight now tells you.** The go-live preflight below
-checks, with read-only catalog queries, which of migrations 0021-0046 the database has (`Migration
+checks, with read-only catalog queries, which of migrations 0021-0048 the database has (`Migration
 NNNN`), that there are no gaps in the chain (`Migration chain`) and that the `app_*` guard and
 erasure functions have the right owner (`Function ownership`). A `FAIL` names the migration and what
 breaks without it. If it reports `Function ownership` problems, the production database was set up

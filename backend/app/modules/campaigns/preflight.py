@@ -263,11 +263,22 @@ class PreflightService:
                 )
             )
 
+        first_email = next((s for s in sequence.steps if s.kind == "EMAIL"), None)
+        if first_email is not None and first_email.email_same_thread:
+            errors.append(
+                PreflightIssue(
+                    code="same_thread_requires_previous_email",
+                    message="The first email can't be sent in the same thread: "
+                    "there is no earlier email to reply to.",
+                    field_path=f"sequence.steps[{first_email.position}]",
+                )
+            )
         for step in sequence.steps:
             if step.kind != "EMAIL":
                 continue
             field_path = f"sequence.steps[{step.position}]"
-            if not (step.email_subject or "").strip():
+            # A follow-up in the same thread takes the previous email's subject.
+            if not step.email_same_thread and not (step.email_subject or "").strip():
                 errors.append(
                     PreflightIssue(
                         code="sequence_step_missing_content",
@@ -300,7 +311,7 @@ class PreflightService:
                 )
             try:
                 validate_template_content(
-                    step.email_subject or " ",
+                    step.email_subject or ("Re:" if step.email_same_thread else " "),
                     step.email_body_html or "",
                     step.email_preheader,
                 )

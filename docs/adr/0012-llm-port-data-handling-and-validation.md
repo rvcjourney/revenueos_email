@@ -35,3 +35,4 @@ Hyper-personalized campaigns ([ADR-0011](0011-hyper-personalized-campaign-type.m
 - New configuration keys and a new secret in one worker group only.
 - Validator thresholds need tuning against real outputs; too strict yields `FAILED`, too loose risks weak personalization.
 - Cost controls are separate from send rate limiting ([RATE_LIMITING](../architecture/RATE_LIMITING.md)) and do not consume send capacity.
+- Amended by [ADR-0021](0021-follow-up-same-thread.md): a follow-up sent in the same thread takes "Re: " + the previous email's subject, so the subject checks (including "a different subject") do not apply to it and the model's subject is discarded.

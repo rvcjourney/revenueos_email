@@ -10,6 +10,7 @@ import { usePersonalizationState } from "@/components/campaigns/personalization/
 import { AiDraftBar } from "@/components/campaigns/sequence/ai-draft-bar";
 import { computeTimings } from "@/components/campaigns/sequence/duration";
 import { EmailStepDialog } from "@/components/campaigns/sequence/email-step-dialog";
+import { replySubject, sameThreadErrorMessage } from "@/components/campaigns/sequence/same-thread";
 import { SequenceTimeline } from "@/components/campaigns/sequence/sequence-timeline";
 import { CampaignSetupPanel } from "@/components/campaigns/sequence/setup/campaign-setup-panel";
 import { useReferenceGeneration } from "@/components/campaigns/sequence/use-reference-generation";
@@ -45,6 +46,10 @@ const NEW_REFERENCE_BODY =
 const WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 function errorMessage(error: unknown) {
+  const sameThread = sameThreadErrorMessage(error);
+  if (sameThread) {
+    return `${sameThread} Turn off “Send in same thread” on the email that would become first, then try again.`;
+  }
   if (error instanceof ApiError) return error.message;
   return "We couldn’t complete that request. Please try again.";
 }
@@ -156,6 +161,8 @@ export default function CampaignSequencePage() {
         position: input.position,
         email_subject: isHyper ? NEW_REFERENCE_SUBJECT : NEW_EMAIL_SUBJECT,
         email_body_html: isHyper ? NEW_REFERENCE_BODY : NEW_EMAIL_BODY,
+        // New follow-ups reply in the previous email's thread by default (ADR-0021).
+        email_same_thread: steps.some((s) => s.kind === "EMAIL" && s.position < input.position),
         // Server inserts the wait and the email in one transaction.
         leading_wait_minutes: input.withWait ? DEFAULT_WAIT_MINUTES : undefined,
       }),
@@ -263,6 +270,10 @@ export default function CampaignSequencePage() {
         day={timings.get(openStep.id)?.day ?? 1}
         previousEmailDay={previousEmail ? (timings.get(previousEmail.id)?.day ?? 1) : null}
         precedingWait={precedingWait}
+        replySubject={replySubject(
+          steps.slice(0, index).filter((s) => s.kind === "EMAIL"),
+          isHyper,
+        )}
         readOnly={readOnly}
         canTestSend={canExecuteCampaign(activeWorkspace?.role_code)}
         referenceMode={isHyper}

@@ -79,7 +79,8 @@ export function TestSendControl({
           recipient_email: recipient.trim(),
           confirm_recipient: true,
           audience_member_id: audienceMemberId,
-          email_subject: subject.trim(),
+          // A same-thread step may have no subject of its own; the server uses the saved one.
+          email_subject: subject.trim() || undefined,
           email_body_html: bodyHtml,
           email_preheader: preheader.trim(),
         },

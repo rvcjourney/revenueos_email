@@ -367,6 +367,16 @@ MIGRATIONS: tuple[Migration, ...] = (
         "WARN",
         "adding, removing and re-timing steps of a paused personalized campaign",
     ),
+    Migration(
+        48,
+        "follow-ups in the same thread",
+        (
+            column("sequence_steps", "email_same_thread"),
+            column("messages", "reply_to_message_id"),
+        ),
+        "FAIL",
+        "saving a step, planning follow-ups and every send read these columns",
+    ),
 )
 
 # Functions whose owner matters (SECURITY DEFINER bodies run with their owner's rights).

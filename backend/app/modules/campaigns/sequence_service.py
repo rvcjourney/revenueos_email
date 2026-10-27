@@ -55,7 +55,8 @@ def _normalize_preheader(preheader: str | None) -> str | None:
 def describe_sequence_problem(steps: Any) -> str | None:
     """Why a sequence cannot run, or None. The rules preflight applies at
     activation that edits can break: it starts and ends with an email, emails
-    and waits alternate, every email has a subject."""
+    and waits alternate, every email has a subject (a follow-up sent in the same
+    thread takes the previous email's, ADR-0021)."""
     ordered = sorted(steps, key=lambda step: step["position"])
     if not ordered:
         return "A campaign needs at least one email"
@@ -65,7 +66,11 @@ def describe_sequence_problem(steps: Any) -> str | None:
         expected = "EMAIL" if index % 2 == 0 else "WAIT"
         if step["kind"] != expected:
             return "Emails and waits must alternate, starting and ending with an email"
-        if step["kind"] == "EMAIL" and not (step["email_subject"] or "").strip():
+        if (
+            step["kind"] == "EMAIL"
+            and not step.get("email_same_thread")
+            and not (step["email_subject"] or "").strip()
+        ):
             return "Every email needs a subject"
     if ordered[-1]["kind"] != "EMAIL":
         return "Emails and waits must alternate, starting and ending with an email"
@@ -136,6 +141,33 @@ class SequenceService:
         return self.repo.get_sequence_frontier(
             workspace_id=context.workspace_id, sequence_id=sequence_id
         )
+
+    @staticmethod
+    def _refuse_same_thread(kind: str, requested: bool | None) -> None:
+        """Only an EMAIL step can be sent in the same thread (ADR-0021)."""
+        if requested and kind != "EMAIL":
+            raise AppError(
+                "validation_error",
+                "Only an email can be sent in the same thread",
+                status_code=422,
+            )
+
+    def _require_previous_email_for_threads(
+        self, context: WorkspaceContext, sequence_id: UUID
+    ) -> None:
+        """The first email has nothing to reply to. Checked after the write, in the
+        same transaction, so raising rolls the whole request back."""
+        steps = self.repo.list_steps_ordered(
+            workspace_id=context.workspace_id, sequence_id=sequence_id
+        )
+        first = next((step for step in steps if step["kind"] == "EMAIL"), None)
+        if first is not None and first.get("email_same_thread"):
+            raise AppError(
+                "same_thread_requires_previous_email",
+                "The first email can't be sent in the same thread: there is no "
+                "earlier email to reply to.",
+                status_code=422,
+            )
 
     @staticmethod
     def _locked(message: str) -> AppError:
@@ -230,7 +262,8 @@ class SequenceService:
         email_preheader: str | None = None,
         sanitize_body: bool = True,
         profile: str = DEFAULT_PROFILE,
-    ) -> tuple[str, str, str | None, dict[str, Any]]:
+        same_thread: bool = False,
+    ) -> tuple[str | None, str, str | None, dict[str, Any]]:
         """Return (subject, body, preheader, variable_schema) for an EMAIL step.
 
         A template version supplies defaults only: any explicitly provided field
@@ -238,7 +271,8 @@ class SequenceService:
         by the template's text. The template id stays as provenance. Content
         entering a step is always sanitized (allow-list) before it is stored.
         For the pre-header, None means "use the template's / none" and an empty
-        string clears it.
+        string clears it. A step sent in the same thread needs no subject (it takes
+        the previous email's); one it has is kept but not used.
         """
         subject = email_subject
         body = email_body_html
@@ -258,7 +292,8 @@ class SequenceService:
             if preheader is None:
                 preheader = version["preheader"]
 
-        if not subject or not subject.strip():
+        has_subject = bool(subject and subject.strip())
+        if not has_subject and not same_thread:
             raise AppError(
                 "validation_error",
                 "email_subject is required for an EMAIL step without a "
@@ -272,9 +307,14 @@ class SequenceService:
         )
         clean_preheader = _normalize_preheader(preheader)
         variable_schema = validate_template_content(
-            subject, clean_body, clean_preheader
+            subject if subject and has_subject else "Re:", clean_body, clean_preheader
         )
-        return subject.strip(), clean_body, clean_preheader, variable_schema
+        return (
+            subject.strip() if subject and has_subject else None,
+            clean_body,
+            clean_preheader,
+            variable_schema,
+        )
 
     def get_sequence(self, context: WorkspaceContext, campaign_id: UUID) -> SequenceOut:
         campaign = self._require_campaign(context, campaign_id)
@@ -410,6 +450,7 @@ class SequenceService:
         payload: SequenceStepCreateIn,
     ) -> SequenceStepOut:
         campaign, paused = self._require_editable_campaign(context, campaign_id)
+        self._refuse_same_thread(payload.kind, payload.email_same_thread)
         sequence = self._ensure_sequence(context, campaign_id)
         if paused:
             existing_steps = self.repo.list_steps_ordered(
@@ -437,6 +478,7 @@ class SequenceService:
                 email_body_html=payload.email_body_html,
                 email_preheader=payload.email_preheader,
                 profile=self._sanitizer_profile(campaign, sequence),
+                same_thread=payload.email_same_thread,
             )
             # A brand-new step has no uploaded images yet.
             self._validate_cid_references(context, None, body)
@@ -469,6 +511,7 @@ class SequenceService:
                 email_variable_schema=variable_schema,
                 wait_duration_minutes=None,
                 source_template_version_id=payload.source_template_version_id,
+                email_same_thread=payload.email_same_thread,
             )
         else:
             if payload.leading_wait_minutes is not None:
@@ -505,6 +548,7 @@ class SequenceService:
                 wait_duration_minutes=payload.wait_duration_minutes,
                 source_template_version_id=None,
             )
+        self._require_previous_email_for_threads(context, UUID(str(sequence["id"])))
         if paused:
             self._finish_paused_edit(
                 context,
@@ -530,6 +574,23 @@ class SequenceService:
             raise AppError("not_found", "Sequence step not found", status_code=404)
         if paused and self._is_hyper(campaign):
             self._refuse_inline_images_in_reference(payload)
+        self._refuse_same_thread(existing["kind"], payload.email_same_thread)
+        was_threaded = bool(existing.get("email_same_thread"))
+        same_thread = (
+            payload.email_same_thread
+            if payload.email_same_thread is not None
+            else was_threaded
+        )
+        if (
+            paused
+            and same_thread != was_threaded
+            and existing["position"]
+            <= self._sequence_frontier(context, UUID(str(existing["sequence_id"])))
+        ):
+            raise self._locked(
+                "Leads have already received this email, so whether it is sent in "
+                "the same thread can't change."
+            )
 
         if existing["kind"] == "EMAIL":
             content_changing = (
@@ -537,6 +598,8 @@ class SequenceService:
                 or payload.email_body_html is not None
                 or payload.email_preheader is not None
                 or payload.source_template_version_id is not None
+                # Turning the switch off needs a subject: validate the result.
+                or payload.email_same_thread is not None
             )
             if content_changing:
                 if payload.source_template_version_id is not None:
@@ -584,6 +647,7 @@ class SequenceService:
                             or payload.source_template_version_id is not None
                         ),
                         profile=profile,
+                        same_thread=same_thread,
                     )
                 )
                 self._validate_cid_references(context, step_id, body)
@@ -604,6 +668,7 @@ class SequenceService:
                 source_template_version_id_provided=(
                     payload.source_template_version_id is not None
                 ),
+                email_same_thread=payload.email_same_thread,
             )
         else:
             row = self.repo.update_step(
@@ -620,6 +685,9 @@ class SequenceService:
             )
         if row is None:
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        self._require_previous_email_for_threads(
+            context, UUID(str(existing["sequence_id"]))
+        )
         if paused:
             self._finish_paused_edit(
                 context,
@@ -701,6 +769,7 @@ class SequenceService:
         )
         if not deleted:
             raise AppError("not_found", "Sequence step not found", status_code=404)
+        self._require_previous_email_for_threads(context, UUID(str(sequence["id"])))
         if paused:
             self._finish_paused_edit(
                 context,
@@ -780,6 +849,7 @@ class SequenceService:
             email_variable_schema=source["email_variable_schema"],
             wait_duration_minutes=None,
             source_template_version_id=source["source_template_version_id"],
+            email_same_thread=bool(source.get("email_same_thread")),
         )
         # Same storage objects and content ids: the copied body's image
         # references keep working without rewriting it.
@@ -855,6 +925,7 @@ class SequenceService:
             sequence_id=sequence_id,
             ordering=ordering,
         )
+        self._require_previous_email_for_threads(context, sequence_id)
         if paused:
             self._finish_paused_edit(
                 context, campaign_id, sequence_id, operation="reorder_steps"
@@ -934,6 +1005,7 @@ class SequenceService:
             email_subject=row["email_subject"],
             email_body_html=row["email_body_html"],
             email_preheader=row.get("email_preheader"),
+            email_same_thread=bool(row.get("email_same_thread")),
             attachments=[to_attachment_out(a) for a in attachments],
             email_variable_schema=row["email_variable_schema"],
             wait_duration_minutes=row["wait_duration_minutes"],
