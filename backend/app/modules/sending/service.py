@@ -50,6 +50,8 @@ from app.modules.rate_limit.schemas import (
 from app.modules.scheduler.schemas import SendTaskPayload
 from app.modules.sending import gates
 from app.modules.sending.repository import (
+    FINALIZE_LATE,
+    FINALIZE_LATE_ACCEPTED,
     AttemptAlreadyClaimed,
     MessageLockedByAnotherWorker,
     SendingRepository,
@@ -361,11 +363,11 @@ class SendingService:
         # From here on, capacity is NEVER released/refunded regardless of
         # outcome (RATE_LIMITING.md: no refunds for uncertain provider
         # usage) -- only the pre-commit abort paths above call release().
-        attempt_id, fresh_ctx, cred_gen = outcome
+        attempt_id, fresh_ctx, cred_gen, deadline = outcome
         if fresh_ctx.retry_count > 0:
             record_retry_executed(fresh_ctx.mailbox_provider)
         return self._invoke_provider_and_finalize(
-            attempt_id, fresh_ctx, cred_gen, compliance
+            attempt_id, fresh_ctx, cred_gen, compliance, authorization_deadline=deadline
         )
 
     def _run_authorization_transaction(
@@ -375,11 +377,11 @@ class SendingService:
         policies: list[Any],
         reservation: Any,
         expected_generation: int,
-    ) -> tuple[UUID, LoadedSendContext, int]:
+    ) -> tuple[UUID, LoadedSendContext, int, datetime]:
         """Re-verify everything under a fresh, lock-holding reload, then
         claim the attempt and commit SENDING atomically. Returns
-        (attempt_id, fresh_ctx, credential_generation) for the caller to use
-        outside this (now-committed) transaction."""
+        (attempt_id, fresh_ctx, credential_generation, authorization_deadline)
+        for the caller to use outside this (now-committed) transaction."""
         rate_status = self.repository.get_rate_control_status()
         if (
             rate_status is None
@@ -411,6 +413,7 @@ class SendingService:
             workspace_id=fresh_ctx.workspace_id, message_id=fresh_ctx.message_id
         )
         now = datetime.now(UTC)
+        deadline = now + timedelta(seconds=AUTHORIZATION_WINDOW_SECONDS)
         self.repository.insert_prepared_attempt(
             attempt_id=attempt_id,
             workspace_id=fresh_ctx.workspace_id,
@@ -419,8 +422,7 @@ class SendingService:
             ordinal=ordinal,
             invocation_owner=f"worker-send:{payload.work_id}",
             credential_generation=fresh_ctx.mailbox_current_connection_generation,
-            authorization_deadline=now
-            + timedelta(seconds=AUTHORIZATION_WINDOW_SECONDS),
+            authorization_deadline=deadline,
             dispatch_generation=fresh_ctx.dispatch_generation,
         )
 
@@ -465,7 +467,12 @@ class SendingService:
             raise _AuthorizationAborted("message_version_conflict")
 
         self.session.commit()
-        return attempt_id, fresh_ctx, fresh_ctx.mailbox_current_connection_generation
+        return (
+            attempt_id,
+            fresh_ctx,
+            fresh_ctx.mailbox_current_connection_generation,
+            deadline,
+        )
 
     # -------------------------------------------------------------------------
     # Provider invocation (no open transaction/lock) + result persistence
@@ -477,6 +484,8 @@ class SendingService:
         ctx: LoadedSendContext,
         credential_generation: int,
         compliance: ComplianceInfo | None = None,
+        *,
+        authorization_deadline: datetime | None = None,
     ) -> SendOutcome:
         provider = ProviderRegistry.get(ctx.mailbox_provider)
 
@@ -485,12 +494,12 @@ class SendingService:
                 ctx, provider, credential_generation
             )
         except _CredentialFailure as exc:
-            self._finalize_not_invoked(ctx, attempt_id, exc)
+            applied = self._finalize_not_invoked(ctx, attempt_id, exc)
             self.session.commit()
             return SendOutcome(
                 message_id=ctx.message_id,
-                outcome=exc.message_status,
-                reason=exc.error_category,
+                outcome=exc.message_status if applied else "NOOP",
+                reason=exc.error_category if applied else "late_provider_result",
                 attempt_id=attempt_id,
             )
 
@@ -501,21 +510,25 @@ class SendingService:
         try:
             attachments = self._load_attachments(ctx)
         except _CredentialFailure as exc:
-            self._finalize_not_invoked(ctx, attempt_id, exc)
+            applied = self._finalize_not_invoked(ctx, attempt_id, exc)
             self.session.commit()
             return SendOutcome(
                 message_id=ctx.message_id,
-                outcome=exc.message_status,
-                reason=exc.error_category,
+                outcome=exc.message_status if applied else "NOOP",
+                reason=exc.error_category if applied else "late_provider_result",
                 attempt_id=attempt_id,
             )
 
         from_address = ctx.frozen_sender_address or ctx.mailbox_original_address
         # Replies and bounces quote the Message-ID, so every campaign message
-        # must carry one we know. Generated once and persisted with the result;
-        # a retry after a lost commit reuses the stored value.
+        # must carry one we know. It is stored only together with the result
+        # (finalize): the commit-retry loop below reuses this value, and a later
+        # attempt reuses it only if an earlier result was stored with it (e.g.
+        # UNKNOWN_OUTCOME). Before the provider call it is not persisted
+        # (PROVIDER_ARCHITECTURE.md asks for that; not done yet).
         rfc_message_id = ctx.rfc_message_id or generate_message_id(from_address)
         body_html, body_text, extra_headers = self._compose_outbound(ctx, compliance)
+        reply_headers, provider_thread_id, _ = self._thread_context(ctx)
         envelope = OutboundMessageEnvelope(
             to_address=ctx.frozen_destination or "",
             from_address=from_address,
@@ -525,11 +538,17 @@ class SendingService:
             body_text=body_text,
             rfc_message_id=rfc_message_id,
             attachments=attachments,
-            extra_headers=extra_headers,
+            extra_headers=extra_headers + reply_headers,
+            provider_thread_id=provider_thread_id,
+            in_reply_to=ctx.thread_in_reply_to if reply_headers else None,
         )
 
         try:
-            send_result = provider.send_message(credential, envelope)
+            # The deadline lets an adapter refuse to start a send that could still
+            # be in flight when recovery declares the attempt abandoned.
+            send_result = provider.send_message(
+                credential, envelope, authorization_deadline=authorization_deadline
+            )
         except Exception as exc:  # noqa: BLE001 -- see comment below
             # Any exception escaping the adapter is treated as ambiguous,
             # never as "definitely not sent": the adapters are documented to
@@ -791,6 +810,27 @@ class SendingService:
             )
         return html, text, unsubscribe_headers(link)
 
+    @staticmethod
+    def _thread_context(
+        ctx: LoadedSendContext,
+    ) -> tuple[tuple[tuple[str, str], ...], str | None, str | None]:
+        """(reply headers, Gmail thread id, why it could not be threaded) for a
+        follow-up sent in the same thread (ADR-0021). When it cannot be threaded it
+        is sent as a normal email with its frozen "Re:" subject: never failed."""
+        if ctx.reply_to_message_id is None:
+            return (), None, None
+        if not ctx.thread_in_reply_to:
+            return (), None, "parent_message_id_missing"
+        # Graph ignores these headers and threads with createReply instead, from
+        # envelope.in_reply_to (ADR-0021 D4).
+        references = ctx.thread_references or (ctx.thread_in_reply_to,)
+        headers = (
+            ("In-Reply-To", ctx.thread_in_reply_to),
+            ("References", " ".join(references)),
+        )
+        thread_id = ctx.thread_provider_id if ctx.mailbox_provider == "GMAIL" else None
+        return headers, thread_id, None
+
     def _finalize_send_result(
         self,
         ctx: LoadedSendContext,
@@ -798,11 +838,18 @@ class SendingService:
         send_result: ProviderSendResult,
         envelope_rfc_message_id: str | None = None,
     ) -> SendOutcome:
+        unthreaded = self._thread_context(ctx)[2] or (
+            "provider_thread_not_found" if send_result.thread_dropped else None
+        )
+        if unthreaded is not None:
+            self._audit(
+                ctx, action="message.same_thread_unavailable", reason=unthreaded
+            )
         # What the recipient will quote in In-Reply-To: the value the provider
         # reports, else the one we put in the envelope.
         rfc_message_id = send_result.rfc_message_id or envelope_rfc_message_id
         if send_result.status == "ACCEPTED":
-            self.repository.finalize_attempt_result(
+            applied = self.repository.finalize_attempt_result(
                 workspace_id=ctx.workspace_id,
                 message_id=ctx.message_id,
                 attempt_id=attempt_id,
@@ -821,7 +868,17 @@ class SendingService:
                 ),
                 rfc_message_id=rfc_message_id,
             )
-            self._audit(ctx, action="message.sent", reason=None)
+            if applied == FINALIZE_LATE:
+                return self._late_result(ctx, attempt_id, "ACCEPTED")
+            self._audit(
+                ctx,
+                action="message.sent",
+                reason=(
+                    "accepted_after_recovery"
+                    if applied == FINALIZE_LATE_ACCEPTED
+                    else None
+                ),
+            )
             return SendOutcome(
                 message_id=ctx.message_id,
                 outcome="SENT",
@@ -841,7 +898,7 @@ class SendingService:
                     else None
                 )
             )
-            self.repository.finalize_attempt_result(
+            applied = self.repository.finalize_attempt_result(
                 workspace_id=ctx.workspace_id,
                 message_id=ctx.message_id,
                 attempt_id=attempt_id,
@@ -851,6 +908,8 @@ class SendingService:
                 error_code=send_result.error_code,
                 rfc_message_id=rfc_message_id,
             )
+            if applied == FINALIZE_LATE:
+                return self._late_result(ctx, attempt_id, "UNKNOWN")
             self._audit(
                 ctx,
                 action="message.ambiguous_outcome",
@@ -876,7 +935,7 @@ class SendingService:
             record_auth_failure(ctx.mailbox_provider)
             now = datetime.now(UTC)
             hold_time = now + timedelta(hours=1)
-            self.repository.finalize_attempt_result(
+            applied = self.repository.finalize_attempt_result(
                 workspace_id=ctx.workspace_id,
                 message_id=ctx.message_id,
                 attempt_id=attempt_id,
@@ -889,6 +948,8 @@ class SendingService:
                 due_at=hold_time,
                 hold_reason="mailbox_reauth_required",
             )
+            if applied == FINALIZE_LATE:
+                return self._late_result(ctx, attempt_id, "REJECTED")
             self._audit(
                 ctx, action="message.held_for_reauth", reason=send_result.error_code
             )
@@ -926,8 +987,7 @@ class SendingService:
             anchor_at=anchor_at,
         )
         if decision.should_retry:
-            record_retry_scheduled(ctx.mailbox_provider, send_result.error_category)
-            self.repository.finalize_attempt_result(
+            applied = self.repository.finalize_attempt_result(
                 workspace_id=ctx.workspace_id,
                 message_id=ctx.message_id,
                 attempt_id=attempt_id,
@@ -939,6 +999,9 @@ class SendingService:
                 next_retry_at=decision.next_retry_at,
                 due_at=decision.next_retry_at,
             )
+            if applied == FINALIZE_LATE:
+                return self._late_result(ctx, attempt_id, "REJECTED")
+            record_retry_scheduled(ctx.mailbox_provider, send_result.error_category)
             self._audit(
                 ctx, action="message.retry_scheduled", reason=send_result.error_category
             )
@@ -953,7 +1016,7 @@ class SendingService:
             record_retry_exhausted(ctx.mailbox_provider)
         record_terminal_failure(ctx.mailbox_provider, decision.terminal_reason)
 
-        self.repository.finalize_attempt_result(
+        applied = self.repository.finalize_attempt_result(
             workspace_id=ctx.workspace_id,
             message_id=ctx.message_id,
             attempt_id=attempt_id,
@@ -963,6 +1026,8 @@ class SendingService:
             error_code=send_result.error_code,
             terminal_reason=decision.terminal_reason or "send_rejected",
         )
+        if applied == FINALIZE_LATE:
+            return self._late_result(ctx, attempt_id, "REJECTED")
         self._audit(ctx, action="message.failed", reason=send_result.error_category)
         return SendOutcome(
             message_id=ctx.message_id,
@@ -971,15 +1036,39 @@ class SendingService:
             attempt_id=attempt_id,
         )
 
+    def _late_result(
+        self, ctx: LoadedSendContext, attempt_id: UUID, classification: str
+    ) -> SendOutcome:
+        """The attempt was already moved on (recovery, reconciliation) when its
+        result arrived (issue I-01). The repository appended it as attempt
+        evidence and changed nothing; it is audited and never retried."""
+        self._audit(ctx, action="message.late_provider_result", reason=classification)
+        logger.warning(
+            "Late provider result recorded without changing the message",
+            extra={
+                "message_id": str(ctx.message_id),
+                "attempt_id": str(attempt_id),
+                "classification": classification,
+            },
+        )
+        return SendOutcome(
+            message_id=ctx.message_id,
+            outcome="NOOP",
+            reason="late_provider_result",
+            attempt_id=attempt_id,
+        )
+
     def _finalize_not_invoked(
         self, ctx: LoadedSendContext, attempt_id: UUID, failure: _CredentialFailure
-    ) -> None:
+    ) -> bool:
+        """Record that the provider was never called. False when the attempt had
+        already been moved on (then it is only audited as a late result)."""
         hold_time = (
             (datetime.now(UTC) + timedelta(hours=1))
             if failure.message_status == "RETRY_SCHEDULED"
             else None
         )
-        self.repository.finalize_attempt_result(
+        applied = self.repository.finalize_attempt_result(
             workspace_id=ctx.workspace_id,
             message_id=ctx.message_id,
             attempt_id=attempt_id,
@@ -994,7 +1083,11 @@ class SendingService:
             due_at=hold_time,
             next_retry_at=hold_time,
         )
+        if applied == FINALIZE_LATE:
+            self._late_result(ctx, attempt_id, "NOT_INVOKED")
+            return False
         self._audit(ctx, action="message.credential_failure", reason=failure.error_code)
+        return True
 
     # -------------------------------------------------------------------------
     # Shared helpers

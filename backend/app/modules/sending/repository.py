@@ -4,15 +4,28 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import text
+from sqlalchemy import RowMapping, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.modules.sending.schemas import LoadedSendContext
 
 logger = logging.getLogger(__name__)
+
+# Longest same-thread chain the send worker walks (one message per email step).
+_MAX_THREAD_DEPTH = 50
+
+# finalize_attempt_result outcomes (issue I-01).
+FINALIZE_APPLIED = "APPLIED"
+FINALIZE_LATE_ACCEPTED = "LATE_ACCEPTED"
+FINALIZE_LATE = "LATE"
+
+
+def _bracketed(message_id: str) -> str:
+    """A Message-ID as it appears in In-Reply-To / References: <id>."""
+    return f"<{message_id.strip().strip('<>')}>"
 
 
 def _safe_set_role(session: Session, role_name: str) -> None:
@@ -86,7 +99,7 @@ class SendingRepository:
                    retry_count, retry_budget, content_subject, content_body_html,
                    content_digest, renderer_version, rendered_at, frozen_destination,
                    frozen_sender_address, frozen_sender_name, rfc_message_id, step_id,
-                   schedule_generation
+                   schedule_generation, reply_to_message_id
             FROM public.messages
             WHERE workspace_id = :ws AND id = :mid
             {lock_clause}
@@ -182,6 +195,10 @@ class SendingRepository:
             .first()
         )
         canonical_address = address["canonical_address"] if address else ""
+        reply_to = msg["reply_to_message_id"]
+        in_reply_to, references, thread_id = self._load_thread(
+            workspace_id, UUID(str(reply_to)) if reply_to else None
+        )
 
         return LoadedSendContext(
             message_id=UUID(str(msg["id"])),
@@ -229,7 +246,58 @@ class SendingRepository:
             message_schedule_generation=msg["schedule_generation"],
             campaign_schedule_generation=campaign_schedule_generation,
             raw=dict(msg),
+            reply_to_message_id=UUID(str(reply_to)) if reply_to else None,
+            thread_in_reply_to=in_reply_to,
+            thread_references=references,
+            thread_provider_id=thread_id,
         )
+
+    def _load_thread(
+        self, workspace_id: UUID, parent_id: UUID | None
+    ) -> tuple[str | None, tuple[str, ...], str | None]:
+        """(In-Reply-To, References oldest first, parent's provider thread) for a
+        same-thread follow-up (ADR-0021). Walks reply_to_message_id up the chain;
+        a chain is at most one message per email step, and the walk is capped in
+        case a bad link ever loops. An ancestor without a Message-ID is left out of
+        References; a parent without one means no reply headers at all."""
+        if parent_id is None:
+            return None, (), None
+        chain: list[RowMapping] = []
+        current: UUID | None = parent_id
+        while current is not None and len(chain) < _MAX_THREAD_DEPTH:
+            row = (
+                self.session.execute(
+                    text(
+                        "SELECT id, rfc_message_id, reply_to_message_id "
+                        "FROM public.messages WHERE workspace_id = :ws AND id = :id"
+                    ),
+                    {"ws": str(workspace_id), "id": str(current)},
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                break
+            chain.append(row)
+            nxt = row["reply_to_message_id"]
+            current = UUID(str(nxt)) if nxt else None
+        if not chain or not chain[0]["rfc_message_id"]:
+            return None, (), None
+        thread_id = self.session.execute(
+            text(
+                "SELECT provider_thread_ref FROM public.message_attempts "
+                "WHERE workspace_id = :ws AND message_id = :mid "
+                "AND evidence_state = 'ACCEPTED' AND provider_thread_ref IS NOT NULL "
+                "ORDER BY ordinal DESC LIMIT 1"
+            ),
+            {"ws": str(workspace_id), "mid": str(chain[0]["id"])},
+        ).scalar()
+        references = tuple(
+            _bracketed(row["rfc_message_id"])
+            for row in reversed(chain)
+            if row["rfc_message_id"]
+        )
+        return _bracketed(chain[0]["rfc_message_id"]), references, thread_id
 
 
     def list_step_attachments(
@@ -701,9 +769,73 @@ class SendingRepository:
         next_retry_at: datetime | None = None,
         due_at: datetime | None = None,
         rfc_message_id: str | None = None,
-    ) -> None:
+    ) -> str:
+        """Apply a provider result to THIS attempt, guarded (issue I-01).
+
+        Applied only while the message is SENDING and this attempt is still
+        PREPARED for the message's current dispatch (FINALIZE_APPLIED). One late
+        result is still applied: an acceptance after recovery already moved this
+        attempt to UNKNOWN and the message to UNKNOWN_OUTCOME resolves to SENT
+        (FINALIZE_LATE_ACCEPTED, MESSAGE_STATE_MACHINE.md). Anything else
+        (reconciled, retried, terminal) changes neither row: the result is only
+        appended as attempt evidence (FINALIZE_LATE) and never schedules a retry.
+
+        Locks the attempt, then the message -- the order recovery's UPDATEs take
+        them -- so the two serialize instead of deadlocking."""
         _safe_set_role(self.session, "app_worker_send")
         _safe_set_workspace(self.session, workspace_id)
+        lock = "" if self._is_sqlite() else "FOR UPDATE"
+        params = {
+            "ws": str(workspace_id),
+            "aid": str(attempt_id),
+            "mid": str(message_id),
+        }
+        attempt = (
+            self.session.execute(
+                text(
+                    "SELECT evidence_state, dispatch_generation "
+                    "FROM public.message_attempts "
+                    "WHERE workspace_id = :ws AND id = :aid AND message_id = :mid "
+                    f"{lock}"
+                ),
+                params,
+            )
+            .mappings()
+            .first()
+        )
+        message = (
+            self.session.execute(
+                text(
+                    "SELECT status, dispatch_generation FROM public.messages "
+                    f"WHERE workspace_id = :ws AND id = :mid {lock}"
+                ),
+                params,
+            )
+            .mappings()
+            .first()
+        )
+        if attempt is None or message is None:
+            return FINALIZE_LATE
+        current = (attempt["evidence_state"], message["status"])
+        same_dispatch = attempt["dispatch_generation"] == message["dispatch_generation"]
+        if same_dispatch and current == ("PREPARED", "SENDING"):
+            applied = FINALIZE_APPLIED
+        elif (
+            same_dispatch
+            and evidence_state == "ACCEPTED"
+            and current == ("UNKNOWN", "UNKNOWN_OUTCOME")
+        ):
+            applied = FINALIZE_LATE_ACCEPTED
+        else:
+            self._record_late_result(
+                workspace_id=workspace_id,
+                attempt_id=attempt_id,
+                evidence_state=evidence_state,
+                provider_message_id=provider_message_id,
+            )
+            return FINALIZE_LATE
+        expected = current
+
         now_col = (
             "CURRENT_TIMESTAMP"
             if self._is_sqlite()
@@ -723,11 +855,13 @@ class SendingRepository:
                     error_category = :error_category,
                     error_code = :error_code
                 WHERE workspace_id = :ws AND id = :attempt_id
+                  AND evidence_state = :expected_evidence
                 """
             ),
             {
                 "ws": str(workspace_id),
                 "attempt_id": str(attempt_id),
+                "expected_evidence": expected[0],
                 "evidence_state": evidence_state,
                 "provider_request_id": provider_request_id,
                 "provider_message_id": provider_message_id,
@@ -754,11 +888,13 @@ class SendingRepository:
                     due_at = COALESCE(:due_at, due_at),
                     version = version + 1
                 WHERE workspace_id = :ws AND id = :mid
+                  AND status = :expected_status
                 """
             ),
             {
                 "ws": str(workspace_id),
                 "mid": str(message_id),
+                "expected_status": expected[1],
                 "status": message_status,
                 "provider_message_id": provider_message_id,
                 "rfc_message_id": rfc_message_id,
@@ -767,6 +903,39 @@ class SendingRepository:
                 "retry_count": retry_count,
                 "next_retry_at": next_retry_at,
                 "due_at": due_at,
+            },
+        )
+        return applied
+
+    def _record_late_result(
+        self,
+        *,
+        workspace_id: UUID,
+        attempt_id: UUID,
+        evidence_state: str,
+        provider_message_id: str | None,
+    ) -> None:
+        """Append a result that came too late to decide anything (issue I-01).
+        Terminal attempt rows are immutable; observations are appended here."""
+        conflict = "" if self._is_sqlite() else "ON CONFLICT DO NOTHING"
+        self.session.execute(
+            text(
+                f"""
+                INSERT INTO public.attempt_evidence
+                    (id, workspace_id, attempt_id, source_kind, source_key,
+                     classification, payload_ref)
+                VALUES
+                    (:id, :ws, :attempt_id, 'late_provider_result', 'send_result',
+                     :classification, :payload_ref)
+                {conflict}
+                """
+            ),
+            {
+                "id": str(uuid4()),
+                "ws": str(workspace_id),
+                "attempt_id": str(attempt_id),
+                "classification": evidence_state,
+                "payload_ref": (provider_message_id or "")[:1024] or None,
             },
         )
 
