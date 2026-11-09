@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import WorkspaceContext
 from app.core.errors import AppError
+from app.core.permissions import has_permission
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import CampaignSettingsCreateIn, CampaignSettingsOut
 
@@ -48,18 +49,32 @@ class CampaignSettingsService:
         self.session = session
         self.repo = CampaignRepository(session)
 
-    def _require_draft_campaign(
+    def _require_editable_campaign(
         self, context: WorkspaceContext, campaign_id: UUID
     ) -> RowMapping:
+        """DRAFT, or an activated PAUSED campaign (ADR-0020). The database allows
+        a new settings version in exactly those two cases (app_guard_campaign_config
+        and the campaign_settings_versions insert policy), which for PAUSED also
+        requires campaigns.execute -- checked here so the answer is a clear 403
+        instead of a row-level-security error."""
         campaign = self.repo.get_campaign(
             workspace_id=context.workspace_id, campaign_id=campaign_id
         )
         if campaign is None:
             raise AppError("not_found", "Campaign not found", status_code=404)
+        if campaign["status"] == "PAUSED" and campaign["activation_id"] is not None:
+            if not has_permission(context.role_code, "campaigns.execute"):
+                raise AppError(
+                    "forbidden",
+                    "Only a manager can change the schedule of a paused campaign",
+                    status_code=403,
+                )
+            return campaign
         if campaign["status"] != "DRAFT":
             raise AppError(
                 "state_conflict",
-                "Schedule/settings can only change while the campaign is DRAFT",
+                "Schedule/settings can only change while the campaign is DRAFT "
+                "or paused",
                 status_code=409,
             )
         return campaign
@@ -99,7 +114,7 @@ class CampaignSettingsService:
         campaign_id: UUID,
         payload: CampaignSettingsCreateIn,
     ) -> CampaignSettingsOut:
-        self._require_draft_campaign(context, campaign_id)
+        campaign = self._require_editable_campaign(context, campaign_id)
         clean_tz = _validate_timezone(payload.timezone)
         if (
             payload.daily_limit is not None
@@ -120,6 +135,16 @@ class CampaignSettingsService:
             window_end_local=payload.window_end_local,
             daily_limit=payload.daily_limit,
         )
+        if campaign["status"] == "PAUSED":
+            # The change applies on resume: the reconcile pass re-projects every
+            # unsent message into the new windows. Ids only, never content.
+            self.repo.record_campaign_audit(
+                workspace_id=context.workspace_id,
+                actor_id=context.user_id,
+                action="campaign.settings_changed_while_paused",
+                campaign_id=campaign_id,
+                after_state={"settings_revision": int(row["revision"])},
+            )
         return self._to_out(row)
 
     def _to_out(self, row: RowMapping) -> CampaignSettingsOut:

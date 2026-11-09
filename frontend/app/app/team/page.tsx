@@ -256,8 +256,8 @@ export default function TeamPage() {
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <p className="text-sm font-medium text-brand-700">Workspace Management</p>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 mt-1">
+          <p className="text-xs font-semibold uppercase tracking-[0.08em] text-brand-600">Workspace Management</p>
+          <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900 mt-1">
             Team &amp; Access
           </h1>
           <p className="mt-1 text-sm text-slate-600">
@@ -364,7 +364,7 @@ export default function TeamPage() {
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
-              <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                 <tr>
                   <th className="px-4 py-3">User</th>
                   <th className="px-4 py-3">Email</th>
@@ -494,7 +494,7 @@ export default function TeamPage() {
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
-                <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                   <tr>
                     <th className="px-4 py-3">Invited Email</th>
                     <th className="px-4 py-3">Role</th>

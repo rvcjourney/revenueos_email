@@ -27,6 +27,7 @@ import {
   insertAtCursor,
   normalizeLinkUrl,
 } from "@/components/email-editor/email-html";
+import { EMAIL_IMAGE_DEFAULT_WIDTH } from "@/components/email-editor/email-image";
 import { VariablePicker } from "@/components/email-editor/variable-picker";
 import { Popover } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
@@ -492,7 +493,7 @@ export const EmailBodyEditor = React.forwardRef<EmailBodyEditorHandle, Props>(
           if (readOnly) return;
           if (mode === "source") {
             const el = sourceRef.current;
-            const tag = `<img src="cid:${contentId}" alt="${alt.replace(/"/g, "&quot;")}">`;
+            const tag = `<img src="cid:${contentId}" alt="${alt.replace(/"/g, "&quot;")}" width="${EMAIL_IMAGE_DEFAULT_WIDTH}">`;
             const result = insertAtCursor(
               valueRef.current,
               el?.selectionStart ?? null,
@@ -511,6 +512,7 @@ export const EmailBodyEditor = React.forwardRef<EmailBodyEditorHandle, Props>(
               attrs: {
                 src: displayUrl ?? urlsRef.current[contentId] ?? "",
                 alt,
+                width: String(EMAIL_IMAGE_DEFAULT_WIDTH),
                 dataCid: contentId,
               },
             })

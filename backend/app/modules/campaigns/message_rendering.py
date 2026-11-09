@@ -25,6 +25,7 @@ def render_step_content(
     frozen_variables: Mapping[str, Any],
     renderer_version: int,
     preheader: str | None = None,
+    thread_subject: str | None = None,
 ) -> RenderedMessageContent:
     """Render a frozen sequence step's content against an enrollment's frozen
     variables.
@@ -37,10 +38,17 @@ def render_step_content(
     *before* the digest is computed. The send gate recomputes the digest from
     the stored body, so it covers the pre-header with no gate/column change, and
     a step without a pre-header renders byte-identically to before.
+
+    `thread_subject` (a step sent in the same thread, ADR-0021) is the finished
+    "Re: ..." subject: it is used as-is, never rendered as a template.
     """
     rendered_subject, rendered_body = render_template_content(
-        subject=subject, body_html=body_html, context_data=frozen_variables
+        subject=subject if thread_subject is None else "",
+        body_html=body_html,
+        context_data=frozen_variables,
     )
+    if thread_subject is not None:
+        rendered_subject = thread_subject
     rendered_body = inject_preheader(
         rendered_body, render_preheader(preheader, frozen_variables)
     )
@@ -48,6 +56,16 @@ def render_step_content(
         rendered_subject, rendered_body, renderer_version
     )
     return RenderedMessageContent(rendered_subject, rendered_body, content_digest)
+
+
+def reply_subject(subject: str) -> str:
+    """The subject of an email sent as a reply in the same thread (ADR-0021 D3):
+    "Re: " + the previous email's subject, never "Re: Re:", within the column's
+    500 characters."""
+    clean = subject.strip()
+    if not clean.lower().startswith("re:"):
+        clean = f"Re: {clean}"
+    return clean[:500]
 
 
 def compute_content_digest(subject: str, body_html: str, renderer_version: int) -> str:
@@ -82,6 +100,9 @@ def compute_sequence_content_digest(
         # (and steps without one) hash exactly as they always did.
         if step.get("email_preheader"):
             entry["email_preheader"] = step["email_preheader"]
+        # Same rule for the same-thread switch (ADR-0021): only when on.
+        if step.get("email_same_thread"):
+            entry["email_same_thread"] = True
         # Attachment identity (not bytes): content id + sha256 pin the exact files
         # the frozen sequence will send. Absent when there are none.
         if step.get("attachments"):

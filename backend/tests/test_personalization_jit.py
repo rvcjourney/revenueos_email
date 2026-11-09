@@ -5,6 +5,7 @@ guarded finalize, rollback). No database, no network, no email."""
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 import pytest
 
@@ -318,6 +319,27 @@ class TestEligibility:
         assert store.usage["GENERATION"] == 0
         assert store.generation["next_attempt_at"] > clock.now
 
+    def test_reference_edited_during_generation_discards_the_stale_email(self) -> None:
+        """Pause -> edit the reference -> resume while a generation is in flight: what
+        the model wrote followed the OLD reference, so it is thrown away unspent and
+        written again from the new one."""
+        runner, store, model, clock = _build()
+
+        def edited(request):
+            store.step["version"] = store.step.get("version", 1) + 1
+            store.step["email_subject"] = "Better subject"
+            return model.default_output(request)
+
+        model._script = [edited]
+        summary = _run(runner)
+        assert summary.deferred == 1 and summary.generated == 0
+        assert store.message["status"] == "PLANNED"  # nothing written
+        assert store.generation["state"] == "PENDING"  # will be claimed again
+        assert store.generation["attempt_count"] == 0
+        assert store.usage["GENERATION"] == 0
+        assert store.attempts[0]["outcome"] == "ABORTED_INELIGIBLE"
+        assert store.generation["next_attempt_at"] > clock.now
+
     def test_message_already_scheduled_by_someone_else_is_not_overwritten(
         self,
     ) -> None:
@@ -494,3 +516,142 @@ def test_contact_data_never_reaches_the_model(field: str) -> None:
     _run(runner)
     blob = repr(model.requests[0])
     assert FROZEN[field] not in blob
+
+
+class TestWaitsEditedWhilePaused:
+    """ADR-0020: a wait may be edited while a personalized campaign is paused, after its
+    follow-ups were planned with the old one. The writer follows the wait as it
+    stands."""
+
+    @staticmethod
+    def _follow_up(store, *, wait_minutes, wait_edited, planned_due):
+        """Step 3 of E-W-E, planned a day before NOW with `planned_due`."""
+        old = NOW - timedelta(days=1)
+        store.step["position"] = 3
+        store.message["anchor_at"] = NOW
+        store.message["created_at"] = old
+        store.message["due_at"] = planned_due
+        store.step_waits = [
+            {
+                "id": uuid.uuid4(),
+                "position": 1,
+                "kind": "EMAIL",
+                "wait_duration_minutes": None,
+                "updated_at": old,
+            },
+            {
+                "id": uuid.uuid4(),
+                "position": 2,
+                "kind": "WAIT",
+                "wait_duration_minutes": wait_minutes,
+                "updated_at": NOW - timedelta(hours=1) if wait_edited else old,
+            },
+            {
+                "id": store.step_id,
+                "position": 3,
+                "kind": "EMAIL",
+                "wait_duration_minutes": None,
+                "updated_at": old,
+            },
+        ]
+
+    def test_an_unchanged_wait_changes_nothing(self) -> None:
+        runner, store, model, _ = _build()
+        self._follow_up(
+            store,
+            wait_minutes=60,
+            wait_edited=False,
+            planned_due=NOW + timedelta(hours=1),
+        )
+        summary = _run(runner)
+        assert summary.generated == 1
+        assert store.message["status"] == "SCHEDULED"
+        assert store.message["due_at"] == NOW + timedelta(hours=1)
+
+    def test_a_longer_wait_holds_the_email_back_without_spending_anything(self) -> None:
+        runner, store, model, clock = _build()
+        self._follow_up(
+            store,
+            wait_minutes=180,
+            wait_edited=True,
+            planned_due=NOW + timedelta(hours=1),
+        )
+        summary = _run(runner)
+        assert summary.deferred == 1 and summary.generated == 0 and model.calls == 0
+        assert store.message["status"] == "PLANNED"
+        assert store.message["due_at"] == NOW + timedelta(hours=3)
+        # Looked at again one lead time (an hour) before it is due, not before.
+        assert store.generation["next_attempt_at"] == NOW + timedelta(hours=2)
+        assert store.generation["attempt_count"] == 0
+        assert store.usage["GENERATION"] == 0
+
+    def test_it_is_written_when_the_new_time_comes(self) -> None:
+        runner, store, model, clock = _build()
+        self._follow_up(
+            store,
+            wait_minutes=180,
+            wait_edited=True,
+            planned_due=NOW + timedelta(hours=1),
+        )
+        _run(runner)
+        clock.advance(hours=2)
+        summary = _run(runner)
+        assert summary.generated == 1
+        assert store.message["status"] == "SCHEDULED"
+        assert store.message["due_at"] == NOW + timedelta(hours=3)
+
+    def test_a_longer_wait_inside_the_lead_time_is_written_now_for_the_new_time(
+        self,
+    ) -> None:
+        runner, store, model, _ = _build()
+        self._follow_up(
+            store,
+            wait_minutes=60,
+            wait_edited=True,
+            planned_due=NOW + timedelta(minutes=30),
+        )
+        summary = _run(runner)
+        assert summary.generated == 1
+        assert store.message["due_at"] == NOW + timedelta(hours=1)
+
+    def test_a_shorter_wait_brings_the_email_forward(self) -> None:
+        runner, store, model, _ = _build()
+        self._follow_up(
+            store,
+            wait_minutes=30,
+            wait_edited=True,
+            planned_due=NOW + timedelta(hours=3),
+        )
+        summary = _run(runner)
+        assert summary.generated == 1
+        assert store.message["due_at"] == NOW + timedelta(minutes=30)
+
+    def test_a_spread_out_time_survives_when_no_wait_was_edited(self) -> None:
+        """An overdue follow-up is planned later than its wait implies (spread over
+        the sending windows). Without an edit that planned time must not be undone."""
+        runner, store, model, clock = _build()
+        self._follow_up(
+            store,
+            wait_minutes=60,
+            wait_edited=False,
+            planned_due=NOW + timedelta(hours=2),
+        )
+        clock.advance(hours=1)  # it is now one lead time before the planned time
+        summary = _run(runner)
+        assert summary.generated == 1
+        assert store.message["due_at"] == NOW + timedelta(hours=2)
+
+    def test_a_first_email_is_left_alone(self) -> None:
+        runner, store, model, _ = _build()
+        store.message["anchor_at"] = None
+        store.step_waits = [
+            {
+                "id": uuid.uuid4(),
+                "position": 2,
+                "kind": "WAIT",
+                "wait_duration_minutes": 5000,
+                "updated_at": NOW,
+            }
+        ]
+        summary = _run(runner)
+        assert summary.generated == 1

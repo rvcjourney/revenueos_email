@@ -16,7 +16,7 @@ from app.modules.personalization.email_style import (
     max_words_for_reference,
 )
 from app.modules.personalization.ports import GenerationRequest
-from app.modules.personalization.validator import CODE_GUIDANCE
+from app.modules.personalization.validator import CODE_GUIDANCE, cta_requirements
 
 SYSTEM_PROMPT = """\
 You write one outbound business email for one recipient. You are given a \
@@ -41,7 +41,10 @@ Rules:
 1. Keep the sender's core message: the offer, the value proposition, the call to \
 action, any claims and the voice of the reference email. You personalize; you do \
 not change the strategy. Keep the email within `limits.max_words` words, shorter \
-if the reference is shorter.
+if the reference is shorter. The email is rejected unless it reuses the call to \
+action's own words: include every link in `call_to_action_links`, or at least \
+`call_to_action_use_at_least` of the `call_to_action_key_words`, spelled exactly as \
+listed. Put them in the closing question, in a follow-up too.
 2. Personalize only the hook and, lightly, the value, using ONLY the provided \
 facts. Never invent facts, numbers, prices, statistics, customers, links, names, \
 dates or events.
@@ -102,6 +105,7 @@ def build_data(request: GenerationRequest) -> dict[str, Any]:
             for fact in request.facts
         ],
     }
+    data.update(cta_requirements(str(request.objective.get("cta", ""))))
     if request.previous is not None:
         data["previous_email"] = {
             "subject": request.previous.subject,

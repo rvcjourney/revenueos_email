@@ -30,6 +30,12 @@ from app.modules.mailboxes.schemas import (
     SmtpUpdateRequest,
 )
 from app.modules.mailboxes.service import MailboxService
+from app.modules.rate_limit.policy_service import (
+    MailboxLimitsIn,
+    MailboxLimitsOut,
+    MailboxLimitsService,
+)
+from app.modules.safety.holds_service import SafetyHoldOut, SafetyHoldService
 
 # Router for workspace-scoped mailbox management
 router = APIRouter()
@@ -66,6 +72,52 @@ def update_mailbox(
 ) -> MailboxDetail:
     service = MailboxService(MailboxRepository(db))
     return service.update_mailbox(context.workspace_id, mailbox_id, payload)
+
+
+@router.get("/mailboxes/{mailbox_id}/limits", response_model=MailboxLimitsOut)
+def get_mailbox_limits(
+    mailbox_id: UUID,
+    context: WorkspaceContext = Depends(require_permission("product.read")),
+    db: Session = Depends(get_db),
+) -> MailboxLimitsOut:
+    """The mailbox's sending limit: emails per rolling 24 hours and the minimum gap."""
+    return MailboxLimitsService(db).get(context, mailbox_id)
+
+
+@router.put("/mailboxes/{mailbox_id}/limits", response_model=MailboxLimitsOut)
+def set_mailbox_limits(
+    mailbox_id: UUID,
+    payload: MailboxLimitsIn,
+    context: WorkspaceContext = Depends(require_permission("mailboxes.manage")),
+    db: Session = Depends(get_db),
+) -> MailboxLimitsOut:
+    return MailboxLimitsService(db).set(context, mailbox_id, payload)
+
+
+@router.get(
+    "/mailboxes/{mailbox_id}/safety-holds", response_model=list[SafetyHoldOut]
+)
+def list_mailbox_safety_holds(
+    mailbox_id: UUID,
+    context: WorkspaceContext = Depends(require_permission("product.read")),
+    db: Session = Depends(get_db),
+) -> list[SafetyHoldOut]:
+    """Active safety holds on the mailbox. While any is active it does not send."""
+    return SafetyHoldService(db).list_active(context, mailbox_id)
+
+
+@router.post(
+    "/mailboxes/{mailbox_id}/safety-holds/{hold_id}/release",
+    response_model=SafetyHoldOut,
+)
+def release_mailbox_safety_hold(
+    mailbox_id: UUID,
+    hold_id: UUID,
+    context: WorkspaceContext = Depends(require_permission("mailboxes.manage")),
+    db: Session = Depends(get_db),
+) -> SafetyHoldOut:
+    """Let a held mailbox send again. Recorded in the audit log."""
+    return SafetyHoldService(db).release(context, mailbox_id, hold_id)
 
 
 @router.post(

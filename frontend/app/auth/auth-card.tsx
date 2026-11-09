@@ -27,22 +27,22 @@ export function AuthCard({
 }) {
   return (
     <div className="min-h-screen bg-white lg:grid lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
-      <aside className="relative hidden overflow-hidden bg-brand-900 p-12 text-white lg:flex lg:flex-col">
+      <aside className="relative hidden overflow-hidden bg-ink-900 p-12 text-white lg:flex lg:flex-col">
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute -right-32 -top-32 h-96 w-96 rounded-full bg-brand-600/30 blur-3xl"
+          className="pointer-events-none absolute -right-32 -top-32 h-96 w-96 rounded-full bg-brand-600/40 blur-3xl"
         />
         <Logo tone="light" size="md" className="relative" />
         <div className="relative my-auto max-w-md">
-          <p className="text-4xl font-semibold leading-tight tracking-tight">
+          <p className="text-4xl font-bold leading-tight tracking-tight">
             More conversations.
             <br />
             Bigger opportunities.
           </p>
           <ul className="mt-8 space-y-4">
             {highlights.map(({ icon: HighlightIcon, text }) => (
-              <li key={text} className="flex items-start gap-3 text-sm leading-6 text-brand-100">
-                <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-white/10">
+              <li key={text} className="flex items-start gap-3 text-sm leading-6 text-ink-300">
+                <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white/10 text-brand-300">
                   <HighlightIcon className="h-4 w-4" aria-hidden="true" />
                 </span>
                 {text}
@@ -60,10 +60,10 @@ export function AuthCard({
             width === "sm" ? "max-w-sm" : width === "md" ? "max-w-md" : "max-w-xl",
           )}
         >
-          <div className="grid h-10 w-10 place-items-center rounded-lg bg-brand-50 text-brand-700">
+          <div className="grid h-11 w-11 place-items-center rounded-xl bg-brand-50 text-brand-600">
             <Icon className="h-5 w-5" aria-hidden="true" />
           </div>
-          <h1 className="mt-5 text-2xl font-semibold tracking-tight text-slate-900">
+          <h1 className="mt-5 text-[26px] font-bold leading-8 tracking-tight text-slate-900">
             {title}
           </h1>
           {subtitle ? (

@@ -203,6 +203,8 @@ def compute_approval_digest(
             "subject": step.get("email_subject"),
             "body": step.get("email_body_html"),
             "preheader": step.get("email_preheader") or None,
+            # Only when on (ADR-0021), so every existing approval stays valid.
+            **({"same_thread": True} if step.get("email_same_thread") else {}),
         }
         for step in sorted(steps, key=lambda s: s["position"])
         if step["kind"] == "EMAIL"

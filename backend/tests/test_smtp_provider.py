@@ -5,7 +5,7 @@ import ssl
 
 import pytest
 
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers import smtp as smtp_module
 from app.modules.mailboxes.providers.base import (
     ErrorCategory,
@@ -160,6 +160,10 @@ def test_validate_connection_auth_failure_raises_app_error(
     with pytest.raises(AppError) as exc_info:
         provider.validate_connection(_credential())
     assert exc_info.value.code == "auth_failure"
+    # Must never be 401: the browser signs the user out on any 401, and a wrong
+    # SMTP password is not an invalid platform session.
+    assert exc_info.value.status_code == PROVIDER_AUTH_REJECTED_STATUS
+    assert exc_info.value.status_code != 401
     server.stop()
 
 

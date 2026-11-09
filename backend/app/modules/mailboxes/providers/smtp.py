@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import Settings
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers.base import (
     ClassifiedProviderError,
     ConnectionValidationResult,
@@ -213,7 +213,9 @@ class SmtpProvider(EmailProvider):
         except smtplib.SMTPAuthenticationError as exc:
             classified = self.classify_error(exc)
             raise AppError(
-                "auth_failure", classified.safe_message, status_code=401
+                "auth_failure",
+                classified.safe_message,
+                status_code=PROVIDER_AUTH_REJECTED_STATUS,
             ) from exc
         except (OSError, smtplib.SMTPException) as exc:
             # OSError already covers TimeoutError/socket.timeout (an alias)
@@ -238,6 +240,9 @@ class SmtpProvider(EmailProvider):
         self,
         credential: Mapping[str, Any],
         envelope: OutboundMessageEnvelope,
+        *,
+        # Only Graph uses it (a send-time budget); the others ignore it.
+        authorization_deadline: datetime | None = None,
     ) -> ProviderSendResult:
         validate_header_value("To", envelope.to_address)
         validate_header_value("From", envelope.from_address)
@@ -467,7 +472,7 @@ class SmtpProvider(EmailProvider):
             raise AppError(
                 "auth_failure",
                 "IMAP login failed. Check the IMAP username and password.",
-                status_code=401,
+                status_code=PROVIDER_AUTH_REJECTED_STATUS,
             ) from exc
         except (OSError, ssl.SSLError) as exc:
             raise AppError(

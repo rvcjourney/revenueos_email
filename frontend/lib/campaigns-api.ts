@@ -5,6 +5,8 @@ import type {
   BulkItem,
   CampaignAudience,
   CampaignDetail,
+  CampaignCounts,
+  CampaignSort,
   CampaignType,
   CampaignMailbox,
   CampaignPage,
@@ -12,6 +14,7 @@ import type {
   CampaignReview,
   CampaignSequence,
   CampaignSettings,
+  CampaignSupplement,
   MailboxTestSendResult,
   PreflightResult,
   SequencePreviewRecipients,
@@ -48,6 +51,8 @@ export async function listCampaigns(
     cursor?: string | null;
     q?: string | null;
     status?: string | null;
+    type?: CampaignType | null;
+    sort?: CampaignSort | null;
   } = {},
 ) {
   const path = appendSearch(workspacePath(workspaceId, "/campaigns"), {
@@ -55,8 +60,22 @@ export async function listCampaigns(
     cursor: params.cursor ?? undefined,
     q: params.q ?? undefined,
     status: params.status ?? undefined,
+    type: params.type ?? undefined,
+    sort: params.sort ?? undefined,
   });
   return (await apiRequest<CampaignPage>(path)).data;
+}
+
+// Campaigns per status under the same search and type filter as the list.
+export async function getCampaignCounts(
+  workspaceId: string,
+  params: { q?: string | null; type?: CampaignType | null } = {},
+) {
+  const path = appendSearch(workspacePath(workspaceId, "/campaigns/counts"), {
+    q: params.q ?? undefined,
+    type: params.type ?? undefined,
+  });
+  return (await apiRequest<CampaignCounts>(path)).data;
 }
 
 export async function createCampaign(
@@ -151,6 +170,8 @@ export async function addSequenceStep(
     email_subject?: string | null;
     email_body_html?: string | null;
     email_preheader?: string | null;
+    // EMAIL follow-ups only: reply in the previous email's thread (ADR-0021).
+    email_same_thread?: boolean;
     source_template_version_id?: string | null;
     // EMAIL only: insert a WAIT of this many minutes directly before the new
     // step, in the same transaction.
@@ -174,6 +195,8 @@ export async function updateSequenceStep(
     email_body_html?: string | null;
     // "" clears the pre-header; omit to leave it unchanged.
     email_preheader?: string | null;
+    // Omit to leave it unchanged.
+    email_same_thread?: boolean;
     source_template_version_id?: string | null;
     wait_duration_minutes?: number | null;
   },
@@ -456,6 +479,51 @@ export async function commitAudience(
   return (await apiRequest<CampaignAudience>(path, { method: "POST" })).data;
 }
 
+// --- Adding leads to a paused campaign (ADR-0020) ---
+
+export async function listSupplements(workspaceId: string, campaignId: string) {
+  const path = workspacePath(workspaceId, `/campaigns/${campaignId}/audience/supplements`);
+  return (await apiRequest<CampaignSupplement[]>(path)).data;
+}
+
+export async function selectSupplement(
+  workspaceId: string,
+  campaignId: string,
+  payload: { lead_ids: string[]; list_ids: string[] },
+) {
+  const path = workspacePath(workspaceId, `/campaigns/${campaignId}/audience/supplements`);
+  return (
+    await apiRequest<CampaignSupplement>(path, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    })
+  ).data;
+}
+
+export async function enrollSupplement(
+  workspaceId: string,
+  campaignId: string,
+  audienceId: string,
+) {
+  const path = workspacePath(
+    workspaceId,
+    `/campaigns/${campaignId}/audience/supplements/${audienceId}/enroll`,
+  );
+  return (await apiRequest<CampaignSupplement>(path, { method: "POST" })).data;
+}
+
+export async function retrySupplement(
+  workspaceId: string,
+  campaignId: string,
+  audienceId: string,
+) {
+  const path = workspacePath(
+    workspaceId,
+    `/campaigns/${campaignId}/audience/supplements/${audienceId}/retry`,
+  );
+  return (await apiRequest<CampaignSupplement>(path, { method: "POST" })).data;
+}
+
 export async function abandonAudience(
   workspaceId: string,
   campaignId: string,
@@ -502,7 +570,7 @@ export async function pauseCampaign(
 export async function resumeCampaign(
   workspaceId: string,
   campaignId: string,
-  payload: { expected_version: number },
+  payload: { expected_version: number; include_completed?: boolean },
 ) {
   const path = workspacePath(workspaceId, `/campaigns/${campaignId}/resume`);
   return (

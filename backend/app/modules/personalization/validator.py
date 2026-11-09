@@ -9,9 +9,11 @@ stable failure codes. Pure and I/O free.
 from __future__ import annotations
 
 import html
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from app.modules.personalization.config_schema import PersonalizationConfig
 from app.modules.personalization.email_style import (
@@ -94,7 +96,12 @@ CODE_GUIDANCE: dict[str, str] = {
     ),
     "missing_must_mention": "Include every must_mention phrase from the objective.",
     "never_say_violation": "Do not use any never_say phrase from the objective.",
-    "cta_missing": "Keep the call to action from the objective.",
+    "cta_missing": (
+        "Keep the call to action from the objective: include every link in "
+        "call_to_action_links, or at least call_to_action_use_at_least of the "
+        "call_to_action_key_words, spelled exactly as listed. A follow-up needs "
+        "them too, in its closing question."
+    ),
     "reference_intent_lost": (
         "Stay close to the message, offer and structure of the reference email."
     ),
@@ -121,6 +128,10 @@ class ValidationContext:
     facts: Mapping[str, Fact]
     previous: PreviousEmail | None = None
     require_fact_use: bool = True
+    # A follow-up sent in the same thread (ADR-0021) gets the previous email's
+    # subject: the model's subject is discarded, so it is neither checked nor
+    # counted towards anything else.
+    subject_fixed: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,6 +169,22 @@ def assemble_body_html(
     return "".join(rendered)
 
 
+def cta_requirements(cta: str) -> dict[str, Any]:
+    """What the CTA check below looks for, as prompt data (each link, or at least
+    half of the key words), so the model does not have to guess how a call to
+    action is checked. Shared by reference drafting and per-lead generation."""
+    links = sorted(extract_urls(cta))
+    words = sorted(significant_tokens(cta))
+    if links:
+        return {"call_to_action_links": links}
+    if len(words) >= 2:
+        return {
+            "call_to_action_key_words": words,
+            "call_to_action_use_at_least": math.ceil(len(words) * CTA_OVERLAP_MIN),
+        }
+    return {}
+
+
 def _objective_text(objective: PersonalizationConfig) -> str:
     return "\n".join(
         [
@@ -191,15 +218,16 @@ def validate_generation(
         if code not in codes:
             codes.append(code)
 
-    subject = (output.subject or "").strip()
-    if not subject:
-        flag("empty_subject")
-    if len(subject) > MAX_SUBJECT_CHARS:
-        flag("subject_too_long")
-    if _SUBJECT_CONTROL_RE.search(output.subject or ""):
-        flag("subject_control_chars")
-    if _PLACEHOLDER_MARK_RE.search(subject):
-        flag("subject_placeholder")
+    subject = "" if ctx.subject_fixed else (output.subject or "").strip()
+    if not ctx.subject_fixed:
+        if not subject:
+            flag("empty_subject")
+        if len(subject) > MAX_SUBJECT_CHARS:
+            flag("subject_too_long")
+        if _SUBJECT_CONTROL_RE.search(output.subject or ""):
+            flag("subject_control_chars")
+        if _PLACEHOLDER_MARK_RE.search(subject):
+            flag("subject_placeholder")
 
     paragraphs = tuple(p.strip() for p in output.paragraphs if p and p.strip())
     if not paragraphs:
@@ -310,7 +338,9 @@ def validate_generation(
             >= FOLLOWUP_SIMILARITY_MAX
         ):
             flag("repeats_previous")
-        if _normalize_subject(subject) == _normalize_subject(ctx.previous.subject):
+        if not ctx.subject_fixed and _normalize_subject(subject) == _normalize_subject(
+            ctx.previous.subject
+        ):
             flag("subject_repeated")
         if _FILLER_RE.search(combined):
             flag("filler_followup")

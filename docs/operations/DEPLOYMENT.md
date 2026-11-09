@@ -196,6 +196,65 @@ backend that classifies pixel hits (the code writes its new `message_events` col
 human-like hits count as opens; scanner/prefetch hits are stored as evidence. It deliberately does
 not backfill: opens recorded before it were never classified, so they stop counting in analytics.
 
+**Go-live limits and hold release (migration 0038).** Additive and idempotent; review its header,
+then apply it **before deploying** this version of the backend. It lets managers set a mailbox's
+sending limit and release a safety hold, and it gives every existing mailbox a default limit of
+50 emails per rolling 24 hours, at least 60 seconds apart (new mailboxes get the same from the
+`MAILBOX_DEFAULT_*` settings). Code deployed before it fails safe: a mailbox without a limit never
+sends (messages are deferred with reason `mailbox_limits_missing`). No script here applies it;
+apply it yourself like the others.
+
+**Pause, resume, edits while paused and adding leads (migrations 0040-0046).** All seven are
+additive (0041 is a repair, see below) and prepared only; review each header (it is the migration
+review) and apply them one at a time, **in numeric order**: 0040 (pause bookkeeping columns), 0041
+(owner of the two frozen-sequence guards), 0042 (edits to an activated campaign's emails while
+paused), 0043 (leads added to a paused campaign), 0044 (reference-email edits for a paused
+personalized campaign; needs 0042), 0045 (the scheduler may read planning jobs so it can
+re-dispatch lost ones), 0046 (a paused personalized campaign is edited like a standard one:
+waits, steps after the last reached one; needs 0044). Deploy the **worker** with 0046's code (the
+post-resume task re-times planned personalized follow-ups and the personalization writer follows
+edited waits); the post-resume task is the same one the resume already dispatches, so no new task
+name or queue is involved. Apply them **before** deploying this version of the backend, workers and
+scheduler. Deploy the **worker first** (new tasks), then the API, then the scheduler. Pause itself
+keeps working on a database that has not had 0040 yet (it then skips the bookkeeping columns), so
+the emergency stop never depends on a migration; every other piece of the feature needs its own.
+Details: [ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md).
+
+**Follow-ups in the same thread (migration 0048).** Apply **after 0046 and 0047** and **before**
+deploying the backend, workers and scheduler of this version: the send worker, progression and the
+step editor read `messages.reply_to_message_id` and `sequence_steps.email_same_thread`, so this
+code on a database without 0048 fails every send (the preflight reports `Migration 0048` as FAIL).
+The migration alone changes nothing visible (the switch defaults off). It replaces
+`app_guard_frozen_sequence_steps` like 0046 does, so the same `app_integrity_guard` elevation
+applies. Details: [ADR-0021](../adr/0021-follow-up-same-thread.md).
+
+**Database whose `app_guard_*` functions are owned by `postgres` (production, 2026-10-09).** 0042
+and 0044 assert that the two frozen-sequence guards are owned by `app_integrity_guard` and roll
+back with `0042 postcondition failed: ... is not SECURITY DEFINER owned by app_integrity_guard`
+when they are not. **0041_guard_function_ownership.sql** repairs exactly that (it is
+idempotent and a no-op where the owners are already right). It first proves that `app_integrity_guard` has the privileges the guards need and stops
+with nothing changed if it does not, then changes the owner of only those two functions. After it,
+save one edit of a DRAFT campaign's email step in the app before continuing with 0042. Undo:
+`ALTER FUNCTION public.app_guard_frozen_sequence_steps() OWNER TO postgres;` and the same for
+`app_guard_frozen_step_attachments()`. The other `app_guard_*` functions keep working as
+`postgres` and are left alone on purpose, so the preflight keeps listing them under `Function
+ownership`.
+
+**Is the database really up to date? The preflight now tells you.** The go-live preflight below
+checks, with read-only catalog queries, which of migrations 0021-0048 the database has (`Migration
+NNNN`), that there are no gaps in the chain (`Migration chain`) and that the `app_*` guard and
+erasure functions have the right owner (`Function ownership`). A `FAIL` names the migration and what
+breaks without it. If it reports `Function ownership` problems, the production database was set up
+by something other than the committed chain: do not apply anything on a guess; look at it first
+(read-only):
+
+```sql
+select p.proname, pg_get_userbyid(p.proowner) as owner, p.prosecdef as security_definer
+from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public' and p.proname like 'app\_%'
+order by 1;
+```
+
 Finish with `unset DB`.
 
 ### 5.2 Storage bucket
@@ -243,7 +302,7 @@ https://YOUR_DOMAIN/api/v1/mailboxes/connect/microsoft/callback
 ```
 
 Under **API permissions** the delegated permissions are now `Mail.Send` and **`Mail.ReadWrite`**
-(plus `offline_access`, `openid`, `profile`, `email`). Outlook mailboxes connected before this
+(plus `User.Read`, `offline_access`, `openid`, `profile`, `email`). Outlook mailboxes connected before this
 version must be disconnected and reconnected to grant `Mail.ReadWrite`.
 
 ---
@@ -262,6 +321,7 @@ Only if you connect to a brand-new, empty database should you create one with
 
 ```bash
 openssl rand -hex 24     # → PLATFORM_OPERATOR_KEY
+openssl rand -hex 32     # → UNSUBSCRIBE_SIGNING_KEY (keep it forever; see 6.2)
 ```
 
 Copy values between your computer and the server through a password manager or `scp`, never
@@ -322,6 +382,8 @@ MAILBOX_ENCRYPTION_KEY="THE_64_CHARACTER_VALUE_FROM_6.1"
 MAILBOX_ENCRYPTION_KEY_ID="v1"
 
 # The built-in default is operator@example.com,admin@example.com; always override it.
+# With SENDING_WORKER_ENABLED=true in production the backend refuses to start while it
+# still holds a placeholder (example.com/org/net) address.
 PLATFORM_OPERATOR_EMAILS="you@yourcompany.com"
 PLATFORM_OPERATOR_KEY="THE_48_CHARACTER_VALUE_FROM_6.1"
 
@@ -365,6 +427,22 @@ TRACKING_SIGNING_KEY=""
 # A pixel fetch sooner than this after sending is a delivery-time scanner or
 # prefetch, not a person, and is not counted as an open.
 OPEN_TRACKING_MIN_DELAY_SECONDS=60
+
+# Mandatory unsubscribe (docs/adr/0019). Every campaign email carries a signed one-click
+# unsubscribe link and a List-Unsubscribe header. Campaign email is never sent without
+# both values, a campaign cannot be activated without them, and with
+# SENDING_WORKER_ENABLED=true the backend will not start. UNSUBSCRIBE_BASE_URL is the
+# public address of THIS app (links are {address}/api/v1/unsubscribe/...). Generate the
+# key with openssl rand -hex 32 and NEVER change it: links in emails already sent stop working.
+UNSUBSCRIBE_BASE_URL="https://YOUR_DOMAIN"
+UNSUBSCRIBE_SIGNING_KEY="THE_64_CHARACTER_VALUE_FROM_6.1"
+
+# Sending limits for a newly connected mailbox (editable per mailbox in the app, 1-500 per day).
+# Raise slowly: a new mailbox with no history is judged harshly by Gmail and Outlook.
+MAILBOX_DEFAULT_DAILY_CAP=50
+MAILBOX_DEFAULT_MIN_SPACING_SECONDS=60
+# The scheduler claims no more messages than this are waiting for a send worker.
+SCHEDULER_MAX_OUTSTANDING_CLAIMS=200
 
 # Provider webhooks stay disabled (HTTP 503) until their secret is set. They are
 # also blocked at Caddy; polling works without them.
@@ -569,9 +647,82 @@ In the browser, in order:
 5. Create a small **campaign** using that list and mailbox. The review page must show no blocking
    problems. Do not activate it yet.
 
+### Go-live preflight (read-only)
+
+Before turning sending on, run the preflight. It changes nothing and sends nothing; it prints one
+line per check and exits non-zero if something would stop real campaigns from working.
+
+```bash
+cd ~/outly
+docker compose run --rm backend python -m app.core.preflight
+```
+
+It checks, among others: `SENDING_WORKER_ENABLED` and `SCHEDULER_ENABLED`, the unsubscribe
+settings, `MAILBOX_ENCRYPTION_KEY`, placeholder operator emails, Redis, the rate controller being
+`READY`, that migration 0038 is applied and the database grants the app needs exist, and that every
+connected mailbox has a daily limit. Fix every `FAIL`. A `WARN` is worth reading: for example
+`SEQUENCE_PROGRESSION_ENABLED=false` means **only the first email of each sequence is sent**.
+The database checks need the owner/migration database user (one that bypasses row-level security);
+with any other user they are reported as unverified rather than guessed.
+
+### Pause / resume rehearsal (staging, with your own mailbox)
+
+The automated tests prove the rules against a real PostgreSQL and the screens against a mock; they
+cannot prove a live mailbox. Before using pause/resume on a real campaign, once, with your own
+addresses and a staging copy (or a throwaway campaign of 3-5 of your own addresses):
+
+1. Start the campaign, then **Pause** while at least one email is waiting. Confirm no further
+   email leaves (`docker compose logs -f worker-send`) and that the pause message says how many were
+   already being sent.
+2. While paused: change the sending window, edit the wording of an email that has not been sent,
+   and add one more of your own addresses (Audience, **Add leads**). Resume must be refused until
+   the added lead finishes; use **Retry** if it shows as failed.
+3. **Resume.** Waiting emails go out gradually over your sending windows, not all at once, and the
+   edited wording is what arrives. Check one real email's body and its unsubscribe footer.
+4. Repeat Pause and Resume twice quickly: the second click must change nothing (no duplicate email,
+   no second "resumed" in the audit trail).
+5. Optional: let one of your addresses finish the sequence, pause, add an email to the end, and
+   resume **with** "also send the new emails to leads who already finished the sequence" ticked. That
+   address (and only that one, if it has not replied or unsubscribed) receives exactly one new email.
+6. Browser checks of the screens against the mock backend: `cd frontend && npm run e2e` (needs the
+   Playwright browser download, or `PLAYWRIGHT_CHROME_PATH` pointing at an installed Chrome). Nothing
+   there touches a database or sends email.
+
+### Rehearsal before real leads
+
+The preflight proves the configuration. These steps prove the live providers, and nothing here can
+be automated. Do them with **your own addresses** and a low limit (the default 50/day is fine):
+
+1. Optionally set the workspace **postal address** and footer message (Dashboard, Email footer).
+   Neither is required to activate a campaign; the unsubscribe link is always added.
+2. Send a controlled test from each connected mailbox (Gmail, Outlook, SMTP) to an inbox you own
+   and check that it arrives. The controlled test is a plain delivery check and has no footer.
+3. Activate a campaign of 3-5 of your own addresses and open one of its emails. The footer must
+   show an unsubscribe link (and your postal address, if you set one), and the plain-text view must be the real
+   message (not "requires an HTML-capable email client"). In Gmail, **Show original** should list
+   `List-Unsubscribe` and `List-Unsubscribe-Post`. Outlook (Microsoft Graph) mailboxes carry the
+   footer link only, not the header.
+4. Watch `docker compose logs -f worker-send`: emails go out one at a time, at least the mailbox
+   spacing apart.
+5. Click the unsubscribe link in one of those emails and confirm on the page. The address must
+   then appear in Suppression, and no further email may be sent to it.
+6. Add one deliberately nonexistent address in a second small campaign. After a few minutes the
+   delivery-failure notice must show up as a bounce (Dashboard, Deliverability). Bounces are only
+   detected on mailboxes with reply detection enabled.
+7. Reply to one of your test emails. Within a few minutes it must appear in **Inbox** and that
+   lead's follow-ups must stop.
+8. Open the mailbox page: **Sending limits** shows the limit, and no hold is active.
+
+Automatic protection: if a mailbox's bounce rate over the last 7 days goes above 5% (with at least
+20 emails sent) it is **held**. It stops sending until a manager releases the hold on its page,
+after looking at why the list bounced. Reply sync places the hold, every few minutes. Spam
+complaints are not measured (no provider feedback loop is wired), so a complaint rate is not acted
+on.
+
 ### Enable real sending
 
-Only after steps 1–5 work. From here emails are **really sent** from connected mailboxes.
+Only after steps 1-5 above work, the preflight has no `FAIL`, and the rehearsal is done. From here
+emails are **really sent** from connected mailboxes.
 
 ```bash
 cd ~/outly

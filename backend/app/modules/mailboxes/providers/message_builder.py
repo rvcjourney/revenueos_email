@@ -69,6 +69,11 @@ def build_rfc5322_message(envelope: OutboundMessageEnvelope) -> EmailMessage:
         rfc_id = envelope.rfc_message_id.strip("<>")
         msg["Message-ID"] = f"<{rfc_id}>"
 
+    for name, value in envelope.extra_headers:
+        validate_header_value(name, name)
+        validate_header_value(name, value)
+        msg[name] = value
+
     if envelope.body_html:
         msg.set_content(
             envelope.body_text or "This message requires an HTML-capable email client."

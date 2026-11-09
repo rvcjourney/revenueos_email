@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
+from app.modules.rate_limit.policy_service import insert_default_mailbox_limit
 from app.modules.suppression.checks import is_address_suppressed
 
 
@@ -179,6 +180,20 @@ class MailboxRepository:
             .one()
         )
         return dict(row)
+
+    def ensure_default_sending_limit(
+        self, *, workspace_id: UUID, mailbox_id: UUID
+    ) -> None:
+        """Give a newly connected mailbox its default sending limit (idempotent).
+
+        Runs as the role that just created the mailbox, in the same transaction,
+        so a mailbox never exists without a limit. The send path refuses to send
+        for a mailbox that has none.
+        """
+        _safe_set_role(self.session, "app_connection")
+        insert_default_mailbox_limit(
+            self.session, workspace_id=workspace_id, mailbox_id=mailbox_id
+        )
 
     def update_mailbox_metadata(
         self,

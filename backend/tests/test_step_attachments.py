@@ -33,8 +33,11 @@ from app.modules.campaigns.attachments import (
 )
 from app.modules.campaigns.message_rendering import compute_sequence_content_digest
 from app.modules.imports.storage import (
+    StorageBucketMissingError,
+    StorageError,
     StorageObjectMissingError,
     StorageUnavailableError,
+    SupabaseStorageClient,
 )
 from app.modules.mailboxes.providers.base import (
     EnvelopeAttachment,
@@ -405,6 +408,41 @@ class TestUploadService:
             self._upload(service)
         assert exc.value.status_code == 503
         repo.insert_attachment.assert_not_called()
+
+    def test_missing_bucket_says_so_and_is_logged(self, caplog) -> None:
+        service, storage, repo = _service()
+        storage.fail_upload = StorageBucketMissingError(
+            "bucket not found (secret-detail)"
+        )
+        with caplog.at_level("WARNING"):
+            with pytest.raises(AppError) as exc:
+                self._upload(service)
+        assert exc.value.code == "attachment_storage_not_configured"
+        assert "secret-detail" not in exc.value.message
+        assert "secret-detail" in caplog.text
+        repo.insert_attachment.assert_not_called()
+
+    def test_supabase_bucket_not_found_response_is_classified(self) -> None:
+        # Supabase answers an upload to a missing bucket with HTTP 400, not 404.
+        response = httpx.Response(
+            400,
+            json={
+                "statusCode": "404",
+                "error": "Bucket not found",
+                "message": "Bucket not found",
+            },
+        )
+        with pytest.raises(StorageBucketMissingError):
+            SupabaseStorageClient(MagicMock(), bucket="x")._raise_for_status(
+                response, action="upload"
+            )
+
+    def test_other_storage_rejection_keeps_the_body_for_the_log(self) -> None:
+        response = httpx.Response(400, text="mime type image/png is not supported")
+        with pytest.raises(StorageError, match="mime type image/png"):
+            SupabaseStorageClient(MagicMock(), bucket="x")._raise_for_status(
+                response, action="upload"
+            )
 
     def test_invalid_disposition_is_rejected(self) -> None:
         service, _, _ = _service()

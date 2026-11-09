@@ -1,0 +1,4 @@
+# Playwright browser checks (frontend/e2e)
+/e2e/screenshots/
+/e2e/test-results/
+/playwright-report/

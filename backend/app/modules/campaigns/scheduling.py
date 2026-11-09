@@ -112,3 +112,79 @@ def project_into_window(
         "No eligible sending window found within the configured bound",
         status_code=500,
     )
+
+
+# How far ahead the window calendar will look for the Nth window. A campaign this
+# long cannot be planned day by day anyway; later messages share the last window
+# and the send-time limiter paces them.
+_CALENDAR_HORIZON_DAYS = 3650
+
+
+class WindowCalendar:
+    """A campaign's sending windows in order, counted from its start.
+
+    Window 0 is the first window still open at `lower_bound_utc` (clipped to
+    start there when the campaign starts mid-window); each following window is the
+    next allowed weekday's local window. It uses the same weekday, timezone and DST
+    rules as `project_into_window`, so a time picked inside a window here is one
+    that function accepts unchanged.
+
+    Windows are found lazily and remembered, so planning thousands of messages
+    over one calendar costs a single scan, not one per message.
+    """
+
+    def __init__(
+        self,
+        lower_bound_utc: datetime,
+        *,
+        timezone: str,
+        weekday_set: int,
+        window_start_local: time,
+        window_end_local: time,
+    ) -> None:
+        self._lower = lower_bound_utc
+        self._tz = ZoneInfo(timezone)
+        self._weekday_set = weekday_set
+        self._start_local = window_start_local
+        self._end_local = window_end_local
+        self._next_date: date = lower_bound_utc.astimezone(self._tz).date()
+        self._last_date = self._next_date + timedelta(days=_CALENDAR_HORIZON_DAYS)
+        self._windows: list[tuple[datetime, datetime]] = []
+
+    def _find_next(self) -> bool:
+        while self._next_date <= self._last_date:
+            local_date = self._next_date
+            self._next_date += timedelta(days=1)
+            if not (self._weekday_set >> local_date.weekday()) & 1:
+                continue
+            start_utc = _resolve_local_to_utc(
+                datetime.combine(local_date, self._start_local),
+                self._tz,
+                prefer_later=True,
+            )
+            end_utc = _resolve_local_to_utc(
+                datetime.combine(local_date, self._end_local),
+                self._tz,
+                prefer_later=False,
+            )
+            if end_utc <= start_utc or end_utc <= self._lower:
+                continue
+            self._windows.append((max(start_utc, self._lower), end_utc))
+            return True
+        return False
+
+    def window(self, index: int) -> tuple[datetime, datetime]:
+        """The `index`th (0-based) window as (start, end) in UTC.
+
+        Past the horizon this returns the last window found rather than failing.
+        """
+        while len(self._windows) <= index:
+            if not self._find_next():
+                break
+        if not self._windows:
+            raise AppError(
+                "internal_error",
+                "No eligible sending window found within the configured bound",
+                status_code=500,
+            )
+        return self._windows[min(index, len(self._windows) - 1)]

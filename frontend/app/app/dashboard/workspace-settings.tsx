@@ -17,6 +17,8 @@ import { canDeleteWorkspace } from "@/lib/permissions";
 import { useWorkspace } from "@/lib/workspace-context";
 import { getWorkspace, updateWorkspace } from "@/lib/workspaces-api";
 
+import { EmailFooterSettings } from "./email-footer-settings";
+
 const schema = z.object({ name: z.string().min(1, "Required").max(200) });
 type FormValues = z.infer<typeof schema>;
 
@@ -120,6 +122,7 @@ export function WorkspaceSettings() {
         )}
       </div>
     </section>
+    <EmailFooterSettings workspace={workspace} canManage={canManage} />
     {canDeleteWorkspace(activeWorkspace?.role_code) ? (
       <Link
         href="/app/settings/danger"

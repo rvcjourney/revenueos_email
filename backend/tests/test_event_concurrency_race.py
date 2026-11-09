@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.support.rate_policies import mailbox_daily_cap
 from app.core.config import Settings
 from app.modules.events.processor import InboundEventProcessor
 from app.modules.mailboxes.providers.base import ProviderSendResult
@@ -100,7 +101,9 @@ def _make_service(ctx: LoadedSendContext) -> SendingService:
     service.rate_limiter = MagicMock()
 
     service.repository.load_message_for_send.return_value = ctx
-    service.rate_policy_repository.resolve_applicable_policies.return_value = []
+    service.rate_policy_repository.resolve_applicable_policies.return_value = [
+        mailbox_daily_cap()
+    ]
     service.rate_limiter.current_generation.return_value = 1
     reservation = RateReservation(
         reservation_id="r1",

@@ -6,6 +6,8 @@ Activation freezes audience/content. Captures persist their list/manual selectio
 
 These decisions supersede corresponding proposals/Open Decisions below. Other release-policy decisions remain open.
 
+**Amended by [ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md) (PAUSED state only):** while a campaign is PAUSED, a user with `campaigns.execute` may change schedule/limits, unsent email content and waits (standard campaigns), step structure after the frontier, and may add leads through a supplement audience. Waits keep elapsing during a pause; resume bumps `schedule_generation`, and a reconcile pass re-validates and re-times unsent messages. All other states keep the immutability above.
+
 ## Purpose, ownership and scope
 
 The backend campaigns module orchestrates authorized intent into recipient progress and durable message work. It implements the Email/Wait MVP in [MVP §§19–22](../product/MVP.md), existing [UF-13–UF-30 flows](../product/USER_FLOWS.md), and [SYSTEM_ARCHITECTURE §§31–35, 118–120](SYSTEM_ARCHITECTURE.md). See [DOMAIN_MODEL](DOMAIN_MODEL.md) for the source-file discrepancy and design status.
@@ -59,7 +61,7 @@ Campaign status controls global execution; enrollment controls one recipient's s
 | Enrollment state | Entry and allowed progress | Terminal behavior |
 |---|---|---|
 | ACTIVE | Created once; progress points to next email or current intent; optional hold reason for pause/mailbox/uncertainty. | Nonterminal, even when no work can run now. |
-| COMPLETED | Last email accepted, progression committed. | No additional sequence message. Late reply/suppression adds outcome facts without reopening. |
+| COMPLETED | Last email accepted, progression committed. | No additional sequence message. Late reply/suppression adds outcome facts without reopening. The only way back to ACTIVE is the **opt-in reopen at resume** (below): guarded `state = COMPLETED`, clean leads only, standard campaigns, bound to the resume's generation ([ADR-0020](../adr/0020-pause-resume-paused-edits-and-late-enrollment.md)). |
 | STOPPED | Recognized reply, suppression, unsubscribe, complaint, archive or explicit permitted removal. Persist all observed reasons; safety facts are not overwritten. | Cancel/skip not-yet-authorized intent, retain sent/unknown attempts. Never auto-reactivate. |
 | FAILED | Permanent execution failure or exhausted safe retry policy before sequence finished. | No next step. Explicit new campaign needed for a new outreach intent. |
 
@@ -67,9 +69,9 @@ Allowed state changes are ACTIVE to any terminal state; terminal to terminal cha
 
 ## Pause, resume, edits and completion
 
-Use [CAMPAIGN_STATE_MACHINE](CAMPAIGN_STATE_MACHINE.md) for exact commands. Pause commits the global gate and invalidates future dispatch authorization; existing SENDING attempts retain their outcome. UI reports outstanding authorized attempts, because an external request cannot be recalled. Resume revalidates configuration, requires useful healthy sender capacity, increments schedule generation, and recalculates overdue work without catching up in a burst.
+Use [CAMPAIGN_STATE_MACHINE](CAMPAIGN_STATE_MACHINE.md) for exact commands. Pause commits the global gate and invalidates future dispatch authorization; existing SENDING attempts retain their outcome. UI reports outstanding authorized attempts, because an external request cannot be recalled. Resume revalidates configuration, requires useful healthy sender capacity, increments schedule generation, and recalculates overdue work without catching up in a burst: unsent messages are re-timed by the reconcile pass and overdue follow-ups are placed by the progression sweep in the next free slot of their own mailbox (daily cap, spacing and already-planned load respected), never earlier than `accepted_at + wait`.
 
-Recommended activated edit policy: metadata may change; content/audience remain immutable; PAUSED campaigns may change windows or reduce limits with versioned settings. Raising limits still obeys platform/provider policy. Invalidate old queue generations and recompute only unsent intents. Never move an anchor earlier than its sequence wait; never rewrite historical due times or attempts. Completed/archived campaigns are duplicated into fresh drafts to send anew. Product approval is required for this policy; it is not silently imported from the broad context's “Edit” action.
+Recommended activated edit policy: metadata may change; content/audience remain immutable; PAUSED campaigns may change windows or limits with versioned settings (approved in ADR-0020), edit the wording of unsent emails and add leads; a personalized campaign follows the same rules (emails already written keep their text; its setup and attachments stay frozen). Raising limits still obeys platform/provider policy. Invalidate old queue generations and recompute only unsent intents. Never move an anchor earlier than its sequence wait; never rewrite historical due times or attempts. Completed/archived campaigns are duplicated into fresh drafts to send anew. Product approval is required for this policy; it is not silently imported from the broad context's “Edit” action.
 
 Completion requires planning READY, every enrollment terminal, and no SENDING/UNKNOWN_OUTCOME message or unfinished progression transaction. A future SCHEDULED or RETRY_SCHEDULED message, mailbox hold or unresolved attempt prevents completion. Lock campaign and check completion after recipient updates; a periodic sweep repairs a missed completion check. Once COMPLETED, late replies/bounces still update inbox/safety/analytics, but do not reopen execution. PAUSED campaigns wait for resume or archive; do not surprise users with an automatic completion transition.
 
@@ -84,7 +86,7 @@ Transaction units: activation + outbox; enrollment chunk + cursor; rendered mess
 | Failure | Required recovery |
 |---|---|
 | Planner process crash / duplicate task | Resume committed manifest cursor, unique enrollment/message keys prevent duplication. |
-| Lost task / Redis restart / publish failure | Outbox relay plus durable job sweep republishes; worker rechecks state. |
+| Lost task / Redis restart / publish failure | Outbox relay plus durable job sweep republishes; worker rechecks state. Planning jobs (enroll/render) are covered by the scheduler's planning-job sweep (PENDING for over a minute, or PROCESSING with an expired lease; RENDER only after its ENROLL is READY) and by an explicit retry of a FAILED job; resume is refused while a job is FAILED. A lost post-resume reconcile or reopen dispatch fails closed (nothing sends / nothing reopens); the reconcile is re-dispatched by the stale-generation sweep. |
 | Database temporary failure | Roll back chunk/command, do not send; replay original command identity. |
 | Provider timeout / send worker crash | Hold affected enrollment until attempt reconciliation; never plan a follow-up from uncertain acceptance. |
 | Provider outage | Backoff/cooldown mailbox/provider; retain ACTIVE holds and alert. |

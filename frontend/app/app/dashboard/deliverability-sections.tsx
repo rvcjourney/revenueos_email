@@ -76,6 +76,14 @@ function WarningCard({ warning }: { warning: DeliverabilityWarning }) {
             </span>
           </div>
           <p className="text-xs leading-relaxed">{warning.message}</p>
+          {warning.code === "MAILBOX_SAFETY_HOLD" && warning.mailbox_id ? (
+            <Link
+              href={`/app/mailboxes/${warning.mailbox_id}`}
+              className="inline-flex items-center gap-1 text-xs font-semibold underline underline-offset-2"
+            >
+              See why and release <ArrowRight className="h-3 w-3" />
+            </Link>
+          ) : null}
           {warning.threshold !== undefined && warning.metric_value !== undefined && (
             <p className="text-[11px] font-medium opacity-80">
               Observed: {warning.metric_value}% | Redline Threshold: {warning.threshold}%

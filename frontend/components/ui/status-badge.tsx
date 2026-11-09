@@ -15,12 +15,12 @@ import type { CampaignStatus } from "@/types/domain";
 export type Tone = "neutral" | "brand" | "success" | "warning" | "danger" | "muted";
 
 const toneClasses: Record<Tone, string> = {
-  neutral: "bg-slate-100 text-slate-700 ring-slate-500/15",
-  brand: "bg-brand-50 text-brand-700 ring-brand-600/20",
-  success: "bg-emerald-50 text-emerald-700 ring-emerald-600/20",
-  warning: "bg-amber-50 text-amber-800 ring-amber-600/25",
-  danger: "bg-red-50 text-red-700 ring-red-600/20",
-  muted: "bg-slate-50 text-slate-500 ring-slate-400/20",
+  neutral: "bg-slate-100 text-slate-600",
+  brand: "bg-brand-50 text-brand-700",
+  success: "bg-emerald-50 text-emerald-700",
+  warning: "bg-amber-50 text-amber-700",
+  danger: "bg-red-50 text-red-700",
+  muted: "bg-slate-100 text-slate-500",
 };
 
 // Generic pill. Always carries text (and usually an icon) so status is never
@@ -39,7 +39,7 @@ export function StatusBadge({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset [&>svg]:h-3 [&>svg]:w-3 [&>svg]:shrink-0",
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11px] font-semibold tracking-wide [&>svg]:h-3 [&>svg]:w-3 [&>svg]:shrink-0",
         toneClasses[tone],
         className,
       )}
@@ -50,17 +50,16 @@ export function StatusBadge({
   );
 }
 
-type CampaignStatusMeta = { tone: Tone; icon: React.ReactNode; accent: string };
+type CampaignStatusMeta = { tone: Tone; icon: React.ReactNode };
 
-// `accent` is the restrained top-edge color used on campaign cards.
 export const campaignStatusMeta: Record<CampaignStatus, CampaignStatusMeta> = {
-  DRAFT: { tone: "neutral", icon: <PencilLine aria-hidden="true" />, accent: "bg-slate-300" },
-  SCHEDULED: { tone: "brand", icon: <Clock aria-hidden="true" />, accent: "bg-brand-500" },
-  RUNNING: { tone: "success", icon: <Play aria-hidden="true" />, accent: "bg-emerald-500" },
-  PAUSED: { tone: "warning", icon: <Pause aria-hidden="true" />, accent: "bg-amber-400" },
-  ERROR: { tone: "danger", icon: <AlertCircle aria-hidden="true" />, accent: "bg-red-500" },
-  COMPLETED: { tone: "brand", icon: <CheckCircle2 aria-hidden="true" />, accent: "bg-brand-400" },
-  ARCHIVED: { tone: "muted", icon: <Archive aria-hidden="true" />, accent: "bg-slate-200" },
+  DRAFT: { tone: "neutral", icon: <PencilLine aria-hidden="true" /> },
+  SCHEDULED: { tone: "brand", icon: <Clock aria-hidden="true" /> },
+  RUNNING: { tone: "success", icon: <Play aria-hidden="true" /> },
+  PAUSED: { tone: "warning", icon: <Pause aria-hidden="true" /> },
+  ERROR: { tone: "danger", icon: <AlertCircle aria-hidden="true" /> },
+  COMPLETED: { tone: "brand", icon: <CheckCircle2 aria-hidden="true" /> },
+  ARCHIVED: { tone: "muted", icon: <Archive aria-hidden="true" /> },
 };
 
 // Renders the raw status code as text.

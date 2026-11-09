@@ -115,6 +115,39 @@ describe("NewImportPageClient", () => {
     expect(push).toHaveBeenCalledWith("/app/leads/imports/import-1");
   });
 
+  it("creates the target list when the import starts, once, and hides the list picker", async () => {
+    arrange();
+    const createTargetList = vi.fn().mockResolvedValue("new-list-1");
+    createImport.mockRejectedValueOnce(new Error("boom")).mockResolvedValue({ id: "import-1" });
+    const user = userEvent.setup();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <NewImportPageClient createTargetList={createTargetList} onImported={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.queryByLabelText(/add to list/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Suppressions")).not.toBeInTheDocument();
+    await uploadCsv(user);
+    expect(createTargetList).not.toHaveBeenCalled(); // cancelling here leaves nothing behind
+
+    await user.click(screen.getByRole("button", { name: /continue to confirm/i }));
+    await user.click(await screen.findByRole("button", { name: /start import/i }));
+    await waitFor(() => expect(createImport).toHaveBeenCalledTimes(1));
+    // A failed start is retried without creating a second list.
+    await user.click(await screen.findByRole("button", { name: /start import/i }));
+    await waitFor(() => expect(createImport).toHaveBeenCalledTimes(2));
+
+    expect(createTargetList).toHaveBeenCalledTimes(1);
+    expect(createImport).toHaveBeenLastCalledWith(
+      "ws-1",
+      expect.objectContaining({ import_kind: "LEADS", list_id: "new-list-1" }),
+    );
+  });
+
   it("refuses to map two columns onto the same field", async () => {
     arrange();
     const user = userEvent.setup();

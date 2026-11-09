@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,20 @@ def _safe_set_workspace(session: Session, workspace_id: UUID | None) -> None:
             )
         else:
             session.execute(text("SELECT set_config('app.workspace_id', '', true)"))
+
+
+def _mailbox_can_send(mailbox: Any) -> bool:
+    """The mailbox half of the send gates, evaluated at claim time so a claim is
+    not wasted on a message the send worker is certain to refuse (sending/gates.py
+    check_mailbox_state and check_safety_holds; blocked_until is handled separately
+    because it needs the authoritative clock)."""
+    return (
+        mailbox["connection_state"] == "CONNECTED"
+        and mailbox["policy_state"] == "ENABLED"
+        and mailbox["health_state"] != "DEGRADED"
+        and mailbox["circuit_state"] != "OPEN"
+        and int(mailbox["pending_safety_count"] or 0) == 0
+    )
 
 
 class SchedulerRepository:
@@ -76,6 +91,175 @@ class SchedulerRepository:
         ).all()
         return [(UUID(str(ws)), UUID(str(cid))) for ws, cid in rows]
 
+    def find_stuck_planning_jobs(
+        self, *, limit: int
+    ) -> list[tuple[UUID, UUID, UUID, UUID | None, str]]:
+        """(workspace, campaign, activation, supplement audience or None, phase) of
+        ENROLL/RENDER jobs nobody is working on: PENDING that was never picked up
+        (publish lost) or PROCESSING with an expired lease (task or its retry message
+        lost). A minute of grace keeps this off jobs whose task is simply in flight.
+        RENDER is only offered once its ENROLL is READY: it renders every PLANNED
+        message of the campaign, so running it early would strand the rest. Read-only;
+        the recovery is a worker task (migration 0045 grants SELECT only)."""
+        _safe_set_role(self.session, "app_scheduler")
+        _safe_set_workspace(self.session, None)
+        rows = self.session.execute(
+            text(
+                """
+                SELECT j.workspace_id, j.campaign_id, j.activation_id,
+                       j.audience_id, j.phase
+                FROM campaign_planning_jobs j
+                JOIN campaigns c ON c.workspace_id = j.workspace_id
+                                AND c.id = j.campaign_id
+                WHERE j.phase IN ('ENROLL', 'RENDER')
+                  AND j.state IN ('PENDING', 'PROCESSING')
+                  AND j.next_due_at
+                      <= pg_catalog.transaction_timestamp() - interval '1 minute'
+                  AND (j.lease_expires_at IS NULL
+                       OR j.lease_expires_at < pg_catalog.transaction_timestamp())
+                  AND c.status <> 'ARCHIVED'
+                  AND c.activation_id = j.activation_id
+                  AND (
+                      j.phase = 'ENROLL'
+                      OR EXISTS (
+                          SELECT 1 FROM campaign_planning_jobs e
+                          WHERE e.workspace_id = j.workspace_id
+                            AND e.campaign_id = j.campaign_id
+                            AND e.activation_id = j.activation_id
+                            AND e.audience_id IS NOT DISTINCT FROM j.audience_id
+                            AND e.phase = 'ENROLL' AND e.state = 'READY'
+                      )
+                  )
+                ORDER BY j.next_due_at, j.id
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).all()
+        return [
+            (
+                UUID(str(ws)),
+                UUID(str(cid)),
+                UUID(str(act)),
+                UUID(str(aud)) if aud else None,
+                str(phase),
+            )
+            for ws, cid, act, aud, phase in rows
+        ]
+
+    def find_due_scheduled_campaigns(self, *, limit: int) -> list[tuple[UUID, UUID]]:
+        """(workspace_id, campaign_id) of SCHEDULED campaigns whose start time has
+        arrived by the database clock, oldest first. Uses campaigns_status_start_idx
+        (status, start_at, id), which exists for exactly this scan."""
+        _safe_set_role(self.session, "app_scheduler")
+        _safe_set_workspace(self.session, None)
+        rows = self.session.execute(
+            text(
+                """
+                SELECT workspace_id, id FROM campaigns
+                WHERE status = 'SCHEDULED'
+                  AND start_at <= pg_catalog.transaction_timestamp()
+                ORDER BY start_at, id
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).all()
+        return [(UUID(str(ws)), UUID(str(cid))) for ws, cid in rows]
+
+    def start_due_campaign(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> int | None:
+        """SCHEDULED -> RUNNING (CAMPAIGN_STATE_MACHINE "Due start"). Returns the
+        campaign's schedule_generation when it started, None when it did not.
+
+        The guard is the WHERE clause, evaluated under the row lock the UPDATE takes:
+        a pause (or archive) that committed first leaves the campaign PAUSED, so this
+        matches nothing -- a stale due-start can never resume a paused campaign, and
+        two schedulers racing start it once. Planning need not be READY: sends are
+        gated on that separately. The generation is deliberately not bumped."""
+        _safe_set_role(self.session, "app_scheduler")
+        _safe_set_workspace(self.session, workspace_id)
+        row = self.session.execute(
+            text(
+                """
+                UPDATE campaigns
+                SET status = 'RUNNING'
+                WHERE workspace_id = :ws AND id = :cid
+                  AND status = 'SCHEDULED'
+                  AND start_at <= pg_catalog.transaction_timestamp()
+                RETURNING schedule_generation
+                """
+            ),
+            {"ws": str(workspace_id), "cid": str(campaign_id)},
+        ).first()
+        if row is None:
+            return None
+        self.session.execute(
+            text(
+                """
+                INSERT INTO public.audit_events (
+                    id, workspace_id, actor_kind, actor_id, action, target_type,
+                    target_id, before_state, after_state, reason
+                ) VALUES (
+                    :id, :ws, 'SYSTEM', NULL, 'campaign.start', 'campaign', :cid,
+                    CAST(:before AS jsonb), CAST(:after AS jsonb), :reason
+                )
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "ws": str(workspace_id),
+                "cid": str(campaign_id),
+                "before": json.dumps({"status": "SCHEDULED"}),
+                "after": json.dumps({"status": "RUNNING"}),
+                "reason": "scheduled start time reached",
+            },
+        )
+        return int(row[0])
+
+    def find_campaigns_with_stale_generation(
+        self, *, after_id: UUID | None, limit: int
+    ) -> list[tuple[UUID, UUID, int]]:
+        """(workspace_id, campaign_id, schedule_generation) of RUNNING campaigns
+        that still hold unsent messages stamped with an older generation, i.e.
+        a resume whose reconcile pass did not finish (ADR-0020). Only campaigns
+        changed (resumed, started) in the last two days are looked at: a lost
+        reconcile is noticed long before that, and without the bound every large
+        resumed campaign would be scanned every minute for ever (the probe walks
+        the campaign's messages through messages_workspace_campaign_idx).
+        Read-only cross-tenant discovery through the existing scheduler SELECT
+        policies; the reconcile itself is workspace-scoped."""
+        _safe_set_role(self.session, "app_scheduler")
+        _safe_set_workspace(self.session, None)
+        rows = self.session.execute(
+            text(
+                """
+                SELECT c.workspace_id, c.id, c.schedule_generation
+                FROM campaigns c
+                WHERE c.status = 'RUNNING'
+                  AND c.planning_status = 'READY'
+                  AND c.schedule_generation > 1
+                  AND c.updated_at >= pg_catalog.transaction_timestamp()
+                                      - interval '2 days'
+                  AND (CAST(:after_id AS uuid) IS NULL
+                       OR c.id > CAST(:after_id AS uuid))
+                  AND EXISTS (
+                      SELECT 1 FROM messages m
+                      WHERE m.workspace_id = c.workspace_id
+                        AND m.campaign_id = c.id
+                        AND m.purpose = 'CAMPAIGN'
+                        AND m.status IN ('SCHEDULED', 'RETRY_SCHEDULED')
+                        AND m.schedule_generation < c.schedule_generation
+                  )
+                ORDER BY c.id
+                LIMIT :limit
+                """
+            ),
+            {"after_id": str(after_id) if after_id else None, "limit": limit},
+        ).all()
+        return [(UUID(str(ws)), UUID(str(cid)), int(gen)) for ws, cid, gen in rows]
+
     def find_campaigns_with_due_generation(
         self, *, after_id: UUID | None, limit: int
     ) -> list[tuple[UUID, UUID]]:
@@ -114,6 +298,17 @@ class SchedulerRepository:
         ).all()
         return [(UUID(str(ws)), UUID(str(cid))) for ws, cid in rows]
 
+    def count_outstanding_claims(self) -> int:
+        """Messages the scheduler has claimed that no send worker has finished
+        with yet (status QUEUED), across all workspaces. Uses
+        messages_claim_expiry_idx."""
+        _safe_set_role(self.session, "app_scheduler")
+        _safe_set_workspace(self.session, None)
+        count = self.session.execute(
+            text("SELECT count(*) FROM messages WHERE status = 'QUEUED'")
+        ).scalar()
+        return int(count or 0)
+
     def find_due_messages(
         self,
         *,
@@ -148,6 +343,16 @@ class SchedulerRepository:
               ON csa.workspace_id = m.workspace_id AND csa.id = m.controlled_send_authorization_id
             WHERE m.status IN ('SCHEDULED', 'RETRY_SCHEDULED')
               AND m.due_at <= {now_expr}
+              -- A mailbox that cannot send is not worth a claim: the send worker
+              -- would refuse the message and it would sit QUEUED for the whole claim
+              -- lease, using up claim slots that healthy mailboxes need. Same rules
+              -- as sending/gates.py check_mailbox_state + check_safety_holds; a
+              -- missing mailbox row fails closed (NULL comparisons are not true).
+              AND mb.connection_state = 'CONNECTED'
+              AND mb.policy_state = 'ENABLED'
+              AND mb.health_state <> 'DEGRADED'
+              AND mb.circuit_state <> 'OPEN'
+              AND mb.pending_safety_count = 0
               AND (
                   (
                       m.purpose = 'CAMPAIGN'
@@ -291,7 +496,8 @@ class SchedulerRepository:
 
         # Mailbox gate (read-only check under message lock)
         mb_query = f"""
-            SELECT id, blocked_until, connection_state
+            SELECT id, blocked_until, connection_state, policy_state, health_state,
+                   circuit_state, pending_safety_count
             FROM mailboxes
             WHERE workspace_id = :ws AND id = :mb_id
         """
@@ -303,6 +509,14 @@ class SchedulerRepository:
             .mappings()
             .first()
         )
+        if mb_row is not None and not _mailbox_can_send(mb_row):
+            return ClaimResult(
+                message_id=message_id,
+                workspace_id=workspace_id,
+                dispatch_generation=msg_row["dispatch_generation"],
+                claimed=False,
+                reason="Mailbox cannot send right now (state, health or hold)",
+            )
         if mb_row and mb_row["blocked_until"] is not None:
             # Check blocked_until against authoritative now
             now_dt = authoritative_now or datetime.now(timezone.utc)

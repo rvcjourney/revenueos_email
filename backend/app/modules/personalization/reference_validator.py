@@ -68,6 +68,8 @@ class ContextEmail:
     position: int
     subject: str
     body_text: str
+    # Sent in the same thread (ADR-0021): its subject is not used, so not compared.
+    threaded: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,9 @@ class DraftContext:
     expected_positions: tuple[int, ...]
     allowed_variables: frozenset[str]
     context_emails: tuple[ContextEmail, ...] = ()
+    # Positions being drafted that are sent in the same thread: the subject the
+    # model writes for them is ignored (ADR-0021 D6).
+    threaded_positions: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -181,10 +186,11 @@ def validate_draft(output: SequenceDraftOutput, ctx: DraftContext) -> DraftValid
     # Rendered the same way as the draft under test: stored emails still carry their
     # {{variable|fallback}} placeholders, and comparing raw against rendered text
     # would never match.
-    others = [
+    # A same-thread email's subject is None here: it never matches another.
+    others: list[tuple[int, str | None, set[tuple[str, ...]]]] = [
         (
             e.position,
-            normalize_subject(_render_placeholders(e.subject)),
+            None if e.threaded else normalize_subject(_render_placeholders(e.subject)),
             word_shingles(_render_placeholders(e.body_text)),
         )
         for e in ctx.context_emails
@@ -192,11 +198,12 @@ def validate_draft(output: SequenceDraftOutput, ctx: DraftContext) -> DraftValid
 
     for index, step in enumerate(drafted):
         step_codes.clear()
-        subject = (step.subject or "").strip()
+        threaded = step.position in ctx.threaded_positions
+        subject = "" if threaded else (step.subject or "").strip()
         preheader = (step.preheader or "").strip()
         paragraphs = tuple(p.strip() for p in step.paragraphs if p and p.strip())
 
-        if (
+        if not threaded and (
             not subject
             or len(subject) > MAX_SUBJECT_CHARS
             or _LINE_BREAK_RE.search(step.subject or "")
@@ -256,12 +263,16 @@ def validate_draft(output: SequenceDraftOutput, ctx: DraftContext) -> DraftValid
                 flag("unsafe_content")
                 break
 
-        normalized_subject = normalize_subject(_render_placeholders(subject))
+        normalized_subject = (
+            None if threaded else normalize_subject(_render_placeholders(subject))
+        )
         shingles = word_shingles(readable)
         if index > 0 or any(p < step.position for p, _, _ in others):
             if FILLER_RE.search(readable_all):
                 flag("filler_followup")
-        if any(normalized_subject == s for _, s, _ in others):
+        if normalized_subject is not None and any(
+            normalized_subject == s for _, s, _ in others
+        ):
             flag("subject_repeated")
         earlier = [sh for pos, _, sh in others if pos < step.position]
         if earlier and containment(shingles, earlier[-1]) >= FOLLOWUP_SIMILARITY_MAX:

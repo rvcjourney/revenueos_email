@@ -149,6 +149,8 @@ class TestUnsubscribeService:
 
 
 class TestUnsubscribeHttpEndpoints:
+    """The public endpoints accept only signed links (stateless tokens)."""
+
     @pytest.fixture
     def client(self) -> TestClient:
         mock_db = MagicMock()
@@ -159,28 +161,41 @@ class TestUnsubscribeHttpEndpoints:
         yield test_client
         app.dependency_overrides.clear()
 
+    @staticmethod
+    def _signed_token() -> str:
+        from app.core.config import Settings
+        from app.modules.unsubscribe.tokens import make_unsubscribe_token
+
+        return make_unsubscribe_token(
+            uuid4(), uuid4(), Settings.current().unsubscribe_signing_key
+        )
+
     def test_get_unsubscribe_page_scanner_safe(self, client: TestClient) -> None:
         """GET request must return confirmation UI and NEVER execute unsubscribe."""
-        token = "sample-token-abc"
-        with patch.object(
-            UnsubscribeService,
-            "resolve_token",
-            return_value={"id": uuid4(), "revoked_at": None},
-        ), patch.object(UnsubscribeService, "execute_unsubscribe") as mock_exec:
-            response = client.get(f"/api/v1/unsubscribe/{token}")
+        with patch.object(UnsubscribeService, "execute_unsubscribe") as mock_exec:
+            response = client.get(f"/api/v1/unsubscribe/{self._signed_token()}")
             assert response.status_code == 200
             assert "Confirm Unsubscribe" in response.text
             # Crucial: GET never executes unsubscribe
             mock_exec.assert_not_called()
 
     def test_get_unsubscribe_page_not_found(self, client: TestClient) -> None:
-        with patch.object(UnsubscribeService, "resolve_token", return_value=None):
-            response = client.get("/api/v1/unsubscribe/invalid-token")
-            assert response.status_code == 404
-            assert "Invalid or Expired Link" in response.text
+        response = client.get("/api/v1/unsubscribe/invalid-token")
+        assert response.status_code == 404
+        assert "Invalid or Expired Link" in response.text
+
+    def test_get_unsubscribe_json_for_clients(self, client: TestClient) -> None:
+        good = client.get(
+            f"/api/v1/unsubscribe/{self._signed_token()}",
+            headers={"Accept": "application/json"},
+        )
+        bad = client.get(
+            "/api/v1/unsubscribe/nope", headers={"Accept": "application/json"}
+        )
+        assert good.status_code == 200 and good.json()["valid"] is True
+        assert bad.status_code == 404 and bad.json()["valid"] is False
 
     def test_post_unsubscribe_executes_successfully(self, client: TestClient) -> None:
-        token = "sample-token-xyz"
         with patch.object(
             UnsubscribeService,
             "execute_unsubscribe",
@@ -190,14 +205,26 @@ class TestUnsubscribeHttpEndpoints:
                 "message": "You have been successfully unsubscribed.",
             },
         ):
-            response = client.post(f"/api/v1/unsubscribe/{token}")
+            response = client.post(f"/api/v1/unsubscribe/{self._signed_token()}")
             assert response.status_code == 200
             data = response.json()
             assert data["success"] is True
             assert data["status"] == "unsubscribed"
 
-    def test_post_unsubscribe_invalid_or_expired_returns_400(self, client: TestClient) -> None:
-        token = "bad-token"
+    def test_post_forged_token_is_rejected_before_the_service_runs(
+        self, client: TestClient
+    ) -> None:
+        with patch.object(UnsubscribeService, "execute_unsubscribe") as mock_exec:
+            response = client.post("/api/v1/unsubscribe/bad-token")
+            assert response.status_code == 404
+            assert "invalid or has expired" in response.json()["error"]["message"]
+            mock_exec.assert_not_called()
+
+    def test_post_valid_signature_but_unknown_message_returns_404(
+        self, client: TestClient
+    ) -> None:
+        """A correctly signed link whose message no longer exists is not honoured
+        silently: the recipient is told it is invalid."""
         with patch.object(
             UnsubscribeService,
             "execute_unsubscribe",
@@ -207,6 +234,5 @@ class TestUnsubscribeHttpEndpoints:
                 "message": "The unsubscribe link is invalid or has expired.",
             },
         ):
-            response = client.post(f"/api/v1/unsubscribe/{token}")
-            assert response.status_code == 400
-            assert "invalid or has expired" in response.json()["error"]["message"]
+            response = client.post(f"/api/v1/unsubscribe/{self._signed_token()}")
+            assert response.status_code == 404

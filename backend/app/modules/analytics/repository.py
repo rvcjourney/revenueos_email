@@ -10,6 +10,14 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.modules.safety.thresholds import (
+    BOUNCE_CRITICAL_PERCENT,
+    BOUNCE_WARNING_PERCENT,
+    COMPLAINT_CRITICAL_PERCENT,
+    bounce_level,
+    complaints_critical,
+    rate_percent,
+)
 from app.modules.tracking.pixel import open_tracking_ready
 
 logger = logging.getLogger(__name__)
@@ -958,14 +966,9 @@ class AnalyticsRepository:
             )[0]["bounced"]
             complaint_count = outcomes["complaints"] if outcomes else 0
 
-            bounce_rate = (
-                round((bounce_count / sent_count) * 100, 2) if sent_count > 0 else 0.0
-            )
-            complaint_rate = (
-                round((complaint_count / sent_count) * 100, 2)
-                if sent_count > 0
-                else 0.0
-            )
+            bounce_rate = rate_percent(bounce_count, sent_count)
+            complaint_rate = rate_percent(complaint_count, sent_count)
+            bounce_severity = bounce_level(bounce_rate, sent_count)
 
             active_holds = holds_by_mailbox.get(mid, 0)
 
@@ -1001,7 +1004,7 @@ class AnalyticsRepository:
                 mb_warnings.append(w)
                 warnings.append(w)
 
-            if bounce_rate > 5.0 and sent_count >= 20:
+            if bounce_severity == "CRITICAL":
                 health_status = (
                     "CRITICAL" if health_status != "DISCONNECTED" else health_status
                 )
@@ -1009,29 +1012,29 @@ class AnalyticsRepository:
                     "code": "HIGH_BOUNCE_RATE",
                     "level": "CRITICAL",
                     "title": "Critical Bounce Rate",
-                    "message": f"Bounce rate on {mb['original_address']} is {bounce_rate}% (> 5.0% threshold). Sending reputation at risk.",
+                    "message": f"Bounce rate on {mb['original_address']} is {bounce_rate}% (> {BOUNCE_CRITICAL_PERCENT}% threshold). Sending reputation at risk.",
                     "metric_value": bounce_rate,
-                    "threshold": 5.0,
+                    "threshold": BOUNCE_CRITICAL_PERCENT,
                     "mailbox_id": UUID(mid),
                 }
                 mb_warnings.append(w)
                 warnings.append(w)
-            elif bounce_rate > 2.0 and sent_count >= 20:
+            elif bounce_severity == "WARNING":
                 if health_status == "HEALTHY":
                     health_status = "WARNING"
                 w = {
                     "code": "ELEVATED_BOUNCE_RATE",
                     "level": "WARNING",
                     "title": "Elevated Bounce Rate",
-                    "message": f"Bounce rate on {mb['original_address']} is {bounce_rate}% (> 2.0% warning threshold).",
+                    "message": f"Bounce rate on {mb['original_address']} is {bounce_rate}% (> {BOUNCE_WARNING_PERCENT}% warning threshold).",
                     "metric_value": bounce_rate,
-                    "threshold": 2.0,
+                    "threshold": BOUNCE_WARNING_PERCENT,
                     "mailbox_id": UUID(mid),
                 }
                 mb_warnings.append(w)
                 warnings.append(w)
 
-            if complaint_rate > 0.1 and sent_count >= 50:
+            if complaints_critical(complaint_rate, sent_count):
                 health_status = (
                     "CRITICAL" if health_status != "DISCONNECTED" else health_status
                 )
@@ -1039,9 +1042,9 @@ class AnalyticsRepository:
                     "code": "HIGH_COMPLAINT_RATE",
                     "level": "CRITICAL",
                     "title": "High Spam Complaint Rate",
-                    "message": f"Complaint rate on {mb['original_address']} is {complaint_rate}% (> 0.1% threshold). ESP suspension risk.",
+                    "message": f"Complaint rate on {mb['original_address']} is {complaint_rate}% (> {COMPLAINT_CRITICAL_PERCENT}% threshold). ESP suspension risk.",
                     "metric_value": complaint_rate,
-                    "threshold": 0.1,
+                    "threshold": COMPLAINT_CRITICAL_PERCENT,
                     "mailbox_id": UUID(mid),
                 }
                 mb_warnings.append(w)

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.core.crypto import encrypt_credentials, encrypt_verifier
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers.base import (
     ConnectionValidationResult,
     EmailProvider,
@@ -139,7 +139,9 @@ class FakeSmtpTestProvider(EmailProvider):
         self.validated_credentials.append(dict(credential))
         if self.validate_should_fail:
             raise AppError(
-                "auth_failure", "SMTP authentication failed", status_code=401
+                "auth_failure",
+                "SMTP authentication failed",
+                status_code=PROVIDER_AUTH_REJECTED_STATUS,
             )
         return ConnectionValidationResult(
             is_valid=True, email_address=None, provider_account_id=None, scopes=[]
@@ -351,7 +353,7 @@ def test_complete_gmail_oauth_identity_failure_fails_flow(
             "Failed to retrieve Gmail identity: Google did not grant the "
             "permissions this connection needs. Please reconnect and approve "
             "all requested access.",
-            status_code=401,
+            status_code=PROVIDER_AUTH_REJECTED_STATUS,
         )
 
     failing_provider.get_identity = _raise_identity_error  # type: ignore[method-assign]
@@ -363,7 +365,7 @@ def test_complete_gmail_oauth_identity_failure_fails_flow(
             code="auth-code",
             state_token="valid-state-3",
         )
-    assert exc_info.value.status_code == 401
+    assert exc_info.value.status_code == PROVIDER_AUTH_REJECTED_STATUS
     assert mock_repo.fail_oauth_flow.called
     assert mock_repo.fail_oauth_flow.call_args[0][0] == flow_id
     assert not mock_repo.insert_mailbox.called
@@ -661,7 +663,9 @@ def test_complete_microsoft_oauth_identity_failure_fails_flow(
 
     def _raise_identity_error(access_token: str) -> ProviderAccountIdentity:
         raise AppError(
-            "provider_error", "Microsoft identity lookup failed", status_code=401
+            "provider_error",
+            "Microsoft identity lookup failed",
+            status_code=PROVIDER_AUTH_REJECTED_STATUS,
         )
 
     failing_provider.get_identity = _raise_identity_error  # type: ignore[method-assign]
@@ -673,7 +677,7 @@ def test_complete_microsoft_oauth_identity_failure_fails_flow(
             code="auth-code",
             state_token="valid-state",
         )
-    assert exc_info.value.status_code == 401
+    assert exc_info.value.status_code == PROVIDER_AUTH_REJECTED_STATUS
     assert mock_repo.fail_oauth_flow.called
     assert not mock_repo.insert_mailbox.called
 

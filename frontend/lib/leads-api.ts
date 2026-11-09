@@ -61,6 +61,23 @@ export async function listLeads(
   return (await apiRequest<LeadPage>(path)).data;
 }
 
+// The server clamps a page to 100, so reaching every match means following the cursor.
+export async function listAllLeadIds(
+  workspaceId: string,
+  params: { q?: string | null; status?: LeadStatus | "ALL" } = {},
+  onProgress?: (found: number) => void,
+) {
+  const ids: string[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: LeadPage = await listLeads(workspaceId, { ...params, limit: 100, cursor });
+    for (const lead of page.items) ids.push(lead.id);
+    onProgress?.(ids.length);
+    cursor = page.next_cursor;
+  } while (cursor);
+  return ids;
+}
+
 export async function createLead(workspaceId: string, payload: LeadPayload) {
   return (
     await apiRequest<Lead>(workspacePath(workspaceId, "/leads"), {

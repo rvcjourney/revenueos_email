@@ -458,12 +458,16 @@ class PersonalizationRepository:
                            g.sequence_id, g.step_id, g.enrollment_id,
                            g.attempt_count, g.max_attempts, g.transient_error_count,
                            m.status AS message_status, m.due_at, m.anchor_at,
+                           m.created_at AS message_created_at,
                            c.campaign_type, c.status AS campaign_status,
                            c.planning_status,
                            e.state AS enrollment_state, e.next_step_id,
                            e.frozen_variables, e.address_id,
                            ss.email_subject, ss.email_body_html, ss.email_preheader,
+                           ss.email_same_thread,
                            ss.position AS step_position,
+                           ss.version AS step_version,
+                           parent.content_subject AS parent_subject,
                            seq.personalization_config,
                            sv.timezone, sv.weekday_set,
                            sv.window_start_local, sv.window_end_local
@@ -480,6 +484,10 @@ class PersonalizationRepository:
                       ON seq.workspace_id = g.workspace_id AND seq.id = g.sequence_id
                     JOIN campaign_settings_versions sv
                       ON sv.workspace_id = c.workspace_id AND sv.id = c.current_settings_id
+                    -- ADR-0021: the parent stored at planning is the only source.
+                    LEFT JOIN messages parent
+                      ON parent.workspace_id = m.workspace_id
+                     AND parent.id = m.reply_to_message_id
                     WHERE g.workspace_id = :workspace_id AND g.id = :generation_id
                     """
                 ),
@@ -527,6 +535,32 @@ class PersonalizationRepository:
             .first()
         )
 
+    def record_same_thread_unavailable(
+        self, *, workspace_id: UUID, message_id: UUID, reason: str
+    ) -> None:
+        """A same-thread follow-up written without the previous email's subject
+        (ADR-0021 D5): the same audit action the send worker records."""
+        self.session.execute(
+            text(
+                """
+                INSERT INTO audit_events
+                    (id, workspace_id, actor_kind, actor_id, action, target_type,
+                     target_id, after_state, reason)
+                VALUES
+                    (:id, :workspace_id, 'SYSTEM', NULL,
+                     'message.same_thread_unavailable', 'message', :message_id,
+                     CAST(:after_state AS jsonb), :reason)
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "workspace_id": str(workspace_id),
+                "message_id": str(message_id),
+                "after_state": json.dumps({"stage": "personalization"}),
+                "reason": reason,
+            },
+        )
+
     def lock_for_finalize(
         self, *, workspace_id: UUID, generation_id: UUID
     ) -> RowMapping | None:
@@ -542,7 +576,8 @@ class PersonalizationRepository:
                            m.status AS message_status, m.due_at, m.anchor_at,
                            m.address_id,
                            c.status AS campaign_status, c.planning_status,
-                           e.state AS enrollment_state, e.next_step_id
+                           e.state AS enrollment_state, e.next_step_id,
+                           ss.version AS step_version
                     FROM message_generations g
                     JOIN messages m
                       ON m.workspace_id = g.workspace_id AND m.id = g.message_id
@@ -550,6 +585,8 @@ class PersonalizationRepository:
                       ON c.workspace_id = g.workspace_id AND c.id = g.campaign_id
                     JOIN campaign_enrollments e
                       ON e.workspace_id = g.workspace_id AND e.id = g.enrollment_id
+                    JOIN sequence_steps ss
+                      ON ss.workspace_id = g.workspace_id AND ss.id = g.step_id
                     WHERE g.workspace_id = :workspace_id AND g.id = :generation_id
                     FOR UPDATE OF g, m
                     """
@@ -590,6 +627,13 @@ class PersonalizationRepository:
                     frozen_sender_name = mb.sender_display_name,
                     rendered_at = pg_catalog.transaction_timestamp(),
                     due_at = :due_at,
+                    -- ADR-0020: stamp the campaign's current generation so a
+                    -- message generated after a resume stays claimable.
+                    schedule_generation = (
+                        SELECT c.schedule_generation FROM campaigns c
+                        WHERE c.workspace_id = m.workspace_id
+                          AND c.id = m.campaign_id
+                    ),
                     status = 'SCHEDULED'
                 FROM campaign_enrollments e, mailboxes mb
                 WHERE m.workspace_id = :workspace_id AND m.id = :message_id
@@ -606,6 +650,31 @@ class PersonalizationRepository:
                 "body_html": body_html,
                 "content_digest": content_digest,
                 "renderer_version": renderer_version,
+                "due_at": due_at,
+            },
+        ).first()
+        return row is not None
+
+    def retime_planned_message(
+        self, *, workspace_id: UUID, message_id: UUID, due_at: datetime
+    ) -> bool:
+        """Move a message that is still waiting to be written to the time its wait
+        now implies (ADR-0020: waits can be edited while a campaign is paused).
+        Guarded on `PLANNED` and not yet rendered, so a written or stopped message
+        is never touched. The timing columns are already granted to this role."""
+        row = self.session.execute(
+            text(
+                """
+                UPDATE messages
+                SET due_at = :due_at
+                WHERE workspace_id = :workspace_id AND id = :message_id
+                  AND status = 'PLANNED' AND rendered_at IS NULL
+                RETURNING id
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "message_id": str(message_id),
                 "due_at": due_at,
             },
         ).first()
@@ -736,7 +805,7 @@ class PersonalizationRepository:
                     SELECT p.id, p.audience_member_id, p.step_id, p.config_digest,
                            ss.position AS step_position, ss.email_subject,
                            ss.email_body_html, ss.email_preheader,
-                           am.frozen_variables
+                           ss.email_same_thread, am.frozen_variables
                     FROM personalization_previews p
                     JOIN sequence_steps ss
                       ON ss.workspace_id = p.workspace_id AND ss.id = p.step_id
@@ -786,7 +855,7 @@ class PersonalizationRepository:
             self.session.execute(
                 text(
                     """
-                    SELECT position, kind, wait_duration_minutes
+                    SELECT id, position, kind, wait_duration_minutes, updated_at
                     FROM sequence_steps
                     WHERE workspace_id = :workspace_id AND sequence_id = :sequence_id
                     ORDER BY position

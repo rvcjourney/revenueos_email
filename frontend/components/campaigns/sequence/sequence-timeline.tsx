@@ -20,6 +20,7 @@ import {
   sequenceProblems,
 } from "@/components/campaigns/sequence/duration";
 import { DurationEditor } from "@/components/campaigns/sequence/duration-input";
+import { replySubject } from "@/components/campaigns/sequence/same-thread";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Popover } from "@/components/ui/popover";
@@ -45,6 +46,14 @@ type Props = {
   regeneratingStepId?: string | null;
   // Any AI drafting request is running, so every Regenerate button waits.
   generating?: boolean;
+  // Paused campaign (ADR-0020): steps at or before this position were reached by a
+  // lead. Their content and waits stay editable; their place in the sequence does
+  // not, and neither does deleting them. 0 for a draft.
+  lockedThrough?: number;
+  // Personalized campaign: each lead's email is written from this reference just before
+  // it is sent, so a paused editor says how many are already written (they keep their
+  // current version) and how many will use the new wording.
+  personalized?: boolean;
 };
 
 function plainText(html: string | null): string {
@@ -71,6 +80,8 @@ export function SequenceTimeline({
   onRegenerateEmail,
   regeneratingStepId = null,
   generating = false,
+  lockedThrough = 0,
+  personalized = false,
 }: Props) {
   const timings = React.useMemo(() => computeTimings(steps), [steps]);
   const problems = sequenceProblems(steps);
@@ -108,6 +119,15 @@ export function SequenceTimeline({
             const emailIndex = number - 1;
             const snippet = plainText(step.email_body_html);
             const nextIsWait = steps[index + 1]?.kind === "WAIT";
+            // A step leads already reached keeps its place; one after it can move.
+            const placeLocked = step.position <= lockedThrough;
+            const previousEmail = emailIndex > 0 ? emails[emailIndex - 1] : null;
+            const upLocked = placeLocked || (previousEmail?.position ?? 0) <= lockedThrough;
+            const showCounts =
+              !personalized && lockedThrough > 0 && step.sent_count !== undefined;
+            const writtenCount = step.written_count ?? 0;
+            const threaded = emailIndex > 0 && step.email_same_thread === true;
+            const unwrittenCount = step.unwritten_count ?? 0;
             return (
               <li key={step.id} className="list-none">
                 <article
@@ -124,6 +144,11 @@ export function SequenceTimeline({
                       <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
                         {index === 0 ? "Day 1 · at start" : `Day ${timing?.day ?? 1}`}
                       </span>
+                      {threaded ? (
+                        <span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs font-medium text-brand-700">
+                          Same thread
+                        </span>
+                      ) : null}
                     </div>
                     <div className="flex items-center gap-1">
                       <Button variant="outline" size="sm" onClick={() => onOpenEmail(step)}>
@@ -161,7 +186,7 @@ export function SequenceTimeline({
                             className="h-8 w-8"
                             aria-label={`Duplicate step ${number}`}
                             title="Duplicate"
-                            disabled={busy}
+                            disabled={busy || step.position < lockedThrough}
                             onClick={() => onDuplicate(step)}
                           >
                             <Copy className="h-3.5 w-3.5" aria-hidden="true" />
@@ -171,8 +196,8 @@ export function SequenceTimeline({
                             size="icon"
                             className="h-8 w-8"
                             aria-label={`Move step ${number} up`}
-                            title="Move up"
-                            disabled={busy || emailIndex === 0}
+                            disabled={busy || emailIndex === 0 || upLocked}
+                            title={placeLocked ? "Leads have already received this email" : "Move up"}
                             onClick={() => onMoveEmail(step, -1)}
                           >
                             <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
@@ -182,8 +207,8 @@ export function SequenceTimeline({
                             size="icon"
                             className="h-8 w-8"
                             aria-label={`Move step ${number} down`}
-                            title="Move down"
-                            disabled={busy || emailIndex === emails.length - 1}
+                            title={placeLocked ? "Leads have already received this email" : "Move down"}
+                            disabled={busy || emailIndex === emails.length - 1 || placeLocked}
                             onClick={() => onMoveEmail(step, 1)}
                           >
                             <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
@@ -193,8 +218,8 @@ export function SequenceTimeline({
                             size="icon"
                             className="h-8 w-8 text-red-600 hover:text-red-700"
                             aria-label={`Delete step ${number}`}
-                            title="Delete"
-                            disabled={busy}
+                            title={placeLocked ? "Leads have already received this email" : "Delete"}
+                            disabled={busy || placeLocked}
                             onClick={() => onDelete(step)}
                           >
                             <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -209,17 +234,36 @@ export function SequenceTimeline({
                     className="mt-3 block w-full rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-600"
                   >
                     <p className="truncate text-sm font-medium text-slate-900">
-                      {step.email_subject?.trim() || (
-                        <span className="text-slate-400">(no subject)</span>
-                      )}
+                      {threaded
+                        ? replySubject(emails.slice(0, emailIndex), personalized)
+                        : step.email_subject?.trim() || (
+                            <span className="text-slate-400">(no subject)</span>
+                          )}
                     </p>
                     <p className="mt-0.5 line-clamp-2 text-sm text-slate-500">
                       {snippet || <span className="text-slate-400">Empty body</span>}
                     </p>
                   </button>
+                  {personalized && step.written_count !== undefined ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      {writtenCount > 0
+                        ? `${writtenCount} personalized email${writtenCount === 1 ? "" : "s"} already written keep${writtenCount === 1 ? "s" : ""} the current version.`
+                        : "Nothing written yet."}
+                      {unwrittenCount > 0
+                        ? ` ${unwrittenCount} will be written from this version.`
+                        : ""}
+                    </p>
+                  ) : null}
+                  {showCounts ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Sent to {step.sent_count} lead{step.sent_count === 1 ? "" : "s"}
+                      {" · "}
+                      {step.unsent_count} waiting. Changes apply to the ones waiting.
+                    </p>
+                  ) : null}
                 </article>
                 {/* Insert-between control sits on the connector after this email. */}
-                {!readOnly && nextIsWait ? (
+                {!readOnly && nextIsWait && step.position >= lockedThrough ? (
                   <div className="flex justify-center">
                     <button
                       type="button"
@@ -310,7 +354,7 @@ export function SequenceTimeline({
                       )}
                     </Popover>
                   )}
-                  {!readOnly && isOrphan ? (
+                  {!readOnly && isOrphan && step.position > lockedThrough ? (
                     <Button
                       variant="ghost"
                       size="icon"

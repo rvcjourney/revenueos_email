@@ -59,8 +59,8 @@ export default function DangerZonePage() {
   return (
     <main className="space-y-6 max-w-2xl pb-16">
       <div>
-        <p className="text-sm font-medium text-red-700">Danger Zone</p>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900 mt-1">
+        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-red-600">Danger Zone</p>
+        <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900 mt-1">
           Delete Workspace
         </h1>
         <p className="mt-1 text-sm text-slate-600">

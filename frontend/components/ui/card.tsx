@@ -33,7 +33,7 @@ export function CardHeader({
   return (
     <div className={cn("flex items-start justify-between gap-3", className)}>
       <div className="min-w-0">
-        <h2 className="text-base font-semibold text-slate-900">{title}</h2>
+        <h2 className="text-[15px] font-bold text-slate-900">{title}</h2>
         {description ? (
           <p className="mt-0.5 text-sm text-slate-500">{description}</p>
         ) : null}

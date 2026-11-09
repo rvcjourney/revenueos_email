@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers.gmail import GMAIL_DEFAULT_SCOPES, GmailProvider
 from app.modules.mailboxes.providers.imap_sync import (
     FetchedImapMessage,
@@ -478,7 +478,7 @@ class TestSmtpImapWiring:
 
         with pytest.raises(AppError) as exc:
             SmtpProvider(imap_connector=refuse).validate_imap(self.CRED)
-        assert exc.value.status_code == 401
+        assert exc.value.status_code == PROVIDER_AUTH_REJECTED_STATUS
 
     def test_validate_imap_reports_an_unreachable_server(self) -> None:
         def unreachable(cred: Any) -> Any:

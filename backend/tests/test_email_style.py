@@ -4,6 +4,7 @@ Pure unit tests: no database, no network, no model."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import replace
 
@@ -194,6 +195,31 @@ class TestPerLeadPrompt:
             "max_words_per_paragraph": MAX_PARAGRAPH_WORDS,
         }
         json.dumps(data)  # still plain JSON
+
+    def test_the_call_to_action_words_the_validator_checks_are_sent(self) -> None:
+        # A follow-up that rewrites the ask must still know what is checked, or it
+        # is rejected with cta_missing on every attempt.
+        data = build_data(self._request())
+        words = data["call_to_action_key_words"]
+        assert "conversation" in words and "open" in words
+        assert data["call_to_action_use_at_least"] == -(-len(words) // 2)
+        assert "call_to_action_links" not in data
+
+    def test_a_call_to_action_link_is_sent_instead_of_words(self) -> None:
+        request = self._request()
+        objective = {**request.objective, "cta": "Book here https://acme.example/demo"}
+        data = build_data(dataclasses.replace(request, objective=objective))
+        assert data["call_to_action_links"] == ["https://acme.example/demo"]
+        assert "call_to_action_key_words" not in data
+
+    def test_the_prompt_and_the_retry_guidance_name_the_call_to_action_data(
+        self,
+    ) -> None:
+        system = build_chat_messages(self._request())[0]["content"]
+        assert "call_to_action_key_words" in system and "follow-up" in system
+        guidance = CODE_GUIDANCE["cta_missing"]
+        assert "call_to_action_key_words" in guidance
+        assert "call_to_action_links" in guidance
 
 
 class TestDraftingPlaybook:

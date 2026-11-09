@@ -22,6 +22,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 MIGRATIONS = pathlib.Path(__file__).resolve().parents[3] / "supabase" / "migrations"
 _POST_CHECK = re.compile(
@@ -38,6 +39,17 @@ def _migration_sql(path: pathlib.Path) -> str:
     return sql
 
 
+def database_uri(admin_uri: str, database: str) -> str:
+    """`admin_uri` pointed at another database, keeping everything else.
+
+    On Windows pgserver listens on TCP (`postgresql://postgres:@127.0.0.1:PORT/postgres`);
+    on Linux it uses a unix socket and the directory is in the query
+    (`postgresql://postgres:@/postgres?host=/tmp/...`). Only the path may change:
+    cutting the string at its last "/" breaks the socket form.
+    """
+    return urlunsplit(urlsplit(admin_uri)._replace(path=f"/{database}"))
+
+
 @contextmanager
 def throwaway_database(up_to: int | None = None) -> Iterator[str]:
     """Yield a superuser connection URI to a fresh database with the migrations
@@ -52,7 +64,7 @@ def throwaway_database(up_to: int | None = None) -> Iterator[str]:
         admin_uri = server.get_uri()
         with psycopg.connect(admin_uri, autocommit=True) as admin:
             admin.execute("CREATE DATABASE outly")
-        uri = admin_uri.rsplit("/", 1)[0] + "/outly"
+        uri = database_uri(admin_uri, "outly")
         with psycopg.connect(uri, autocommit=True) as conn:
             conn.execute("CREATE SCHEMA IF NOT EXISTS auth")
             conn.execute("CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY)")

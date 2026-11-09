@@ -4,7 +4,7 @@
 
 :root {
   color-scheme: light;
-  --background: 248 250 252;
+  --background: 246 247 251;
   --foreground: 15 23 42;
 }
 
@@ -22,21 +22,51 @@ body {
   background: rgb(var(--background));
   color: rgb(var(--foreground));
   font-family: theme("fontFamily.sans");
-  font-feature-settings: "cv11", "ss01";
+  /* Plus Jakarta Sans has a narrow word space (0.17em); open it slightly so
+     small text stays easy to read. */
+  word-spacing: 0.06em;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
 ::selection {
-  background: rgb(199 210 254);
+  background: rgb(200 204 255);
   color: rgb(15 23 42);
+}
+
+/* Scrollbars: slim and quiet everywhere instead of the chunky OS default. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(203 213 225) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: rgb(203 213 225);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(148 163 184);
+}
+/* Strips of tabs and the navigation still scroll (wheel, touch, keyboard),
+   but show no bar at all. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
 }
 
 /* One consistent, visible keyboard focus treatment for anything that doesn't
    set its own ring (links, summary, custom controls). */
 :focus-visible {
-  outline: 2px solid rgb(79 70 229);
+  outline: 2px solid rgb(74 64 226);
   outline-offset: 2px;
 }
 
@@ -111,6 +141,90 @@ select {
 }
 .email-editor .ProseMirror h2 {
   font-size: 1.25em;
+}
+/* Inline images: resizable, optionally floated so text wraps beside them. */
+.email-editor .ProseMirror .email-image {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: bottom;
+  line-height: 0;
+}
+.email-editor .ProseMirror .email-image img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+.email-editor .ProseMirror .email-image[data-align="left"] {
+  float: left;
+  margin: 0 8px 4px 0;
+}
+.email-editor .ProseMirror .email-image[data-align="right"] {
+  float: right;
+  margin: 0 0 4px 8px;
+}
+.email-editor .ProseMirror .email-image.ProseMirror-selectednode img {
+  outline: 2px solid rgb(79 70 229);
+  outline-offset: 1px;
+}
+.email-editor .ProseMirror .email-image-handle,
+.email-editor .ProseMirror .email-image-bar {
+  display: none;
+}
+.email-editor .ProseMirror .email-image.ProseMirror-selectednode .email-image-handle {
+  display: block;
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: rgb(79 70 229);
+  border: 2px solid #fff;
+  cursor: nwse-resize;
+  touch-action: none;
+}
+.email-editor .ProseMirror .email-image[data-align="right"].ProseMirror-selectednode .email-image-handle {
+  right: auto;
+  left: -6px;
+  cursor: nesw-resize;
+}
+.email-editor .ProseMirror .email-image.ProseMirror-selectednode .email-image-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  position: absolute;
+  top: -34px;
+  left: 0;
+  z-index: 10;
+  padding: 2px;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(15 23 42 / 0.12);
+  line-height: 1;
+  white-space: nowrap;
+}
+.email-editor .ProseMirror .email-image-bar button {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: rgb(51 65 85);
+}
+.email-editor .ProseMirror .email-image-bar button:hover {
+  background: rgb(241 245 249);
+}
+.email-editor .ProseMirror .email-image-bar button[aria-pressed="true"] {
+  background: rgb(238 242 255);
+  color: rgb(67 56 202);
+  font-weight: 600;
+}
+.email-editor .ProseMirror .email-image-sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: rgb(226 232 240);
 }
 .email-editor .ProseMirror p.is-editor-empty:first-child::before {
   content: attr(data-placeholder);

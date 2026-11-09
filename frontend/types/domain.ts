@@ -439,6 +439,33 @@ export type SmtpUpdateInput = {
   imap_password?: string;
 };
 
+// A reason a mailbox is not sending (backend/app/modules/safety/holds_service.py).
+export type SafetyHold = {
+  id: string;
+  kind: "HIGH_BOUNCE_RATE" | "RESYNC" | "OTHER";
+  status: "ACTIVE" | "RESOLVED";
+  reason: string;
+  created_at: string;
+  resolved_at: string | null;
+};
+
+// How much one mailbox may send (backend/app/modules/rate_limit/policy_service.py).
+export type MailboxLimits = {
+  // null when the mailbox has no limit row: it cannot send until one is set.
+  daily_cap: number | null;
+  min_spacing_seconds: number | null;
+  configured: boolean;
+  default_daily_cap: number;
+  default_min_spacing_seconds: number;
+  max_daily_cap: number;
+  max_spacing_seconds: number;
+};
+
+export type MailboxLimitsInput = {
+  daily_cap: number;
+  min_spacing_seconds: number;
+};
+
 export type MailboxTestSendResult = {
   message_id: string;
   status: "SENT" | "FAILED" | "UNKNOWN_OUTCOME";
@@ -481,9 +508,22 @@ export type CampaignListItem = {
   // Absent on responses from a server that predates purge/erase.
   is_activated?: boolean;
   erased_at?: string | null;
+  // Set only while PAUSED (absent on a server that predates pause metadata).
+  paused_at?: string | null;
+  // Absent on a server that predates the list's owner and start time.
+  start_at?: string | null;
+  creator_name?: string | null;
   version: number;
   created_at: string;
   updated_at: string;
+};
+
+export type CampaignSort = "updated_desc" | "created_desc" | "name_asc";
+
+export type CampaignCounts = {
+  by_status: Partial<Record<CampaignStatus, number>>;
+  not_archived: number;
+  total: number;
 };
 
 export type CampaignPage = {
@@ -508,6 +548,13 @@ export type CampaignDetail = {
   error_reason: string | null;
   is_activated?: boolean;
   erased_at?: string | null;
+  // Pause bookkeeping (ADR-0020). paused_at is set only while PAUSED.
+  paused_at?: string | null;
+  paused_total_seconds?: number;
+  last_resumed_at?: string | null;
+  // Only on the response to a pause: emails already being sent, which a pause
+  // cannot recall.
+  outstanding_attempts?: number | null;
   version: number;
   created_at: string;
   updated_at: string;
@@ -560,10 +607,19 @@ export type SequenceStep = {
   email_subject: string | null;
   email_body_html: string | null;
   email_preheader?: string | null;
+  // Follow-up sent as a reply to the previous email, with its subject (ADR-0021).
+  email_same_thread?: boolean;
   attachments?: StepAttachment[];
   email_variable_schema: Record<string, unknown> | null;
   wait_duration_minutes: number | null;
   source_template_version_id: string | null;
+  // Activated campaigns only (ADR-0020): leads that already received this email,
+  // and unsent messages an edit would still change.
+  sent_count?: number;
+  unsent_count?: number;
+  // Personalized campaigns: emails already written (frozen) / still to be written.
+  written_count?: number;
+  unwritten_count?: number;
   version: number;
   created_at: string;
   updated_at: string;
@@ -593,6 +649,12 @@ export type CampaignSequence = {
   revision: number;
   status: "DRAFT" | "FROZEN" | "EMPTY";
   steps: SequenceStep[];
+  // True when this user may edit the (frozen) sequence right now: the campaign is
+  // paused, standard, and they may execute campaigns (ADR-0020).
+  paused_edit_allowed?: boolean;
+  // Steps at or before this position were reached by a lead: their content and
+  // waits may change, their place in the sequence may not.
+  structure_locked_through?: number;
 };
 
 export type CampaignMailbox = {
@@ -635,11 +697,33 @@ export type CampaignAudience = {
   accepted_count: number | null;
   excluded_count: number | null;
   error_reason: string | null;
+  selected_list_ids: string[];
+  selected_lead_ids: string[];
 };
 
 // archived_lead/suppressed are exact; invalid_address_estimate is a residual
 // (see backend AudienceExclusionBreakdown) since a lead with no resolvable
 // email address never gets a campaign_audience_members row to count exactly.
+// Leads being added to a paused campaign (ADR-0020).
+export type CampaignSupplement = {
+  id: string;
+  campaign_id: string;
+  revision: number;
+  status: AudienceStatus;
+  started_at: string;
+  completed_at: string | null;
+  total_candidates: number | null;
+  processed_count: number;
+  accepted_count: number | null;
+  excluded_count: number | null;
+  // reason -> count: already_enrolled, suppressed, archived_lead, ...
+  exclusions: Record<string, number>;
+  enroll_state: "NOT_STARTED" | "PENDING" | "PROCESSING" | "READY" | "FAILED";
+  render_state: "NOT_STARTED" | "PENDING" | "PROCESSING" | "READY" | "FAILED";
+  enrolled_count: number;
+  error_reason: string | null;
+};
+
 export type AudienceExclusionBreakdown = {
   archived_lead: number;
   suppressed: number;

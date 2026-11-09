@@ -185,6 +185,8 @@ class FakeWorld:
             "id": uuid.uuid4(),
             "status": "SCHEDULED",
             "accepted_at": None,
+            "mailbox_id": self.enrollments[eid]["assigned_mailbox_id"],
+            "subject": f"One {name}",
         }
         return eid
 
@@ -226,6 +228,9 @@ class FakeWorld:
                     "next_step_id": e["next_step_id"],
                     "message_status": m["status"],
                     "accepted_at": m["accepted_at"],
+                    "message_id": m["id"],
+                    "message_subject": m.get("subject"),
+                    "message_mailbox_id": m.get("mailbox_id"),
                     "sender_address": e["sender_address"],
                     "sender_name": e["sender_name"],
                 }
@@ -245,6 +250,7 @@ class FakeWorld:
             "schedule_generation": kw["schedule_generation"],
             "campaign_id": kw["campaign_id"],
             "sequence_id": kw["sequence_id"],
+            "reply_to_message_id": kw.get("reply_to_message_id"),
         }
         self.calls.append("insert")
         return message_id
@@ -698,3 +704,71 @@ class TestHyperPersonalizedProgression:
         _run(world)
         assert world.calls == ["insert", "render"]
         assert world.messages[(eid, world.steps[2]["id"])]["status"] == "SCHEDULED"
+
+
+class TestSameThreadFollowUp:
+    """ADR-0021: a threaded follow-up replies to the email the lead was just sent."""
+
+    def _threaded_sequence(self):
+        steps = _three_email_sequence()
+        steps[2]["email_same_thread"] = True
+        steps[2]["email_subject"] = None
+        return steps
+
+    def test_parent_and_re_subject_are_frozen_with_the_follow_up(self) -> None:
+        from app.modules.campaigns.message_rendering import compute_content_digest
+
+        steps = self._threaded_sequence()
+        world = FakeWorld(steps)
+        eid = world.enroll(name="Ada", company="Engine Co")
+        world.accept(eid, T)
+        _run(world)
+
+        parent = world.messages[(eid, steps[0]["id"])]
+        second = world.messages[(eid, steps[2]["id"])]
+        assert second["reply_to_message_id"] == parent["id"]
+        assert second["subject"] == "Re: One Ada"
+        assert "Hi Ada, follow-up 2" in second["body"]
+        assert second["digest"] == compute_content_digest(
+            "Re: One Ada", second["body"], 1
+        )
+
+    def test_an_unthreaded_follow_up_has_no_parent(self) -> None:
+        steps = _three_email_sequence()
+        world = FakeWorld(steps)
+        eid = world.enroll(name="Ada", company="Engine Co")
+        world.accept(eid, T)
+        _run(world)
+        assert world.messages[(eid, steps[2]["id"])]["reply_to_message_id"] is None
+
+    def test_a_parent_sent_from_another_mailbox_is_not_linked(self) -> None:
+        steps = self._threaded_sequence()
+        world = FakeWorld(steps)
+        eid = world.enroll(name="Ada", company="Engine Co")
+        world.messages[(eid, steps[0]["id"])]["mailbox_id"] = uuid.uuid4()
+        world.accept(eid, T)
+        _run(world)
+        second = world.messages[(eid, steps[2]["id"])]
+        assert second["reply_to_message_id"] is None
+        # Still a follow-up of the same conversation.
+        assert second["subject"] == "Re: One Ada"
+
+    def test_a_personalized_follow_up_gets_its_parent_at_insert(self) -> None:
+        steps = self._threaded_sequence()
+        world = HyperWorld(steps)
+        eid = world.enroll(name="Ada", company="Engine Co")
+        world.accept(eid, T)
+        _run(world)
+        parent = world.messages[(eid, steps[0]["id"])]
+        second = world.messages[(eid, steps[2]["id"])]
+        assert second["reply_to_message_id"] == parent["id"]
+        assert second["status"] == "PLANNED"  # written later by the JIT writer
+
+    def test_a_personalized_follow_up_from_another_mailbox_has_no_parent(self) -> None:
+        steps = self._threaded_sequence()
+        world = HyperWorld(steps)
+        eid = world.enroll(name="Ada", company="Engine Co")
+        world.messages[(eid, steps[0]["id"])]["mailbox_id"] = uuid.uuid4()
+        world.accept(eid, T)
+        _run(world)
+        assert world.messages[(eid, steps[2]["id"])]["reply_to_message_id"] is None

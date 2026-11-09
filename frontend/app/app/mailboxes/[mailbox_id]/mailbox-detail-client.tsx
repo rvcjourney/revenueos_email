@@ -28,6 +28,8 @@ import {
   type ImapSettings,
 } from "@/components/mailboxes/imap-settings-fields";
 import { ProviderBadge, providerSubtext } from "@/components/mailboxes/provider-badge";
+import { SafetyHoldsCard } from "@/components/mailboxes/safety-holds-card";
+import { SendingLimitsCard } from "@/components/mailboxes/sending-limits-card";
 import { ApiError } from "@/lib/api-client";
 import {
   disconnectMailbox,
@@ -338,7 +340,7 @@ export function MailboxDetailClient({ mailboxId: propId }: { mailboxId?: string 
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">
                 {mailbox.email_address}
               </h1>
               <span className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-800">
@@ -629,6 +631,14 @@ export function MailboxDetailClient({ mailboxId: propId }: { mailboxId?: string 
         </div>
       ) : null}
 
+      {activeWorkspaceId ? (
+        <SafetyHoldsCard
+          workspaceId={activeWorkspaceId}
+          mailboxId={mailboxId}
+          canManage={mayManage}
+        />
+      ) : null}
+
       {/* Status & Diagnostics grid */}
       <div className="grid gap-4 sm:grid-cols-3">
         <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-card">
@@ -686,6 +696,14 @@ export function MailboxDetailClient({ mailboxId: propId }: { mailboxId?: string 
           </p>
         </div>
       </div>
+
+      {activeWorkspaceId ? (
+        <SendingLimitsCard
+          workspaceId={activeWorkspaceId}
+          mailboxId={mailboxId}
+          canManage={mayManage}
+        />
+      ) : null}
 
       {/* Controlled Test Email Section */}
       <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-card space-y-5">

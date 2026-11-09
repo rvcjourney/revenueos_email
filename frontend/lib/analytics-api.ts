@@ -1,5 +1,8 @@
 import { apiRequest } from "@/lib/api-client";
 import type {
+  CampaignActivityPage,
+  CampaignActivityStatus,
+  CampaignActivityType,
   CampaignAnalytics,
   CampaignSequenceAnalytics,
   DeliverabilityOverview,
@@ -46,6 +49,36 @@ export async function getCampaignSequenceAnalytics(
 ): Promise<CampaignSequenceAnalytics> {
   const endpoint = `/api/v1/workspaces/${workspaceId}/analytics/campaigns/${campaignId}/sequence`;
   const response = await apiRequest<CampaignSequenceAnalytics>(endpoint);
+  return response.data;
+}
+
+export type CampaignActivityParams = {
+  type?: CampaignActivityType | null;
+  status?: CampaignActivityStatus | null;
+  startDate?: string | null;
+  endDate?: string | null;
+  q?: string | null;
+  limit?: number;
+  cursor?: string | null;
+};
+
+export async function getCampaignActivity(
+  workspaceId: string,
+  campaignId: string,
+  params: CampaignActivityParams = {},
+): Promise<CampaignActivityPage> {
+  const query = new URLSearchParams();
+  if (params.type) query.set("type", params.type);
+  if (params.status) query.set("status", params.status);
+  if (params.startDate) query.set("start_date", params.startDate);
+  if (params.endDate) query.set("end_date", params.endDate);
+  if (params.q) query.set("q", params.q);
+  if (params.limit) query.set("limit", String(params.limit));
+  if (params.cursor) query.set("cursor", params.cursor);
+
+  const qs = query.toString();
+  const endpoint = `/api/v1/workspaces/${workspaceId}/analytics/campaigns/${campaignId}/activity${qs ? `?${qs}` : ""}`;
+  const response = await apiRequest<CampaignActivityPage>(endpoint);
   return response.data;
 }
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 
@@ -9,9 +9,10 @@ import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { useToast } from "@/components/ui/toast";
 import { ApiError } from "@/lib/api-client";
-import { createCampaignSettings, listCampaignSettings } from "@/lib/campaigns-api";
-import { canDraftCampaign } from "@/lib/permissions";
+import { createCampaignSettings, getCampaign, listCampaignSettings } from "@/lib/campaigns-api";
+import { canDraftCampaign, canExecuteCampaign } from "@/lib/permissions";
 import { useWorkspace } from "@/lib/workspace-context";
 
 const WEEKDAYS: { value: number; label: string }[] = [
@@ -59,7 +60,7 @@ export default function CampaignSchedulePage() {
   const campaignId = params.campaign_id;
   const queryClient = useQueryClient();
   const { activeWorkspaceId, activeWorkspace } = useWorkspace();
-  const mayDraft = canDraftCampaign(activeWorkspace?.role_code);
+  const { toast } = useToast();
   const timezones = useMemo(supportedTimezones, []);
 
   const [actionError, setActionError] = useState<string | null>(null);
@@ -86,6 +87,23 @@ export default function CampaignSchedulePage() {
     enabled: Boolean(activeWorkspaceId && campaignId),
   });
 
+  const campaignKey = ["workspace", activeWorkspaceId, "campaigns", campaignId];
+  const campaignQuery = useQuery({
+    queryKey: campaignKey,
+    queryFn: () => getCampaign(activeWorkspaceId as string, campaignId),
+    enabled: Boolean(activeWorkspaceId && campaignId),
+  });
+  const status = campaignQuery.data?.status;
+  // A draft is edited by anyone who may draft; a paused campaign's schedule only by
+  // someone who may run campaigns (ADR-0020). Every other state is frozen.
+  const mayEdit =
+    status === "DRAFT"
+      ? canDraftCampaign(activeWorkspace?.role_code)
+      : status === "PAUSED"
+        ? canExecuteCampaign(activeWorkspace?.role_code)
+        : false;
+  const isPaused = status === "PAUSED";
+
   const createMutation = useMutation({
     mutationFn: () => {
       if (!activeWorkspaceId || !campaignId) throw new Error("Not ready");
@@ -98,12 +116,29 @@ export default function CampaignSchedulePage() {
       });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: settingsKey });
+      setActionError(null);
+      // A new settings version moves the campaign's pointer, so its version changes
+      // too: refresh everything about this campaign, not just the schedule.
+      queryClient.invalidateQueries({ queryKey: campaignKey });
+      if (isPaused) toast("Schedule saved. It applies to emails that haven't been sent when you resume.");
     },
-    onError: (err) => setActionError(errorMessage(err)),
+    onError: (err) => {
+      setActionError(errorMessage(err));
+      queryClient.invalidateQueries({ queryKey: campaignKey });
+    },
   });
 
   const current = settingsQuery.data?.[0] ?? null;
+
+  // Editing a paused campaign starts from what it has now, not from the defaults.
+  useEffect(() => {
+    if (!isPaused || !current) return;
+    setTimezone(current.timezone);
+    setWeekdays(new Set(current.weekdays));
+    setWindowStart(current.window_start_local.slice(0, 5));
+    setWindowEnd(current.window_end_local.slice(0, 5));
+    setDailyLimit(current.daily_limit == null ? "" : String(current.daily_limit));
+  }, [isPaused, current?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="max-w-xl space-y-6">
@@ -116,6 +151,21 @@ export default function CampaignSchedulePage() {
       </div>
 
       {actionError && <Alert variant="error">{actionError}</Alert>}
+      {isPaused && mayEdit && (
+        <Alert variant="info">
+          This campaign is paused. A new schedule applies to emails that haven&apos;t been sent:
+          they are re-timed into the new sending days and hours when you resume.
+        </Alert>
+      )}
+      {status && status !== "DRAFT" && !mayEdit && (
+        <Alert variant="info">
+          {status === "PAUSED"
+            ? "Only a manager can change the schedule of a paused campaign."
+            : status === "RUNNING" || status === "SCHEDULED"
+              ? "The schedule can't be changed while the campaign is running. Pause it first."
+              : `The schedule can't be changed because the campaign is ${status.toLowerCase()}.`}
+        </Alert>
+      )}
 
       {current && (
         <div className="rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-sm">
@@ -137,7 +187,7 @@ export default function CampaignSchedulePage() {
         </div>
       )}
 
-      {mayDraft && (
+      {mayEdit && (
         <form
           className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-card"
           onSubmit={(e) => {

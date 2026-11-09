@@ -38,6 +38,14 @@ vi.mock("@/lib/mailboxes-api", () => ({
   updateSmtpMailbox,
 }));
 
+// The limits card has its own tests (components/mailboxes/sending-limits-card.test.tsx).
+vi.mock("@/components/mailboxes/sending-limits-card", () => ({
+  SendingLimitsCard: () => null,
+}));
+vi.mock("@/components/mailboxes/safety-holds-card", () => ({
+  SafetyHoldsCard: () => null,
+}));
+
 const { useWorkspace } = vi.hoisted(() => ({ useWorkspace: vi.fn() }));
 
 vi.mock("@/lib/workspace-context", () => ({ useWorkspace }));

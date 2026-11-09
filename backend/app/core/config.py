@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -13,6 +14,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # pytest/uvicorn, repo root for tooling run from there). Docker containers
 # get real env vars injected directly and never rely on this file existing.
 _REPO_ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
+
+# Domains reserved for documentation (RFC 2606): no real person owns an address there.
+_RESERVED_EXAMPLE_DOMAINS = frozenset({"example.com", "example.org", "example.net"})
 
 
 def _split_origins(value: str | list[str]) -> list[str]:
@@ -60,9 +64,21 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = Field(default=5_000, ge=100, le=60_000)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
 
+    # The sending limit every mailbox starts with (docs/adr/0019): this many
+    # messages per rolling 24 hours, at least this many seconds apart. People with
+    # the mailboxes.manage permission can change it per mailbox. Migration 0038
+    # backfilled the same values for mailboxes that already existed.
+    mailbox_default_daily_cap: int = Field(default=50, ge=1, le=500)
+    mailbox_default_min_spacing_seconds: int = Field(default=60, ge=0, le=3600)
+
     scheduler_enabled: bool = True
     scheduler_poll_seconds: float = Field(default=5.0, gt=0, le=300)
     scheduler_batch_size: int = Field(default=50, ge=1, le=1000)
+    # The most messages the scheduler keeps claimed (QUEUED, waiting for a send
+    # worker) at once. Claims expire after scheduler_claim_lease_seconds, so
+    # claiming faster than the workers send only creates expired claims and
+    # duplicate tasks. See docs/architecture/SCHEDULER.md.
+    scheduler_max_outstanding_claims: int = Field(default=200, ge=1, le=10_000)
     scheduler_claim_lease_seconds: int = Field(default=300, ge=10, le=3600)
     outbox_publish_batch_size: int = Field(default=50, ge=1, le=1000)
     outbox_lease_seconds: int = Field(default=60, ge=5, le=600)
@@ -158,6 +174,14 @@ class Settings(BaseSettings):
     # prefetch, not a person reading the email, and is not counted as an open.
     open_tracking_min_delay_seconds: int = Field(default=60, ge=0, le=3600)
 
+    # Mandatory unsubscribe (docs/adr/0019). Every campaign email carries a signed
+    # one-click unsubscribe link, so campaign mail is never sent unless both are set.
+    # UNSUBSCRIBE_BASE_URL is this app's public origin (the link is
+    # {base}/api/v1/unsubscribe/{token}); generate the key with `openssl rand -hex 32`
+    # and do not rotate it: links already sent in emails would stop working.
+    unsubscribe_base_url: str = ""
+    unsubscribe_signing_key: str = ""
+
     # Shared secrets for the provider webhooks. When unset the endpoint is
     # disabled (503) instead of accepting unauthenticated events.
     event_webhook_secret: str = ""
@@ -245,6 +269,52 @@ class Settings(BaseSettings):
             raise ValueError("At least one CORS origin is required")
         if self.app_env == "production" and "*" in self.cors_origins:
             raise ValueError("Wildcard CORS origins are not allowed in production")
+        return self
+
+    @model_validator(mode="after")
+    def validate_unsubscribe_when_sending(self) -> Settings:
+        # A production deployment that sends campaign mail must be able to put a
+        # working unsubscribe link in every email. Failing at startup is louder,
+        # and safer, than discovering it as deferred sends during a campaign.
+        if self.app_env == "production" and self.sending_worker_enabled:
+            parsed = urlparse(self.unsubscribe_base_url)
+            if not (
+                self.unsubscribe_signing_key
+                and parsed.scheme in ("http", "https")
+                and parsed.netloc
+            ):
+                raise ValueError(
+                    "SENDING_WORKER_ENABLED requires UNSUBSCRIBE_BASE_URL (an "
+                    "http(s) origin) and UNSUBSCRIBE_SIGNING_KEY in production"
+                )
+        return self
+
+    @property
+    def placeholder_operator_emails(self) -> list[str]:
+        """Operator addresses that are the shipped placeholders (or any reserved
+        example.* domain). Anyone able to register such an address would become a
+        platform operator, so it must never be live."""
+        return [
+            email
+            for email in (
+                e.strip().lower() for e in self.platform_operator_emails.split(",")
+            )
+            if email and email.rpartition("@")[2] in _RESERVED_EXAMPLE_DOMAINS
+        ]
+
+    @model_validator(mode="after")
+    def validate_operators_when_sending(self) -> Settings:
+        # Checked when a production deployment turns sending on (the go-live
+        # moment), not on every production start, so a deployment that is not
+        # sending yet is not taken down by it.
+        if self.app_env == "production" and self.sending_worker_enabled:
+            placeholders = self.placeholder_operator_emails
+            if placeholders:
+                raise ValueError(
+                    "PLATFORM_OPERATOR_EMAILS still holds placeholder address(es) "
+                    f"({', '.join(placeholders)}); set it to your own operator "
+                    "address(es) before enabling sending in production"
+                )
         return self
 
     @model_validator(mode="after")

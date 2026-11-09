@@ -35,6 +35,42 @@ class SchedulerService:
         self.settings = settings or Settings.current()
         self.repository = SchedulerRepository(session)
 
+    def start_due_campaigns(self, *, limit: int = 50) -> list[tuple[UUID, UUID, int]]:
+        """Start every SCHEDULED campaign whose start time has arrived. One commit
+        per campaign, so one bad row cannot undo the others. Returns
+        (workspace_id, campaign_id, schedule_generation) for each campaign started.
+
+        A campaign that was paused and resumed before its start was put back to
+        SCHEDULED with a bumped generation and no reconcile (it was not RUNNING), so
+        its old messages are fenced; the caller dispatches the reconcile pass for
+        those (generation > 1) now that they can be sent."""
+        started: list[tuple[UUID, UUID, int]] = []
+        for workspace_id, campaign_id in self.repository.find_due_scheduled_campaigns(
+            limit=limit
+        ):
+            try:
+                generation = self.repository.start_due_campaign(
+                    workspace_id=workspace_id, campaign_id=campaign_id
+                )
+                self.session.commit()
+            except Exception as exc:
+                self.session.rollback()
+                logger.warning(
+                    "Error starting due campaign %s: %s", campaign_id, exc,
+                    extra={"workspace_id": str(workspace_id)},
+                )
+                continue
+            if generation is None:
+                continue  # paused, archived or started by another scheduler first
+            logger.info(
+                "CAMPAIGN_STARTED workspace=%s campaign=%s generation=%s",
+                workspace_id,
+                campaign_id,
+                generation,
+            )
+            started.append((workspace_id, campaign_id, generation))
+        return started
+
     def discover_and_claim_due_work(
         self,
         *,
@@ -47,6 +83,18 @@ class SchedulerService:
         Returns (discovered_count, claimed_count).
         """
         limit = batch_size or self.settings.scheduler_batch_size
+
+        # Backpressure: a claim lasts scheduler_claim_lease_seconds, so claiming
+        # faster than the send workers finish only makes claims expire unused.
+        # Claim no more than there is room for.
+        room = self.settings.scheduler_max_outstanding_claims - (
+            self.repository.count_outstanding_claims()
+        )
+        if room <= 0:
+            logger.info("Scheduler holding back: too many outstanding claims")
+            return 0, 0
+        limit = min(limit, room)
+
         candidates = self.repository.find_due_messages(
             limit=limit * 2,  # Fetch slightly wider candidate pool for fairness filtering
             authoritative_now=authoritative_now,

@@ -1,18 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Search } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Loader2 } from "lucide-react";
 
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
+import { LeadPicker } from "@/components/leads/lead-picker";
 import { addLeadsToListWithProgress } from "@/lib/bulk-add-to-list";
 import { errorMessage } from "@/lib/errors";
-import { listLeads } from "@/lib/leads-api";
-import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useWorkspace } from "@/lib/workspace-context";
 
 type AddListMembersDialogProps = {
@@ -21,10 +19,6 @@ type AddListMembersDialogProps = {
   listId: string;
   listName: string;
 };
-
-function fullName(firstName: string | null, lastName: string | null) {
-  return [firstName, lastName].filter(Boolean).join(" ") || "Unnamed lead";
-}
 
 export function AddListMembersDialog({
   open,
@@ -42,14 +36,6 @@ export function AddListMembersDialog({
     null,
   );
   const [submitting, setSubmitting] = useState(false);
-  const debouncedSearch = useDebouncedValue(search, 350);
-
-  const searchQuery = useQuery({
-    queryKey: ["workspace", activeWorkspaceId, "leads", "list-picker", debouncedSearch],
-    queryFn: () =>
-      listLeads(activeWorkspaceId!, { limit: 25, q: debouncedSearch, status: "ACTIVE" }),
-    enabled: Boolean(activeWorkspaceId && open),
-  });
 
   function close() {
     setSearch("");
@@ -90,8 +76,6 @@ export function AddListMembersDialog({
     }
   }
 
-  const leads = searchQuery.data?.items ?? [];
-
   return (
     <Dialog
       open={open}
@@ -126,65 +110,14 @@ export function AddListMembersDialog({
     >
       <div className="space-y-4 p-4">
         {error ? <Alert>{error}</Alert> : null}
-        <div className="relative">
-          <Search
-            className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-slate-400"
-            aria-hidden="true"
-          />
-          <Input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search active leads by name, email or company"
-            className="pl-9"
-            disabled={submitting}
-            autoFocus
-          />
-        </div>
-
-        {searchQuery.isLoading ? (
-          <div className="flex h-32 items-center justify-center">
-            <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
-          </div>
-        ) : leads.length === 0 ? (
-          <p className="py-6 text-center text-sm text-slate-500">
-            {debouncedSearch
-              ? "No active leads match that search."
-              : "Search for leads to add to this list."}
-          </p>
-        ) : (
-          <div className="max-h-80 divide-y divide-slate-100 overflow-y-auto rounded-md border border-slate-200">
-            {leads.map((lead) => (
-              <label
-                key={lead.id}
-                className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-slate-50"
-              >
-                <input
-                  type="checkbox"
-                  checked={selected.has(lead.id)}
-                  disabled={submitting}
-                  onChange={(event) =>
-                    setSelected((current) => {
-                      const next = new Set(current);
-                      if (event.target.checked) next.add(lead.id);
-                      else next.delete(lead.id);
-                      return next;
-                    })
-                  }
-                  className="h-4 w-4 rounded border-slate-300 text-brand-600"
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block font-medium text-slate-900">
-                    {fullName(lead.first_name, lead.last_name)}
-                  </span>
-                  <span className="block text-slate-500">
-                    {lead.email}
-                    {lead.company ? ` · ${lead.company}` : ""}
-                  </span>
-                </span>
-              </label>
-            ))}
-          </div>
-        )}
+        <LeadPicker
+          enabled={open}
+          search={search}
+          onSearchChange={setSearch}
+          selected={selected}
+          onSelectedChange={setSelected}
+          disabled={submitting}
+        />
       </div>
     </Dialog>
   );

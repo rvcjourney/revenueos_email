@@ -108,6 +108,16 @@ class OutboundMessageEnvelope:
     body_text: str | None = None
     rfc_message_id: str | None = None
     attachments: tuple[EnvelopeAttachment, ...] = ()
+    # Extra RFC 5322 headers (name, value), e.g. List-Unsubscribe. Written by the
+    # raw-MIME providers (Gmail, SMTP). Microsoft Graph's JSON send only accepts
+    # custom headers starting with "x-", so that adapter does not send them.
+    extra_headers: tuple[tuple[str, str], ...] = ()
+    # The provider thread to send into (a same-thread follow-up, ADR-0021). Only
+    # Gmail uses it; the reply headers travel in extra_headers.
+    provider_thread_id: str | None = None
+    # The Message-ID being replied to (ADR-0021). Microsoft Graph, which ignores
+    # extra_headers, finds that message and replies to it with createReply.
+    in_reply_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +134,9 @@ class ProviderSendResult:
     error_code: str | None = None
     raw_response: dict[str, Any] | None = None
     retry_after_seconds: float | None = None
+    # The provider refused the requested thread and the message was sent outside
+    # it (it still carries the reply headers).
+    thread_dropped: bool = False
 
 
 @dataclass(frozen=True)
@@ -219,6 +232,8 @@ class EmailProvider(Protocol):
         self,
         credential: Mapping[str, Any],
         envelope: OutboundMessageEnvelope,
+        *,
+        authorization_deadline: datetime | None = None,
     ) -> ProviderSendResult: ...
 
     def classify_error(

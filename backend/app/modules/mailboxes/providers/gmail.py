@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 import httpx
 
 from app.core.config import Settings
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers.base import (
     ClassifiedProviderError,
     ConnectionValidationResult,
@@ -71,6 +71,24 @@ def _looks_like_delivery_report(message: ProviderInboundMessage) -> bool:
     return "multipart/report" in content_type or sender.startswith(
         ("mailer-daemon@", "postmaster@")
     )
+
+
+def _thread_not_found(resp: httpx.Response) -> bool:
+    """Gmail refused the send because of its threadId. [inferred] Google does not
+    document this error: messages.send answers 404 "Requested entity was not
+    found." for a thread that does not exist (nothing else in the request names
+    an entity), and 400 "Invalid thread_id value" for a malformed one. Any other
+    rejection is classified as usual and not retried."""
+    if resp.status_code == 404:
+        return True
+    if resp.status_code != 400:
+        return False
+    try:
+        error = resp.json().get("error", {})
+    except ValueError:
+        return False
+    message = str(error.get("message", "")) if isinstance(error, dict) else ""
+    return "thread" in message.lower()
 
 
 class GmailProvider(EmailProvider):
@@ -236,7 +254,11 @@ class GmailProvider(EmailProvider):
             raise AppError(
                 "auth_failure" if classified.requires_reconnect else "provider_error",
                 classified.safe_message,
-                status_code=401 if classified.requires_reconnect else 502,
+                status_code=(
+                    PROVIDER_AUTH_REJECTED_STATUS
+                    if classified.requires_reconnect
+                    else 502
+                ),
             )
 
         payload = resp.json()
@@ -279,7 +301,11 @@ class GmailProvider(EmailProvider):
             raise AppError(
                 "provider_error",
                 f"Failed to retrieve Gmail identity: {classified.safe_message}",
-                status_code=401 if classified.requires_reconnect else 502,
+                status_code=(
+                    PROVIDER_AUTH_REJECTED_STATUS
+                    if classified.requires_reconnect
+                    else 502
+                ),
             )
 
         payload = resp.json()
@@ -311,6 +337,9 @@ class GmailProvider(EmailProvider):
         self,
         credential: Mapping[str, Any],
         envelope: OutboundMessageEnvelope,
+        *,
+        # Only Graph uses it (a send-time budget); the others ignore it.
+        authorization_deadline: datetime | None = None,
     ) -> ProviderSendResult:
         access_token = credential["access_token"]
 
@@ -332,10 +361,21 @@ class GmailProvider(EmailProvider):
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
-        body = {"raw": encoded_raw}
+        body: dict[str, str] = {"raw": encoded_raw}
+        if envelope.provider_thread_id:
+            body["threadId"] = envelope.provider_thread_id
 
+        thread_dropped = False
         try:
             resp = client.post(GMAIL_SEND_URL, headers=headers, json=body)
+            if "threadId" in body and _thread_not_found(resp):
+                # The reply's thread is gone (deleted by the user, or never ours).
+                # This answer proves nothing was sent, so send it once outside the
+                # thread; the reply headers still thread it for the recipient.
+                thread_dropped = True
+                resp = client.post(
+                    GMAIL_SEND_URL, headers=headers, json={"raw": encoded_raw}
+                )
         except httpx.TimeoutException:
             # Ambiguous: submission may have succeeded remotely before
             # the connection dropped
@@ -364,6 +404,7 @@ class GmailProvider(EmailProvider):
                 or envelope.rfc_message_id,
                 accepted_at=datetime.now(UTC),
                 raw_response=data,
+                thread_dropped=thread_dropped,
             )
 
         # Non-200 response
@@ -606,7 +647,11 @@ class GmailProvider(EmailProvider):
     ) -> SyncPageResult:
         access_token = credential.get("access_token")
         if not access_token:
-            raise AppError("auth_failure", "Missing access token for Gmail sync", status_code=401)
+            raise AppError(
+                "auth_failure",
+                "Missing access token for Gmail sync",
+                status_code=PROVIDER_AUTH_REJECTED_STATUS,
+            )
 
         client = self._get_client()
         headers = {"Authorization": f"Bearer {access_token}"}

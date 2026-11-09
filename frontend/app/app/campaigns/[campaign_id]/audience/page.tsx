@@ -3,21 +3,23 @@
 import { useParams } from "next/navigation";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Loader2, Users, XCircle } from "lucide-react";
+import { CheckCircle2, FileUp, Loader2, Users, XCircle } from "lucide-react";
 
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { AddLeadsPanel } from "@/components/campaigns/add-leads-panel";
+import { AudienceCsvImportDialog } from "@/components/campaigns/audience-csv-import-dialog";
+import { AudiencePicker } from "@/components/campaigns/audience-picker";
 import { ApiError } from "@/lib/api-client";
 import {
   abandonAudience,
   commitAudience,
   getAudienceExclusions,
+  getCampaign,
   getCommittedAudience,
   selectAudience,
 } from "@/lib/campaigns-api";
-import { listLeadLists, listLeads } from "@/lib/leads-api";
-import { canDraftCampaign } from "@/lib/permissions";
+import { canDraftCampaign, canExecuteCampaign } from "@/lib/permissions";
 import { useWorkspace } from "@/lib/workspace-context";
 import type { CampaignAudience } from "@/types/domain";
 import { LoadingBlock } from "@/components/ui/skeleton";
@@ -205,6 +207,7 @@ export default function CampaignAudiencePage() {
   const [leadSearch, setLeadSearch] = useState("");
   const [selectedLeadIds, setSelectedLeadIds] = useState<Set<string>>(new Set());
   const [actionError, setActionError] = useState<string | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
 
   const audienceKey = ["workspace", activeWorkspaceId, "campaigns", campaignId, "audience"];
 
@@ -219,31 +222,23 @@ export default function CampaignAudiencePage() {
       query.state.data?.status === "CAPTURING" ? 2000 : false,
   });
 
-  const listsQuery = useQuery({
-    queryKey: ["workspace", activeWorkspaceId, "lead-lists", { forCampaign: true }],
-    queryFn: () =>
-      activeWorkspaceId
-        ? listLeadLists(activeWorkspaceId, { limit: 100 })
-        : Promise.reject(new Error("No active workspace")),
-    enabled: Boolean(activeWorkspaceId),
-  });
-
-  const leadsQuery = useQuery({
-    queryKey: [
-      "workspace",
-      activeWorkspaceId,
-      "leads",
-      { forCampaign: true, q: leadSearch },
-    ],
-    queryFn: () =>
-      activeWorkspaceId
-        ? listLeads(activeWorkspaceId, { limit: 25, q: leadSearch || null })
-        : Promise.reject(new Error("No active workspace")),
-    enabled: Boolean(activeWorkspaceId && leadSearch.trim().length > 0),
+  const campaignQuery = useQuery({
+    queryKey: ["workspace", activeWorkspaceId, "campaigns", campaignId],
+    queryFn: () => getCampaign(activeWorkspaceId as string, campaignId),
+    enabled: Boolean(activeWorkspaceId && campaignId),
   });
 
   const invalidateAudience = () =>
     queryClient.invalidateQueries({ queryKey: audienceKey });
+
+  // A CSV import changes the audience, the campaign's readiness and the lists.
+  const refreshAfterImport = () => {
+    queryClient.invalidateQueries({
+      queryKey: ["workspace", activeWorkspaceId, "campaigns", campaignId],
+    });
+    queryClient.invalidateQueries({ queryKey: ["workspace", activeWorkspaceId, "lead-lists"] });
+    queryClient.invalidateQueries({ queryKey: ["workspace", activeWorkspaceId, "leads"] });
+  };
 
   const selectMutation = useMutation({
     mutationFn: () => {
@@ -282,20 +277,44 @@ export default function CampaignAudiencePage() {
   });
 
   const audience = audienceQuery.data;
-  const canSelectNew =
-    mayDraft && (!audience || audience.status !== "CAPTURING");
+  const status = campaignQuery.data?.status;
+  // The audience is chosen while the campaign is a draft. Once it is activated it is
+  // frozen, except that a manager can add leads while it is paused (ADR-0020).
+  const isDraft = status === "DRAFT";
+  const canSelectNew = isDraft && mayDraft && (!audience || audience.status !== "CAPTURING");
+  const canAddLeads = status === "PAUSED" && canExecuteCampaign(activeWorkspace?.role_code);
 
   return (
     <div className="max-w-3xl space-y-6">
-      <div>
-        <h2 className="text-lg font-semibold text-slate-900">Audience</h2>
-        <p className="text-sm text-slate-500">
-          Select the leads or lists you intend to include. Suppression and
-          eligibility are re-checked again before anything sends.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-900">Audience</h2>
+          <p className="text-sm text-slate-500">
+            Select the leads or lists you intend to include. Suppression and
+            eligibility are re-checked again before anything sends.
+          </p>
+        </div>
+        {canSelectNew && activeWorkspaceId && campaignQuery.data?.status === "DRAFT" ? (
+          <Button type="button" variant="outline" onClick={() => setImportOpen(true)}>
+            <FileUp className="mr-1.5 h-4 w-4" aria-hidden="true" />
+            Import from CSV
+          </Button>
+        ) : null}
       </div>
 
       {actionError && <Alert variant="error">{actionError}</Alert>}
+
+      {status && !isDraft ? (
+        <Alert variant="info">
+          {status === "PAUSED"
+            ? canAddLeads
+              ? "This campaign's audience is fixed, but you can add more leads below while it is paused."
+              : "This campaign's audience is fixed. Only a manager can add leads to a paused campaign."
+            : status === "RUNNING" || status === "SCHEDULED"
+              ? "This campaign's audience is fixed while it is running. Pause the campaign to add leads."
+              : "This campaign's audience is fixed."}
+        </Alert>
+      ) : null}
 
       {audienceQuery.isLoading ? (
         <LoadingBlock />
@@ -306,7 +325,7 @@ export default function CampaignAudiencePage() {
           audience={audience}
           onCommit={() => commitMutation.mutate()}
           onAbandon={() => abandonMutation.mutate()}
-          canManage={mayDraft}
+          canManage={mayDraft && isDraft}
           isCommitting={commitMutation.isPending}
           isAbandoning={abandonMutation.isPending}
         />
@@ -328,84 +347,17 @@ export default function CampaignAudiencePage() {
           </p>
 
           <div className="mt-4 space-y-4">
-            <div>
-              <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Lead lists
-              </h4>
-              <div className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-md border border-slate-200 p-2">
-                {listsQuery.data?.items.length ? (
-                  listsQuery.data.items.map((list) => (
-                    <label
-                      key={list.id}
-                      className="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-slate-50"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedListIds.has(list.id)}
-                        onChange={(e) => {
-                          const next = new Set(selectedListIds);
-                          if (e.target.checked) next.add(list.id);
-                          else next.delete(list.id);
-                          setSelectedListIds(next);
-                        }}
-                      />
-                      {list.name}
-                      <span className="text-xs text-slate-400">
-                        ({list.member_count})
-                      </span>
-                    </label>
-                  ))
-                ) : (
-                  <p className="px-2 py-1 text-xs text-slate-400">No lists yet.</p>
-                )}
-              </div>
-            </div>
-
-            <div>
-              <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Individual leads
-              </h4>
-              <Input
-                className="mt-2"
-                placeholder="Search leads by name, email, or company..."
-                value={leadSearch}
-                onChange={(e) => setLeadSearch(e.target.value)}
+            {activeWorkspaceId ? (
+              <AudiencePicker
+                workspaceId={activeWorkspaceId}
+                selectedListIds={selectedListIds}
+                onListsChange={setSelectedListIds}
+                selectedLeadIds={selectedLeadIds}
+                onLeadsChange={setSelectedLeadIds}
+                leadSearch={leadSearch}
+                onLeadSearchChange={setLeadSearch}
               />
-              {leadSearch.trim() && (
-                <div className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-md border border-slate-200 p-2">
-                  {leadsQuery.data?.items.length ? (
-                    leadsQuery.data.items.map((lead) => (
-                      <label
-                        key={lead.id}
-                        className="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-slate-50"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedLeadIds.has(lead.id)}
-                          onChange={(e) => {
-                            const next = new Set(selectedLeadIds);
-                            if (e.target.checked) next.add(lead.id);
-                            else next.delete(lead.id);
-                            setSelectedLeadIds(next);
-                          }}
-                        />
-                        {lead.first_name} {lead.last_name} &mdash; {lead.email}
-                      </label>
-                    ))
-                  ) : (
-                    <p className="px-2 py-1 text-xs text-slate-400">
-                      No matching leads.
-                    </p>
-                  )}
-                </div>
-              )}
-              {selectedLeadIds.size > 0 && (
-                <p className="mt-1 text-xs text-slate-500">
-                  {selectedLeadIds.size} lead{selectedLeadIds.size === 1 ? "" : "s"}{" "}
-                  selected individually.
-                </p>
-              )}
-            </div>
+            ) : null}
 
             <div className="flex justify-end">
               <Button
@@ -424,6 +376,21 @@ export default function CampaignAudiencePage() {
           </div>
         </div>
       )}
+
+      {canAddLeads && activeWorkspaceId ? (
+        <AddLeadsPanel workspaceId={activeWorkspaceId} campaignId={campaignId} />
+      ) : null}
+
+      {activeWorkspaceId && campaignQuery.data ? (
+        <AudienceCsvImportDialog
+          open={importOpen}
+          onOpenChange={setImportOpen}
+          workspaceId={activeWorkspaceId}
+          campaignId={campaignId}
+          campaignName={campaignQuery.data.name}
+          onChanged={refreshAfterImport}
+        />
+      ) : null}
     </div>
   );
 }

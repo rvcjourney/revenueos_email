@@ -15,6 +15,7 @@ from app.api.deps import (
 from app.core.auth import AuthenticatedPrincipal
 from app.core.errors import AppError
 from app.core.permissions import require_permission
+from app.modules.unsubscribe.compliance import validate_compliance_section
 from app.schemas.workspace import (
     MembershipOut,
     WorkspaceCreateIn,
@@ -155,8 +156,11 @@ def update_workspace(
         set_clauses.append("name = :name")
         params["name"] = payload.name
     if payload.defaults is not None:
+        defaults = dict(payload.defaults)
+        if "compliance" in defaults:
+            defaults["compliance"] = validate_compliance_section(defaults["compliance"])
         set_clauses.append("defaults = CAST(:defaults AS jsonb)")
-        params["defaults"] = json.dumps(payload.defaults)
+        params["defaults"] = json.dumps(defaults)
 
     row = (
         db.execute(

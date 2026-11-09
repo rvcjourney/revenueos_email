@@ -7,7 +7,15 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import WorkspaceContext, get_db
 from app.core.permissions import require_permission
+from app.modules.analytics.activity import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    CampaignActivityService,
+)
 from app.modules.analytics.schemas import (
+    CampaignActivityPage,
+    CampaignActivityStatus,
+    CampaignActivityType,
     CampaignAnalytics,
     CampaignSequenceAnalytics,
     DeliverabilityOverview,
@@ -62,6 +70,45 @@ def get_campaign_analytics(
 ) -> CampaignAnalytics:
     """Fetch authoritative campaign-level performance metrics and rates."""
     return AnalyticsService(db).get_campaign_analytics(context, campaign_id)
+
+
+@router.get("/campaigns/{campaign_id}/activity", response_model=CampaignActivityPage)
+def get_campaign_activity(
+    campaign_id: UUID,
+    type: CampaignActivityType | None = Query(
+        default=None, description="Only this kind of activity"
+    ),
+    status: CampaignActivityStatus | None = Query(
+        default=None, description="Only activity with this outcome status"
+    ),
+    start_date: str | None = Query(
+        default=None, description="Window start in YYYY-MM-DD format"
+    ),
+    end_date: str | None = Query(
+        default=None, description="Window end in YYYY-MM-DD format"
+    ),
+    q: str | None = Query(
+        default=None,
+        max_length=100,
+        description="Search recipient email or subject",
+    ),
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    cursor: str | None = Query(default=None, max_length=512),
+    context: WorkspaceContext = Depends(require_permission("product.read")),
+    db: Session = Depends(get_db),
+) -> CampaignActivityPage:
+    """Newest-first history of what happened in one campaign."""
+    return CampaignActivityService(db).get_activity(
+        context,
+        campaign_id,
+        activity_type=type,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+        q=q,
+        limit=limit,
+        cursor=cursor,
+    )
 
 
 @router.get(

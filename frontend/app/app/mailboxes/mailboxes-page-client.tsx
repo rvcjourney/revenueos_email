@@ -82,7 +82,8 @@ export function MailboxesPageClient() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+          <p className="mb-1.5 text-xs font-semibold uppercase tracking-[0.08em] text-brand-600">Workspace</p>
+          <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">
             Mailboxes
           </h1>
           <p className="mt-1 text-sm text-slate-500">
@@ -135,7 +136,7 @@ export function MailboxesPageClient() {
         <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-card">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
-              <thead className="bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
                 <tr>
                   <th scope="col" className="px-4 py-3">
                     Account

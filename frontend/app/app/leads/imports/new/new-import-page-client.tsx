@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Loader2, UploadCloud } from "lucide-react";
 
@@ -45,6 +45,10 @@ type NewImportPageClientProps = {
   // A dialog wrapper supplies its own title, so it hides this page's own
   // heading to avoid showing the same title twice.
   showHeading?: boolean;
+  // Imports into a list that doesn't exist yet: called once when the import is
+  // started, so cancelling the wizard leaves nothing behind. Leads only, and the
+  // list picker is hidden because the target is decided by the caller.
+  createTargetList?: () => Promise<string>;
 };
 
 export function NewImportPageClient({
@@ -52,6 +56,7 @@ export function NewImportPageClient({
   defaultListId = "",
   onImported,
   showHeading = true,
+  createTargetList,
 }: NewImportPageClientProps = {}) {
   const router = useRouter();
   const { activeWorkspaceId } = useWorkspace();
@@ -63,6 +68,8 @@ export function NewImportPageClient({
   const [uploadResult, setUploadResult] = useState<ImportUploadOut | null>(null);
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  // Kept so retrying a failed start reuses the list instead of creating another.
+  const createdTargetListId = useRef<string | null>(null);
   const mappableFields =
     importKind === "LEADS" ? LEAD_IMPORT_FIELDS : SUPPRESSION_IMPORT_FIELDS;
 
@@ -86,8 +93,13 @@ export function NewImportPageClient({
   });
 
   const createMutation = useMutation({
-    mutationFn: () =>
-      createImport(activeWorkspaceId!, {
+    mutationFn: async () => {
+      let targetListId: string | null = listId || null;
+      if (createTargetList) {
+        createdTargetListId.current ??= await createTargetList();
+        targetListId = createdTargetListId.current;
+      }
+      return createImport(activeWorkspaceId!, {
         storage_object_key: uploadResult!.storage_object_key,
         storage_object_version: uploadResult!.storage_object_version,
         storage_object_digest: uploadResult!.storage_object_digest,
@@ -97,8 +109,9 @@ export function NewImportPageClient({
           columns: toApiColumns(mapping),
           source_filename: file!.name,
         },
-        list_id: listId || null,
-      }),
+        list_id: targetListId,
+      });
+    },
     onSuccess: (job) => {
       if (onImported) onImported(job);
       else router.push(`/app/leads/imports/${job.id}`);
@@ -146,7 +159,7 @@ export function NewImportPageClient({
     <main className="mx-auto max-w-3xl space-y-6">
       {showHeading ? (
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+          <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">
             New Import
           </h1>
           <p className="mt-2 text-sm text-slate-500">
@@ -161,31 +174,33 @@ export function NewImportPageClient({
         <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-card">
           <form onSubmit={handleUpload} className="space-y-6">
             <div className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium text-slate-700">Import Type</label>
-                <div className="flex gap-4">
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="radio"
-                      checked={importKind === "LEADS"}
-                      onChange={() => setImportKind("LEADS")}
-                      className="text-brand-600 focus:ring-brand-600"
-                    />
-                    Leads
-                  </label>
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="radio"
-                      checked={importKind === "SUPPRESSION"}
-                      onChange={() => setImportKind("SUPPRESSION")}
-                      className="text-brand-600 focus:ring-brand-600"
-                    />
-                    Suppressions
-                  </label>
+              {!createTargetList && (
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium text-slate-700">Import Type</label>
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        checked={importKind === "LEADS"}
+                        onChange={() => setImportKind("LEADS")}
+                        className="text-brand-600 focus:ring-brand-600"
+                      />
+                      Leads
+                    </label>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        checked={importKind === "SUPPRESSION"}
+                        onChange={() => setImportKind("SUPPRESSION")}
+                        className="text-brand-600 focus:ring-brand-600"
+                      />
+                      Suppressions
+                    </label>
+                  </div>
                 </div>
-              </div>
+              )}
 
-              {importKind === "LEADS" && (
+              {importKind === "LEADS" && !createTargetList && (
                 <div className="space-y-1.5">
                   <label htmlFor="list-select" className="text-sm font-medium text-slate-700">
                     Add to List (Optional)

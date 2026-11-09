@@ -23,12 +23,17 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
 
+from app.modules.campaigns.follow_up_timing import (
+    intended_follow_up_due,
+    wait_edited_after,
+)
+from app.modules.campaigns.message_rendering import reply_subject
 from app.modules.campaigns.scheduling import project_into_window
 from app.modules.personalization.budget import RpmLimiter
 from app.modules.personalization.config_schema import parse_config
@@ -69,6 +74,8 @@ class RunnerConfig:
     chunk_size: int = 10
     max_transient_errors: int = 8
     daily_generation_cap: int = 2000
+    # How long before its due time a follow-up is written (the planner's lead time).
+    lead_seconds: int = 3600
 
     @classmethod
     def from_settings(cls, settings: Any) -> RunnerConfig:
@@ -77,6 +84,7 @@ class RunnerConfig:
             chunk_size=settings.personalization_chunk_size,
             max_transient_errors=settings.personalization_max_transient_errors,
             daily_generation_cap=settings.personalization_daily_generation_cap,
+            lead_seconds=settings.personalization_lead_time_seconds,
         )
 
 
@@ -109,6 +117,24 @@ class _Item:
     retry_codes: tuple[str, ...]
     work: Mapping[str, Any]
     previous: PreviousEmail | None
+    # Same-thread follow-up (ADR-0021): the subject it takes, or why it can't.
+    thread_subject: str | None = None
+    thread_unavailable: str | None = None
+
+
+def _thread_subject(
+    work: Mapping[str, Any], previous: PreviousEmail | None
+) -> tuple[str | None, str | None]:
+    """(subject, reason it is unavailable) of a follow-up sent in the same thread.
+    The parent stored when it was planned (messages.reply_to_message_id) decides;
+    without one (the lead changed mailbox) the previous sent email does; with
+    neither the model's own subject is kept and the reason recorded."""
+    if not work.get("email_same_thread"):
+        return None, None
+    source = work.get("parent_subject") or (previous.subject if previous else None)
+    if source:
+        return reply_subject(source), None
+    return None, "previous_subject_missing"
 
 
 def _backoff(base: int, cap: int, n: int) -> float:
@@ -226,6 +252,7 @@ class GenerationRunner:
                     workspace_id=workspace_id, generation_id=generation_id
                 )
                 previous = self._load_previous(repo, workspace_id, work, now)
+                thread_subject, thread_unavailable = _thread_subject(work, previous)
                 items.append(
                     _Item(
                         generation_id=generation_id,
@@ -237,6 +264,8 @@ class GenerationRunner:
                         retry_codes=tuple(row["last_failure_codes"] or ()),
                         work=dict(work),
                         previous=previous,
+                        thread_subject=thread_subject,
+                        thread_unavailable=thread_unavailable,
                     )
                 )
         return items
@@ -286,6 +315,8 @@ class GenerationRunner:
             # Paused between the claim and now: don't spend a model call.
             self._defer_paused(workspace_id, item, summary)
             return
+        if self._hold_back_until_lead_time(workspace_id, item, work, summary):
+            return
 
         try:
             config = parse_config(work["personalization_config"])
@@ -301,12 +332,14 @@ class GenerationRunner:
             workspace_id=workspace_id,
             frozen_variables=work["frozen_variables"] or {},
             objective=config,
-            reference_subject=work["email_subject"],
+            # A threaded step may have no subject of its own.
+            reference_subject=work["email_subject"] or "",
             reference_body_html=work["email_body_html"],
             reference_preheader=work["email_preheader"],
             step_position=int(work["step_position"]),
             previous=item.previous,
             retry_codes=item.retry_codes,
+            thread_subject=item.thread_subject,
         )
         try:
             outcome = self._service.attempt(inputs)
@@ -352,6 +385,73 @@ class GenerationRunner:
                 workspace_id=workspace_id, generation_id=item.generation_id
             )
         summary.superseded += 1
+
+    def _intended_due(
+        self,
+        repo: Any,
+        workspace_id: UUID,
+        work: Mapping[str, Any],
+        planned_due: datetime | None,
+    ) -> datetime | None:
+        """When this follow-up should go out, given the waits as they stand NOW (the
+        rule is shared with the post-resume re-time pass: follow_up_timing.py)."""
+        if work.get("anchor_at") is None:
+            return planned_due
+        steps = repo.list_step_waits(
+            workspace_id=workspace_id, sequence_id=work["sequence_id"]
+        )
+        return intended_follow_up_due(
+            steps=steps,
+            step_id=str(work["step_id"]),
+            anchor_at=work["anchor_at"],
+            planned_due=planned_due,
+            wait_edited=wait_edited_after(
+                steps, int(work["step_position"]), work.get("message_created_at")
+            ),
+            timezone=work["timezone"],
+            weekday_set=int(work["weekday_set"]),
+            window_start_local=work["window_start_local"],
+            window_end_local=work["window_end_local"],
+        )
+
+    def _hold_back_until_lead_time(
+        self,
+        workspace_id: UUID,
+        item: _Item,
+        work: Mapping[str, Any],
+        summary: ChunkSummary,
+    ) -> bool:
+        """The wait was made longer after this message was planned, so it is not yet
+        time to write it: move the message to its new time and look at it again one
+        lead time before that. No model call is spent. True when held back."""
+        if work.get("anchor_at") is None:
+            return False
+        now = self._clock()
+        with self._db.transaction() as repo:
+            target = self._intended_due(repo, workspace_id, work, work["due_at"])
+            lead = timedelta(seconds=self._config.lead_seconds)
+            if target is None or target - lead <= now:
+                return False
+            repo.retime_planned_message(
+                workspace_id=workspace_id, message_id=item.message_id, due_at=target
+            )
+            repo.finish_attempt(
+                workspace_id=workspace_id,
+                generation_id=item.generation_id,
+                attempt_no=item.attempt_no,
+                outcome="ABORTED_INELIGIBLE",
+            )
+            repo.refund_usage(
+                workspace_id=workspace_id, day=now.date(), kind="GENERATION"
+            )
+            repo.release_claim(
+                workspace_id=workspace_id,
+                generation_id=item.generation_id,
+                delay_seconds=max(1.0, (target - lead - now).total_seconds()),
+                refund_attempt=True,
+            )
+        summary.deferred += 1
+        return True
 
     def _defer_paused(
         self, workspace_id: UUID, item: _Item, summary: ChunkSummary
@@ -603,12 +703,20 @@ class GenerationRunner:
                 )
                 summary.superseded += 1
                 return
+            # The reference email was edited (while the campaign was paused, then
+            # resumed) after this generation read it: what was written follows the
+            # OLD reference. Throw it away and write it again from the new one.
+            reference_changed = item.work.get("step_version") is not None and str(
+                locked["step_version"]
+            ) != str(item.work["step_version"])
             if (
                 locked["campaign_status"] != "RUNNING"
                 or locked["planning_status"] != "READY"
+                or reference_changed
             ):
-                # Paused (or otherwise not running): keep the job for later, and
-                # do not spend the attempt or the budget unit.
+                # Paused (or otherwise not running), or the reference changed under
+                # us: keep the job for later, and do not spend the attempt or the
+                # budget unit.
                 repo.finish_attempt(
                     workspace_id=workspace_id,
                     generation_id=item.generation_id,
@@ -621,14 +729,16 @@ class GenerationRunner:
                 repo.release_claim(
                     workspace_id=workspace_id,
                     generation_id=item.generation_id,
-                    delay_seconds=_PAUSED_DEFER_SECONDS,
+                    delay_seconds=1 if reference_changed else _PAUSED_DEFER_SECONDS,
                     refund_attempt=True,
                 )
                 summary.deferred += 1
                 return
 
             work = item.work
-            intended: datetime = locked["due_at"] or now
+            intended: datetime = (
+                self._intended_due(repo, workspace_id, work, locked["due_at"]) or now
+            )
             due_at = project_into_window(
                 max(intended, now),
                 timezone=work["timezone"],
@@ -657,6 +767,12 @@ class GenerationRunner:
                 )
                 summary.superseded += 1
                 return
+            if item.thread_unavailable is not None:
+                repo.record_same_thread_unavailable(
+                    workspace_id=workspace_id,
+                    message_id=item.message_id,
+                    reason=item.thread_unavailable,
+                )
             fallback = outcome.kind == "FALLBACK"
             repo.finish_attempt(
                 workspace_id=workspace_id,

@@ -83,7 +83,7 @@ export function Dialog({
   return createPortal(
     <div
       className={cn(
-        "fixed inset-0 z-50 flex justify-center bg-slate-900/50 backdrop-blur-[1px] animate-fade-in",
+        "fixed inset-0 z-50 flex justify-center bg-ink-950/60 backdrop-blur-[2px] animate-fade-in",
         align === "center" ? "items-center p-4" : "items-stretch p-0 sm:p-4",
       )}
       onMouseDown={(event) => {
@@ -98,7 +98,7 @@ export function Dialog({
         tabIndex={-1}
         onKeyDown={onKeyDown}
         className={cn(
-          "flex w-full max-w-6xl flex-col overflow-hidden bg-white shadow-overlay outline-none animate-slide-up sm:rounded-xl",
+          "flex w-full max-w-6xl flex-col overflow-hidden bg-white shadow-overlay outline-none animate-slide-up sm:rounded-2xl",
           // "stretch" already fills the fixed-inset overlay's height via
           // items-stretch above. "center" sizes to content instead, so
           // without a cap here a tall form (e.g. Add Lead) grows past the
@@ -110,7 +110,7 @@ export function Dialog({
       >
         <div className="flex items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
           <div className="flex min-w-0 items-center gap-3">
-            <h2 id={titleId} className="truncate text-base font-semibold text-slate-900">
+            <h2 id={titleId} className="truncate text-base font-bold text-slate-900">
               {title}
             </h2>
             {headerContent}

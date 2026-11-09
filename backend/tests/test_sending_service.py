@@ -11,9 +11,12 @@ from app.core.config import Settings
 from app.modules.mailboxes.providers.base import ProviderSendResult
 from app.modules.mailboxes.providers.registry import ProviderRegistry
 from app.modules.rate_limit.schemas import (
+    RateDenial,
     RateLimitDenied,
     RateLimitUnavailable,
+    RatePolicySpec,
     RateReservation,
+    RateScopeKind,
 )
 from app.modules.scheduler.schemas import SendTaskPayload
 from app.modules.sending.repository import (
@@ -21,7 +24,13 @@ from app.modules.sending.repository import (
     MessageLockedByAnotherWorker,
 )
 from app.modules.sending.schemas import LoadedSendContext
-from app.modules.sending.service import SendingService
+from app.modules.sending.service import (
+    MAX_DEFERRAL,
+    MIN_DEFERRAL,
+    SAFETY_HOLD_RETRY,
+    SendingService,
+    deferral_delay,
+)
 
 
 def _payload(
@@ -96,6 +105,19 @@ def _reset_provider_registry() -> None:
     ProviderRegistry.reset()
 
 
+def _mailbox_policy() -> RatePolicySpec:
+    """The daily cap every connected mailbox has (50 per rolling 24 h)."""
+    return RatePolicySpec(
+        kind=RateScopeKind.MAILBOX,
+        source_id=str(uuid.uuid4()),
+        scope_key="mailbox-1",
+        unit="MESSAGE",
+        window_seconds=86_400,
+        limit_value=50,
+        min_spacing_seconds=60,
+    )
+
+
 def _make_service(ctx: LoadedSendContext | None = None) -> SendingService:
     session = MagicMock()
     # Default: no suppression row found (is_address_suppressed /
@@ -108,7 +130,9 @@ def _make_service(ctx: LoadedSendContext | None = None) -> SendingService:
     service.rate_limiter = MagicMock()
 
     service.repository.load_message_for_send.return_value = ctx
-    service.rate_policy_repository.resolve_applicable_policies.return_value = []
+    service.rate_policy_repository.resolve_applicable_policies.return_value = [
+        _mailbox_policy()
+    ]
     service.rate_limiter.current_generation.return_value = 1
     reservation = RateReservation(
         reservation_id="r1",
@@ -268,6 +292,119 @@ def test_rate_limit_denied_defers_and_never_calls_provider() -> None:
     fake_provider.send_message.assert_not_called()
 
 
+def _denial(retry_after_seconds: float | None) -> RateLimitDenied:
+    return RateLimitDenied(
+        RateDenial(
+            reason="CAPACITY_DENIED",
+            failing_kind=RateScopeKind.MAILBOX,
+            failing_scope_key="mailbox-1",
+            retry_after_seconds=retry_after_seconds,
+        )
+    )
+
+
+def _handed_back(service: SendingService) -> tuple[dict[str, object], float]:
+    """The one hand-back the service made, and how far in the future it is due."""
+    service.repository.defer_for_capacity.assert_called_once()
+    kwargs = service.repository.defer_for_capacity.call_args.kwargs
+    return kwargs, (kwargs["due_at"] - datetime.now(UTC)).total_seconds()
+
+
+def test_a_denied_message_is_handed_back_to_the_scheduler_not_left_queued() -> None:
+    """A mailbox at its cap used to leave the message QUEUED until the claim lease
+    expired, then claim it again at once. It must be rescheduled for later."""
+    ctx = _ctx(dispatch_generation=3)
+    service = _make_service(ctx)
+    service.rate_limiter.reserve.side_effect = _denial(3600.0)
+
+    outcome = service.execute(
+        _payload(
+            workspace_id=ctx.workspace_id,
+            message_id=ctx.message_id,
+            dispatch_generation=3,
+        )
+    )
+
+    assert (outcome.outcome, outcome.reason) == ("DEFERRED", "rate_limit_denied")
+    kwargs, wait = _handed_back(service)
+    assert kwargs["workspace_id"] == ctx.workspace_id
+    assert kwargs["message_id"] == ctx.message_id
+    assert kwargs["dispatch_generation"] == 3
+    assert 3600 <= wait <= 3600 * 1.1 + 1
+    service.session.commit.assert_called()
+
+
+def test_deferral_delay_is_clamped_and_jittered() -> None:
+    assert MIN_DEFERRAL.total_seconds() <= deferral_delay(None).total_seconds() <= 33.1
+    assert MIN_DEFERRAL.total_seconds() <= deferral_delay(0.5).total_seconds() <= 33.1
+    assert deferral_delay(-5.0) >= MIN_DEFERRAL
+    capped = deferral_delay(10_000_000.0).total_seconds()
+    assert MAX_DEFERRAL.total_seconds() <= capped <= MAX_DEFERRAL.total_seconds() * 1.1
+    # Jitter spreads a burst: not every call returns the same instant.
+    assert len({deferral_delay(600.0) for _ in range(20)}) > 1
+
+
+def test_a_campaign_mailbox_with_no_daily_cap_never_sends_unlimited() -> None:
+    fake_provider = MagicMock()
+    ProviderRegistry.register("GMAIL", fake_provider)
+    ctx = _ctx()
+    service = _make_service(ctx)
+    service.rate_policy_repository.resolve_applicable_policies.return_value = []
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert (outcome.outcome, outcome.reason) == ("DEFERRED", "mailbox_limits_missing")
+    service.rate_limiter.reserve.assert_not_called()
+    fake_provider.send_message.assert_not_called()
+    _, wait = _handed_back(service)
+    assert wait == pytest.approx(SAFETY_HOLD_RETRY.total_seconds(), abs=5)
+
+
+def test_a_short_window_pacing_policy_is_not_a_daily_cap() -> None:
+    """One message per 10 s paces a mailbox but would still allow thousands a day."""
+    ctx = _ctx()
+    service = _make_service(ctx)
+    pacing_only = RatePolicySpec(
+        **{**_mailbox_policy().__dict__, "window_seconds": 10, "limit_value": 1}
+    )
+    policies = service.rate_policy_repository.resolve_applicable_policies
+    policies.return_value = [pacing_only]
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert outcome.reason == "mailbox_limits_missing"
+    service.rate_limiter.reserve.assert_not_called()
+
+
+def test_a_message_that_is_not_a_campaign_send_does_not_need_a_mailbox_cap() -> None:
+    ctx = _ctx(purpose="CONTROLLED_TEST")
+    service = _make_service(ctx)
+    service.rate_policy_repository.resolve_applicable_policies.return_value = []
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert outcome.reason != "mailbox_limits_missing"
+
+
+def test_a_held_mailbox_hands_its_messages_back_for_fifteen_minutes() -> None:
+    ctx = _ctx(mailbox_pending_safety_count=1)
+    service = _make_service(ctx)
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert (outcome.outcome, outcome.reason) == ("DEFERRED", "safety_hold_active")
+    _, wait = _handed_back(service)
+    assert wait == pytest.approx(SAFETY_HOLD_RETRY.total_seconds(), abs=5)
+
+
 def test_rate_control_generation_mismatch_inside_transaction_aborts() -> None:
     fake_provider = MagicMock()
     ProviderRegistry.register("GMAIL", fake_provider)
@@ -322,6 +459,26 @@ def test_paused_campaign_defers_leaves_message_untouched() -> None:
     fake_provider.send_message.assert_not_called()
     service.repository.skip_message.assert_not_called()
     service.repository.finalize_attempt_result.assert_not_called()
+
+
+def test_message_from_before_a_resume_is_handed_back_not_sent() -> None:
+    """ADR-0020: claimed before the pause, so its time/content were never
+    re-validated by the reconcile pass. Released with a dispatch-generation bump
+    (not skipped, not sent) so the reconcile pass can re-stamp it."""
+    fake_provider = MagicMock()
+    ProviderRegistry.register("GMAIL", fake_provider)
+    ctx = _ctx(message_schedule_generation=1, campaign_schedule_generation=2)
+    service = _make_service(ctx)
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert outcome.outcome == "DEFERRED"
+    assert outcome.reason == "stale_schedule_generation"
+    fake_provider.send_message.assert_not_called()
+    service.repository.skip_message.assert_not_called()
+    service.repository.defer_for_capacity.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +679,7 @@ def _send_capturing_envelope(
     ProviderRegistry.register("GMAIL", fake_provider)
     service = _authorized_service(ctx)
     configured = Settings.current().model_copy(update=settings_overrides)
+    service.settings = configured
     with (
         patch(
             "app.modules.sending.service.decrypt_credentials",
@@ -616,7 +774,10 @@ def test_open_pixel_is_added_at_send_time_naming_this_message() -> None:
     token = envelope.body_html.split("/api/v1/t/o/")[1].split(".gif")[0]
     parsed = parse_open_token(token, TRACKING["tracking_signing_key"])
     assert parsed is not None
-    assert (parsed.workspace_id, parsed.message_id) == (ctx.workspace_id, ctx.message_id)
+    assert (parsed.workspace_id, parsed.message_id) == (
+        ctx.workspace_id,
+        ctx.message_id,
+    )
     # The send time is signed in so scanner fetches can be told from human opens.
     assert parsed.sent_at is not None
     # The frozen snapshot is untouched: the pixel exists only on the envelope.
@@ -631,7 +792,11 @@ def test_no_pixel_when_tracking_is_off_or_unconfigured() -> None:
         {**TRACKING, "tracking_signing_key": ""},
     ):
         envelope, _ = _send_capturing_envelope(_ctx(), accepted, **overrides)
-        assert envelope.body_html == "<p>Hi</p>"
+        # Every campaign email still gets its unsubscribe footer; only the pixel
+        # depends on tracking being configured.
+        assert "/api/v1/t/o/" not in envelope.body_html
+        assert "<img" not in envelope.body_html
+        assert envelope.body_html.startswith("<p>Hi</p>")
 
 
 def test_the_pixel_does_not_break_the_content_digest_check() -> None:
@@ -639,3 +804,95 @@ def test_the_pixel_does_not_break_the_content_digest_check() -> None:
     accepted = ProviderSendResult(status="ACCEPTED", provider_message_id="p")
     envelope, kwargs = _send_capturing_envelope(_ctx(), accepted, **TRACKING)
     assert kwargs["message_status"] == "SENT" and "<img" in envelope.body_html
+
+
+# ---------------------------------------------------------------------------
+# Mandatory unsubscribe: every campaign email carries a signed link
+# ---------------------------------------------------------------------------
+
+ACCEPTED = ProviderSendResult(status="ACCEPTED", provider_message_id="p")
+
+
+def test_a_campaign_email_carries_footer_headers_and_a_real_text_part() -> None:
+    from app.modules.unsubscribe.tokens import parse_unsubscribe_token
+
+    ctx = _ctx()
+    envelope, kwargs = _send_capturing_envelope(ctx, ACCEPTED)
+
+    assert kwargs["message_status"] == "SENT"
+    headers = dict(envelope.extra_headers)
+    assert headers["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
+    url = headers["List-Unsubscribe"].strip("<>")
+    assert url.startswith("https://app.test/api/v1/unsubscribe/")
+    # The link names exactly this message and verifies with the configured key.
+    parsed = parse_unsubscribe_token(
+        url.rsplit("/", 1)[1], Settings.current().unsubscribe_signing_key
+    )
+    assert parsed is not None
+    assert (parsed.workspace_id, parsed.message_id) == (
+        ctx.workspace_id,
+        ctx.message_id,
+    )
+    # The same link is in the visible footer and in the text alternative.
+    assert f'href="{url}"' in envelope.body_html
+    assert envelope.body_text and url in envelope.body_text
+    assert envelope.body_text.startswith("Hi")
+    # The frozen snapshot is untouched.
+    assert ctx.content_body_html == "<p>Hi</p>"
+
+
+def test_the_workspace_postal_address_is_in_the_footer() -> None:
+    fake_provider = MagicMock()
+    fake_provider.capabilities = frozenset()
+    fake_provider.send_message.return_value = ACCEPTED
+    ProviderRegistry.register("GMAIL", fake_provider)
+    ctx = _ctx()
+    service = _authorized_service(ctx)
+    service.repository.get_workspace_defaults.return_value = {
+        "compliance": {"postal_address": "1 Main St\nMumbai 400001"}
+    }
+
+    with patch(
+        "app.modules.sending.service.decrypt_credentials",
+        return_value={"access_token": "x"},
+    ):
+        service.execute(
+            _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+        )
+
+    envelope = fake_provider.send_message.call_args.args[1]
+    assert "1 Main St<br>Mumbai 400001" in envelope.body_html
+    assert "Mumbai 400001" in envelope.body_text
+    service.repository.get_workspace_defaults.assert_called_once_with(
+        workspace_id=ctx.workspace_id
+    )
+
+
+def test_without_unsubscribe_settings_nothing_is_reserved_or_sent() -> None:
+    """Fail closed, and before any capacity is spent."""
+    fake_provider = MagicMock()
+    ProviderRegistry.register("GMAIL", fake_provider)
+    ctx = _ctx()
+    service = _make_service(ctx)
+    service.settings = Settings.current().model_copy(
+        update={"unsubscribe_base_url": "", "unsubscribe_signing_key": ""}
+    )
+
+    outcome = service.execute(
+        _payload(workspace_id=ctx.workspace_id, message_id=ctx.message_id)
+    )
+
+    assert outcome.outcome == "DEFERRED"
+    assert outcome.reason == "unsubscribe_not_configured"
+    fake_provider.send_message.assert_not_called()
+    service.rate_limiter.reserve.assert_not_called()
+    service.repository.insert_prepared_attempt.assert_not_called()
+
+
+def test_a_controlled_test_send_is_not_given_a_footer() -> None:
+    ctx = _ctx(purpose="CONTROLLED_TEST")
+    service = _make_service(ctx)
+
+    html, text, headers = service._compose_outbound(ctx, None)
+
+    assert (html, text, headers) == ("<p>Hi</p>", None, ())

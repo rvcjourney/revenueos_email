@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers.base import (
     ErrorCategory,
     OutboundMessageEnvelope,
@@ -211,7 +211,7 @@ def test_get_identity_insufficient_scope_403() -> None:
 
     with pytest.raises(AppError) as exc_info:
         provider.get_identity("fake-token")
-    assert exc_info.value.status_code == 401
+    assert exc_info.value.status_code == PROVIDER_AUTH_REJECTED_STATUS
     assert "message could not be sent" not in exc_info.value.message.lower()
     assert "permissions" in exc_info.value.message.lower()
 

@@ -10,12 +10,29 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.core.metrics import (
     record_message_cancelled_due_to_event,
     record_suppression_created,
     record_unsubscribe_processed,
 )
+from app.db.context import enter_worker_scope
 from app.modules.events.repository import EventRepository, _safe_set_workspace
+from app.modules.unsubscribe.tokens import is_stateless_token, parse_unsubscribe_token
+
+
+def _enter_scope(session: Session, workspace_id: UUID, role_name: str) -> None:
+    """Run the rest of this transaction as `role_name` for one workspace.
+
+    A recipient who clicks an unsubscribe link is anonymous: there is no user, so
+    the request's own `app_api` role cannot satisfy the permission-based policies
+    on suppressions, enrollments or messages. The event-pipeline role
+    (`app_worker_general`) holds exactly those grants. SQLite (unit tests) has no
+    roles.
+    """
+    bind = session.get_bind()
+    if bind is not None and getattr(bind.dialect, "name", "") == "postgresql":
+        enter_worker_scope(session, workspace_id=workspace_id, role_name=role_name)
 
 
 class UnsubscribeService:
@@ -104,6 +121,52 @@ class UnsubscribeService:
 
         return dict(row)
 
+    def _resolve_reference(
+        self, raw_token: str, *, now: datetime
+    ) -> dict[str, Any] | None:
+        """Who a token refers to: workspace, address and the message it came from.
+
+        Stateless signed tokens are verified without the database and name a
+        message; the address is read from that message. Older stored-digest
+        tokens are looked up by digest. None means invalid.
+        """
+        if not is_stateless_token(raw_token):
+            return self.resolve_token(raw_token, now=now)
+
+        parsed = parse_unsubscribe_token(
+            raw_token, Settings.current().unsubscribe_signing_key
+        )
+        if parsed is None:
+            return None
+        _enter_scope(self.session, parsed.workspace_id, "app_worker_general")
+        row = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT address_id
+                    FROM public.messages
+                    WHERE workspace_id = :workspace_id AND id = :message_id
+                    """
+                ),
+                {
+                    "workspace_id": str(parsed.workspace_id),
+                    "message_id": str(parsed.message_id),
+                },
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            return None
+        return {
+            "id": None,
+            "workspace_id": parsed.workspace_id,
+            "address_id": row["address_id"],
+            "message_id": parsed.message_id,
+            "expires_at": None,
+            "revoked_at": None,
+        }
+
     def execute_unsubscribe(
         self,
         raw_token: str,
@@ -112,7 +175,7 @@ class UnsubscribeService:
     ) -> dict[str, Any]:
         """Atomically consume unsubscribe token, commit suppression, and stop enrollments."""
         now = now or datetime.now(UTC)
-        token_info = self.resolve_token(raw_token, now=now)
+        token_info = self._resolve_reference(raw_token, now=now)
 
         if token_info is None:
             return {
@@ -123,18 +186,18 @@ class UnsubscribeService:
 
         workspace_id = UUID(str(token_info["workspace_id"]))
         address_id = UUID(str(token_info["address_id"]))
-        token_id = UUID(str(token_info["id"]))
+        token_id = UUID(str(token_info["id"])) if token_info["id"] else None
         expires_at = token_info["expires_at"]
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-
-        # Check expiry
-        if now > expires_at:
-            return {
-                "success": False,
-                "status": "expired_token",
-                "message": "The unsubscribe link has expired.",
-            }
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            # Check expiry
+            if now > expires_at:
+                return {
+                    "success": False,
+                    "status": "expired_token",
+                    "message": "The unsubscribe link has expired.",
+                }
 
         # Check if already revoked (idempotent success)
         if token_info["revoked_at"] is not None:
@@ -146,6 +209,7 @@ class UnsubscribeService:
             }
 
         token_digest = self.hash_token(raw_token)
+        _enter_scope(self.session, workspace_id, "app_worker_general")
 
         # 1. Upsert durable suppression
         _, suppression_created = self.repo.upsert_suppression(
@@ -178,17 +242,21 @@ class UnsubscribeService:
             terminal_reason="unsubscribed",
         )
 
-        # 4. Revoke token
-        revoke_stmt = text(
-            """
-            UPDATE public.unsubscribe_tokens
-            SET revoked_at = :now,
-                version = version + 1
-            WHERE id = :token_id
-              AND revoked_at IS NULL
-            """
-        )
-        self.session.execute(revoke_stmt, {"token_id": str(token_id), "now": now})
+        # 4. Revoke a stored token (stateless tokens have no row; repeating one is
+        # harmless because every step above is idempotent).
+        if token_id is not None:
+            _enter_scope(self.session, workspace_id, "app_api")
+            revoke_stmt = text(
+                """
+                UPDATE public.unsubscribe_tokens
+                SET revoked_at = :now,
+                    version = version + 1
+                WHERE id = :token_id
+                  AND revoked_at IS NULL
+                """
+            )
+            self.session.execute(revoke_stmt, {"token_id": str(token_id), "now": now})
+            _enter_scope(self.session, workspace_id, "app_worker_general")
 
         # 5. Record domain event
         self.repo.record_domain_event(

@@ -652,3 +652,66 @@ describe("EmailStepDialog", () => {
     expect(within(dialog).getByRole("button", { name: "Close" })).toBeInTheDocument();
   });
 });
+
+describe("EmailStepDialog: send in same thread", () => {
+  const checkbox = () => screen.queryByRole("checkbox", { name: /send in same thread/i });
+
+  it("is not offered on the first email", async () => {
+    setup({ stepNumber: 1, day: 1, previousEmailDay: null, precedingWait: null });
+    await screen.findByLabelText("Subject", { selector: "input" });
+    expect(checkbox()).not.toBeInTheDocument();
+  });
+
+  it("loads the saved value and shows the reply subject instead of the subject input", async () => {
+    setup({ step: makeStep({ email_same_thread: true }), replySubject: "Re: Hello" });
+    expect(await screen.findByRole("checkbox", { name: /send in same thread/i })).toBeChecked();
+    expect(screen.queryByLabelText("Subject", { selector: "input" })).not.toBeInTheDocument();
+    expect(screen.getByText("Subject: Re: Hello")).toBeInTheDocument();
+  });
+
+  it("does not require a subject when checked, and saves the flag", async () => {
+    const user = userEvent.setup();
+    setup();
+    campaignsApi.updateSequenceStep.mockResolvedValue(makeStep({ email_same_thread: true }));
+    const subject = await screen.findByLabelText("Subject", { selector: "input" });
+    expect(checkbox()).not.toBeChecked();
+    await user.clear(subject);
+    await user.click(checkbox() as HTMLElement);
+    expect(screen.getByText("Subject: Re: (subject of the previous email)")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() =>
+      expect(campaignsApi.updateSequenceStep).toHaveBeenCalledWith("ws-1", "camp-1", "e2", {
+        expected_version: 4,
+        email_body_html: "<p>Hi {{first_name|there}},</p>",
+        email_preheader: "",
+        email_same_thread: true,
+      }),
+    );
+  });
+
+  it("requires a subject again when unchecked", async () => {
+    const user = userEvent.setup();
+    setup({ step: makeStep({ email_same_thread: true, email_subject: null }) });
+    await user.click((await screen.findByRole("checkbox", { name: /send in same thread/i })));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(await screen.findByText(/add a subject before saving/i)).toBeInTheDocument();
+    expect(campaignsApi.updateSequenceStep).not.toHaveBeenCalled();
+  });
+
+  it("explains a refused threading change on a step leads already reached", async () => {
+    const user = userEvent.setup();
+    setup();
+    campaignsApi.updateSequenceStep.mockRejectedValue(
+      new ApiError("server text", 409, "step_locked", null),
+    );
+    await user.click((await screen.findByRole("checkbox", { name: /send in same thread/i })));
+    expect(screen.getByText(/test sends use the saved/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+    expect(
+      await screen.findByText(
+        "Leads have already reached this step, so its threading can't change.",
+      ),
+    ).toBeInTheDocument();
+  });
+});

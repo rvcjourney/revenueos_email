@@ -42,6 +42,7 @@ function campaign(overrides: Partial<CampaignListItem> = {}): CampaignListItem {
 }
 
 const analytics = {
+  total_recipients: 140,
   sent: 125,
   opened: 22,
   replied: 3,
@@ -85,20 +86,23 @@ describe("CampaignCard", () => {
 
     expect(await screen.findByText("125")).toBeInTheDocument();
     expect(screen.getByText("Sent")).toBeInTheDocument();
-    expect(screen.getByText("Opened")).toBeInTheDocument();
-    expect(screen.getByText("Replies")).toBeInTheDocument();
-    expect(screen.getByText("Bounced")).toBeInTheDocument();
-    expect(screen.getByText(/open rate/)).toBeInTheDocument();
+    expect(screen.getByText("Total leads")).toBeInTheDocument();
+    expect(screen.getByText("140")).toBeInTheDocument();
+    expect(screen.getByText("Reply rate")).toBeInTheDocument();
+    expect(screen.getByText("2.4%")).toBeInTheDocument();
+    expect(screen.getByText("Open rate")).toBeInTheDocument();
+    expect(screen.getByText("18.4%")).toBeInTheDocument();
     expect(getCampaignAnalytics).toHaveBeenCalledWith("ws-1", "camp-1");
   });
 
-  it("hides Opened and falls back to reply rate when open tracking is unsupported", async () => {
+  it("shows bounces instead of an open rate when open tracking is unsupported", async () => {
     getCampaignAnalytics.mockResolvedValue({ ...analytics, open_tracking_supported: false });
     renderCard(campaign());
 
     expect(await screen.findByText("125")).toBeInTheDocument();
-    expect(screen.queryByText("Opened")).not.toBeInTheDocument();
-    expect(screen.getByText(/reply rate/)).toBeInTheDocument();
+    expect(screen.queryByText("Open rate")).not.toBeInTheDocument();
+    expect(screen.getByText("Reply rate")).toBeInTheDocument();
+    expect(screen.getByText("Bounced")).toBeInTheDocument();
   });
 
   it("degrades quietly when metrics fail to load", async () => {
@@ -113,15 +117,32 @@ describe("CampaignCard", () => {
     );
   });
 
-  it("offers Configure to editors and View to read-only roles", () => {
+  it("names the main action after the campaign's state, and offers only View to read-only roles", () => {
     getCampaignAnalytics.mockResolvedValue(analytics);
-    const { unmount } = renderCard(campaign(), true);
-    expect(screen.getByRole("link", { name: "Configure" })).toBeInTheDocument();
-    unmount();
+    const overview = "/app/campaigns/camp-1/overview";
+    const cases: [CampaignListItem["status"], string, string][] = [
+      ["DRAFT", "Continue setup", overview],
+      ["RUNNING", "View progress", overview],
+      ["PAUSED", "View details", overview],
+      ["COMPLETED", "View report", "/app/campaigns/camp-1/analytics"],
+    ];
+    for (const [status, label, href] of cases) {
+      const { unmount } = renderCard(campaign({ status }), true);
+      expect(screen.getByRole("link", { name: label })).toHaveAttribute("href", href);
+      unmount();
+    }
 
-    renderCard(campaign(), false);
-    expect(screen.getByRole("link", { name: "View" })).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "Configure" })).not.toBeInTheDocument();
+    renderCard(campaign({ status: "COMPLETED" }), false);
+    expect(screen.getByRole("link", { name: "View" })).toHaveAttribute("href", overview);
+    expect(screen.queryByRole("link", { name: "View report" })).not.toBeInTheDocument();
+  });
+
+  it("describes the campaign's latest event and who created it", () => {
+    renderCard(
+      campaign({ status: "DRAFT", creator_name: "Naitik Patel", created_at: "2026-01-01T00:00:00Z" }),
+    );
+    expect(screen.getByText(/^Created /)).toBeInTheDocument();
+    expect(screen.getByText("by Naitik Patel")).toBeInTheDocument();
   });
 
   it("offers archive per state and role: drafts to editors, activated ones to executors, never running", async () => {

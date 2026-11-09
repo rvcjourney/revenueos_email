@@ -5,16 +5,17 @@ import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 
 from app.core.config import Settings
-from app.core.errors import AppError
+from app.core.errors import PROVIDER_AUTH_REJECTED_STATUS, AppError
 from app.modules.mailboxes.providers.base import (
     ClassifiedProviderError,
     ConnectionValidationResult,
     EmailProvider,
+    EnvelopeAttachment,
     ErrorCategory,
     OutboundMessageEnvelope,
     ProviderAccountIdentity,
@@ -45,12 +46,16 @@ MAIL_SEND_SCOPE = "https://graph.microsoft.com/Mail.Send"
 # reveals the Message-ID and conversation id that replies and bounces refer to,
 # and the same scope covers reading the Inbox for reply synchronization.
 MAIL_READWRITE_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite"
+# get_identity() calls Graph /me, which answers 403 to a token that carries
+# only Mail.* scopes; User.Read is the minimal scope that allows it.
+USER_READ_SCOPE = "https://graph.microsoft.com/User.Read"
 
 MICROSOFT_DEFAULT_SCOPES = [
     "openid",
     "profile",
     "email",
     "offline_access",
+    USER_READ_SCOPE,
     MAIL_SEND_SCOPE,
     MAIL_READWRITE_SCOPE,
 ]
@@ -60,6 +65,41 @@ class _GraphRateLimited(Exception):
     def __init__(self, retry_after: float) -> None:
         super().__init__("graph rate limited")
         self.retry_after = retry_after
+
+
+_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=15.0)
+# One request's worst case on a fresh connection (connect + write + read). /send
+# is not started with less than this left before the authorization deadline.
+_WORST_REQUEST_SECONDS = 5.0 + 5.0 + 10.0
+
+
+def _attachment_json(attachment: EnvelopeAttachment) -> dict[str, Any]:
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": attachment.filename,
+        "contentType": attachment.content_type,
+        "contentBytes": base64.b64encode(attachment.data).decode("ascii"),
+        # Inline images are matched to the HTML by cid.
+        "isInline": attachment.content_id is not None,
+        **({"contentId": attachment.content_id} if attachment.content_id else {}),
+    }
+
+
+def _network_rejection(exc: Exception) -> ProviderSendResult:
+    """No answer from Graph before /send: nothing was sent, safe to retry."""
+    return ProviderSendResult(
+        status="DEFINITIVELY_REJECTED",
+        error_category=ErrorCategory.NETWORK_ERROR,
+        error_code="network_error",
+        raw_response={"detail": str(exc)},
+    )
+
+
+def _message_id_filter(rfc_message_id: str) -> str:
+    """The OData filter matching one internetMessageId, percent-encoded by hand:
+    httpx would send spaces as "+", and a Message-ID may itself contain "+"."""
+    value = f"<{rfc_message_id.strip().strip('<>')}>".replace("'", "''")
+    return quote(f"internetMessageId eq '{value}'", safe="")
 
 
 class MicrosoftGraphProvider(EmailProvider):
@@ -95,9 +135,7 @@ class MicrosoftGraphProvider(EmailProvider):
         if self._http_client is not None:
             return self._http_client
         if self._owned_http_client is None:
-            self._owned_http_client = httpx.Client(
-                timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=15.0)
-            )
+            self._owned_http_client = httpx.Client(timeout=_TIMEOUT)
         return self._owned_http_client
 
     @property
@@ -235,7 +273,11 @@ class MicrosoftGraphProvider(EmailProvider):
             raise AppError(
                 "auth_failure" if classified.requires_reconnect else "provider_error",
                 classified.safe_message,
-                status_code=401 if classified.requires_reconnect else 502,
+                status_code=(
+                    PROVIDER_AUTH_REJECTED_STATUS
+                    if classified.requires_reconnect
+                    else 502
+                ),
             )
 
         payload = resp.json()
@@ -279,7 +321,11 @@ class MicrosoftGraphProvider(EmailProvider):
             raise AppError(
                 "provider_error",
                 f"Failed to retrieve Microsoft identity: {classified.safe_message}",
-                status_code=401 if classified.requires_reconnect else 502,
+                status_code=(
+                    PROVIDER_AUTH_REJECTED_STATUS
+                    if classified.requires_reconnect
+                    else 502
+                ),
             )
 
         payload = resp.json()
@@ -316,6 +362,8 @@ class MicrosoftGraphProvider(EmailProvider):
         self,
         credential: Mapping[str, Any],
         envelope: OutboundMessageEnvelope,
+        *,
+        authorization_deadline: datetime | None = None,
     ) -> ProviderSendResult:
         access_token = credential["access_token"]
 
@@ -344,22 +392,7 @@ class MicrosoftGraphProvider(EmailProvider):
             },
         }
         if envelope.attachments:
-            message["attachments"] = [
-                {
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": attachment.filename,
-                    "contentType": attachment.content_type,
-                    "contentBytes": base64.b64encode(attachment.data).decode("ascii"),
-                    # Inline images are matched to the HTML by cid.
-                    "isInline": attachment.content_id is not None,
-                    **(
-                        {"contentId": attachment.content_id}
-                        if attachment.content_id
-                        else {}
-                    ),
-                }
-                for attachment in envelope.attachments
-            ]
+            message["attachments"] = [_attachment_json(a) for a in envelope.attachments]
         client = self._get_client()
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -371,19 +404,25 @@ class MicrosoftGraphProvider(EmailProvider):
         # replies and bounces refer to; a draft does. Creating the draft sends
         # nothing, so a failure or timeout at this step is a definitive
         # non-send and safe to retry.
-        try:
-            create = client.post(GRAPH_MESSAGES_URL, headers=headers, json=message)
-        except httpx.TransportError as exc:
-            return ProviderSendResult(
-                status="DEFINITIVELY_REJECTED",
-                error_category=ErrorCategory.NETWORK_ERROR,
-                error_code="network_error",
-                raw_response={"detail": str(exc)},
-            )
-        if create.status_code != 201:
-            return self._rejected_result(create)
+        # A same-thread follow-up (ADR-0021) is a reply draft made from its parent;
+        # with no parent to reply to it is sent as an ordinary draft.
+        thread_dropped = False
+        draft: dict[str, Any] | None = None
+        if envelope.in_reply_to:
+            reply = self._reply_draft(client, headers, envelope)
+            if isinstance(reply, ProviderSendResult):
+                return reply
+            thread_dropped = reply is None
+            draft = reply
+        if draft is None:
+            try:
+                create = client.post(GRAPH_MESSAGES_URL, headers=headers, json=message)
+            except httpx.TransportError as exc:
+                return _network_rejection(exc)
+            if create.status_code != 201:
+                return self._rejected_result(create)
+            draft = create.json()
 
-        draft = create.json()
         draft_id = draft.get("id")
         if not draft_id:
             return ProviderSendResult(
@@ -393,6 +432,21 @@ class MicrosoftGraphProvider(EmailProvider):
             )
         rfc_message_id = draft.get("internetMessageId") or envelope.rfc_message_id
         thread_id = draft.get("conversationId")
+
+        # Send-time budget (issue I-01): a /send that could still be running when
+        # the authorization deadline passes would race recovery, which then calls
+        # the attempt UNKNOWN. Not starting it is a clean non-send, retried normally.
+        if (
+            authorization_deadline is not None
+            and (authorization_deadline - datetime.now(UTC)).total_seconds()
+            < _WORST_REQUEST_SECONDS
+        ):
+            self._discard_draft(client, headers, str(draft_id))
+            return ProviderSendResult(
+                status="DEFINITIVELY_REJECTED",
+                error_category=ErrorCategory.TEMPORARY_PROVIDER_ERROR,
+                error_code="send_deadline_budget",
+            )
 
         try:
             resp = client.post(f"{GRAPH_MESSAGES_URL}/{draft_id}/send", headers=headers)
@@ -406,6 +460,7 @@ class MicrosoftGraphProvider(EmailProvider):
                 provider_message_id=str(draft_id),
                 provider_thread_id=thread_id,
                 rfc_message_id=rfc_message_id,
+                thread_dropped=thread_dropped,
             )
         except httpx.TransportError as exc:
             self._discard_draft(client, headers, str(draft_id))
@@ -425,6 +480,7 @@ class MicrosoftGraphProvider(EmailProvider):
                 rfc_message_id=rfc_message_id,
                 accepted_at=datetime.now(UTC),
                 raw_response=None,
+                thread_dropped=thread_dropped,
             )
 
         self._discard_draft(client, headers, str(draft_id))
@@ -433,11 +489,112 @@ class MicrosoftGraphProvider(EmailProvider):
     def _discard_draft(
         self, client: httpx.Client, headers: dict[str, str], draft_id: str
     ) -> None:
-        """Best-effort cleanup of a draft that was definitively not sent."""
+        """Best-effort cleanup of a draft that was definitively not sent. Never
+        raises: a leftover draft must not change the send's outcome."""
         try:
             client.delete(f"{GRAPH_MESSAGES_URL}/{draft_id}", headers=headers)
-        except httpx.HTTPError:
+        except Exception:  # noqa: BLE001 -- cleanup only; logged, outcome unchanged
             logger.warning("graph_draft_cleanup_failed", extra={"provider": "MICROSOFT"})
+
+    def _reply_draft(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        envelope: OutboundMessageEnvelope,
+    ) -> dict[str, Any] | ProviderSendResult | None:
+        """A reply draft to envelope.in_reply_to that holds exactly our snapshot
+        (ADR-0021 D4): the draft, None when there is no sent parent to reply to
+        (send unthreaded), or the rejection to return. Every call here only reads
+        mail or writes a draft, so any failure is a definitive non-send."""
+        assert envelope.in_reply_to is not None
+        # The whole mailbox (the lead's reply or the user may have moved it), but a
+        # draft is not a sent parent.
+        try:
+            found = client.get(
+                f"{GRAPH_MESSAGES_URL}?$filter={_message_id_filter(envelope.in_reply_to)}"
+                "&$top=5&$select=id,conversationId,isDraft",
+                headers=headers,
+            )
+        except httpx.TransportError as exc:
+            return _network_rejection(exc)
+        if found.status_code != 200:
+            return self._rejected_result(found)
+        parent = next(
+            (
+                m
+                for m in found.json().get("value", [])
+                if m.get("id") and not m.get("isDraft")
+            ),
+            None,
+        )
+        if parent is None:
+            return None
+
+        try:
+            created = client.post(
+                f"{GRAPH_MESSAGES_URL}/{quote(str(parent['id']), safe='')}/createReply",
+                headers=headers,
+                json={},
+            )
+        except httpx.TransportError as exc:
+            return _network_rejection(exc)
+        if created.status_code == 404:
+            return None  # deleted since the lookup
+        if created.status_code != 201:
+            return self._rejected_result(created)
+        draft: dict[str, Any] = created.json()
+        draft_id = draft.get("id")
+        if not draft_id:
+            return ProviderSendResult(
+                status="DEFINITIVELY_REJECTED",
+                error_category=ErrorCategory.TEMPORARY_PROVIDER_ERROR,
+                error_code="draft_without_id",
+            )
+
+        # createReply addresses the parent's sender (ourselves) and quotes it:
+        # replace all of that with the frozen snapshot.
+        failure: ProviderSendResult | None = None
+        try:
+            patched = client.patch(
+                f"{GRAPH_MESSAGES_URL}/{draft_id}",
+                headers=headers,
+                json={
+                    "subject": envelope.subject,
+                    "body": {
+                        "contentType": "HTML",
+                        "content": envelope.body_html or envelope.body_text or "",
+                    },
+                    "toRecipients": [
+                        {"emailAddress": {"address": envelope.to_address}}
+                    ],
+                    "ccRecipients": [],
+                    "bccRecipients": [],
+                    "from": {
+                        "emailAddress": {
+                            "address": envelope.from_address,
+                            "name": envelope.from_name or envelope.from_address,
+                        }
+                    },
+                },
+            )
+            if patched.status_code != 200:
+                failure = self._rejected_result(patched)
+            for attachment in envelope.attachments:
+                if failure is not None:
+                    break
+                uploaded = client.post(
+                    f"{GRAPH_MESSAGES_URL}/{draft_id}/attachments",
+                    headers=headers,
+                    json=_attachment_json(attachment),
+                )
+                if uploaded.status_code != 201:
+                    failure = self._rejected_result(uploaded)
+        except httpx.TransportError as exc:
+            failure = _network_rejection(exc)
+        if failure is not None:
+            self._discard_draft(client, headers, str(draft_id))
+            return failure
+        return draft
 
     def _rejected_result(self, resp: httpx.Response) -> ProviderSendResult:
         error_payload = resp.json() if resp.content else {}
@@ -624,7 +781,11 @@ class MicrosoftGraphProvider(EmailProvider):
     ) -> SyncPageResult:
         access_token = credential.get("access_token")
         if not access_token:
-            raise AppError("auth_failure", "Missing access token for Microsoft sync", status_code=401)
+            raise AppError(
+                "auth_failure",
+                "Missing access token for Microsoft sync",
+                status_code=PROVIDER_AUTH_REJECTED_STATUS,
+            )
 
         client = self._get_client()
         headers = {

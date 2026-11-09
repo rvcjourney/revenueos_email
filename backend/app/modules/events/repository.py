@@ -23,10 +23,15 @@ def _safe_set_role(session: Session, role: str) -> None:
 
 
 def _safe_set_workspace(session: Session, workspace_id: UUID | None) -> None:
+    # Must be `app.workspace_id`: that is the setting public.app_current_workspace_id()
+    # reads, so it is what every RLS policy sees. (This used to set an unrelated
+    # `app.current_workspace_id`, which left RLS with no workspace at all.)
     bind = session.get_bind()
     if bind and getattr(bind.dialect, "name", "") == "postgresql":
-        val = str(workspace_id) if workspace_id else ""
-        session.execute(text(f"SET LOCAL app.current_workspace_id = '{val}'"))
+        session.execute(
+            text("SELECT set_config('app.workspace_id', :ws, true)"),
+            {"ws": str(workspace_id) if workspace_id else ""},
+        )
 
 
 # NOTE: UPDATE statements on provider_receipts, safety_holds and suppressions do

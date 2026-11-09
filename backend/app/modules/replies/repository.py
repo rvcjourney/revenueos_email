@@ -1085,8 +1085,9 @@ class ReplyRepository:
         mailbox_id: UUID,
         source_identity: str,
         reason: str,
-    ) -> None:
-        """Insert an active safety hold on a mailbox."""
+    ) -> bool:
+        """Insert an active safety hold on a mailbox. False when a hold with this
+        source identity already exists (nothing changes)."""
         _safe_set_role(self.session, "app_worker_sync")
         _safe_set_workspace(self.session, workspace_id)
 
@@ -1102,7 +1103,7 @@ class ReplyRepository:
             ON CONFLICT (workspace_id, source_work_identity) DO NOTHING
             """
         )
-        self.session.execute(
+        result = self.session.execute(
             query,
             {
                 "id": str(uuid4()),
@@ -1112,6 +1113,7 @@ class ReplyRepository:
                 "reason": reason[:500],
             },
         )
+        return bool(getattr(result, "rowcount", 0))
 
     def resolve_safety_hold(
         self,

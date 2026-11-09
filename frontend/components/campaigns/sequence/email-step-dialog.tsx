@@ -30,6 +30,10 @@ import {
   AttachmentsBar,
   UploadButtons,
 } from "@/components/campaigns/sequence/attachments-bar";
+import {
+  sameThreadErrorMessage,
+  UNKNOWN_REPLY_SUBJECT,
+} from "@/components/campaigns/sequence/same-thread";
 import { SaveAsTemplate } from "@/components/campaigns/sequence/save-as-template";
 import { TestSendControl } from "@/components/campaigns/sequence/test-send-control";
 import { Alert } from "@/components/ui/alert";
@@ -56,6 +60,8 @@ type Props = {
   day: number;
   previousEmailDay: number | null;
   precedingWait: SequenceStep | null;
+  // Subject this step carries when sent in the same thread ("Re: …").
+  replySubject?: string;
   readOnly: boolean;
   // campaigns.execute: test emails go to real inboxes, so managers and above.
   canTestSend: boolean;
@@ -93,6 +99,7 @@ export function EmailStepDialog({
   day,
   previousEmailDay,
   precedingWait,
+  replySubject = UNKNOWN_REPLY_SUBJECT,
   readOnly,
   canTestSend,
   referenceMode = false,
@@ -184,9 +191,11 @@ export function EmailStepDialog({
   } = usePreviewRecipients({ workspaceId, campaignId, enabled: open, index: recipientIndex });
   const safeIndex = Math.min(recipientIndex, recipients.length - 1);
   const recipient = recipients[safeIndex];
+  // The first email has nothing to reply to.
+  const threaded = previousEmailDay !== null && draft.sameThread;
   const preview = useEmailPreview({
     workspaceId,
-    subject: draft.subject,
+    subject: threaded ? replySubject : draft.subject,
     preheader: draft.preheader,
     bodyHtml: draft.bodyHtml,
     recipient,
@@ -202,6 +211,8 @@ export function EmailStepDialog({
         ? `Choose a whole day after Day ${previousEmailDay} (up to 365 days later).`
         : null;
   const subjectEmpty = draft.subject.trim() === "";
+  // A threaded step takes the previous email's subject, so it needs none of its own.
+  const subjectMissing = subjectEmpty && !threaded;
   const bodyEmpty = !/<img\b/i.test(draft.bodyHtml) && stripTags(draft.bodyHtml) === "";
 
   function requestClose() {
@@ -249,7 +260,7 @@ export function EmailStepDialog({
     if (readOnly || saving) return;
     setBanner(null);
     setConflict(false);
-    if (subjectEmpty) {
+    if (subjectMissing) {
       setBanner({ kind: "error", text: "Add a subject before saving." });
       return;
     }
@@ -258,6 +269,7 @@ export function EmailStepDialog({
       return;
     }
     setSaving(true);
+    const threadChanged = draft.sameThread !== baseline.sameThread;
     let emailSaved: SequenceStep | undefined;
     try {
       // Compared with what the draft started from (not the live prop), so a
@@ -266,22 +278,26 @@ export function EmailStepDialog({
         draft.subject !== baseline.subject ||
         draft.preheader !== baseline.preheader ||
         draft.bodyHtml !== baseline.bodyHtml ||
+        threadChanged ||
         pickedTemplate !== null;
       if (contentChanged) {
         emailSaved = await updateSequenceStep(workspaceId, campaignId, step.id, {
           expected_version: versionOverride.step ?? step.version,
-          email_subject: draft.subject.trim(),
+          // A threaded step may have no subject; omitted keeps the saved one.
+          ...(subjectEmpty ? {} : { email_subject: draft.subject.trim() }),
           email_body_html: draft.bodyHtml,
           // "" clears; omitted would leave it unchanged.
           email_preheader: draft.preheader.trim(),
           ...(pickedTemplate?.templateVersionId
             ? { source_template_version_id: pickedTemplate.templateVersionId }
             : {}),
+          ...(threadChanged ? { email_same_thread: draft.sameThread } : {}),
         });
         markSaved({
           subject: emailSaved.email_subject ?? "",
           preheader: emailSaved.email_preheader ?? "",
           bodyHtml: emailSaved.email_body_html ?? "",
+          sameThread: emailSaved.email_same_thread ?? false,
         });
         onSaved({ step: emailSaved });
       }
@@ -318,11 +334,14 @@ export function EmailStepDialog({
       } else if (error instanceof ApiError && error.code === "state_conflict") {
         setBanner({
           kind: "error",
-          text: "This campaign is no longer a draft, so the sequence can’t be edited. Your text is still here if you want to copy it.",
+          text: "This campaign is no longer a draft or paused, so the sequence can’t be edited. Your text is still here if you want to copy it.",
         });
         onLocked();
       } else {
-        setBanner({ kind: "error", text: describeError(error) });
+        setBanner({
+          kind: "error",
+          text: sameThreadErrorMessage(error, threadChanged) ?? describeError(error),
+        });
       }
     } finally {
       setSaving(false);
@@ -355,7 +374,7 @@ export function EmailStepDialog({
       if (error instanceof ApiError && error.code === "state_conflict") {
         setBanner({
           kind: "error",
-          text: "This campaign is no longer a draft, so files can't be added.",
+          text: "This campaign is no longer a draft or paused, so files can't be added.",
         });
         onLocked();
       } else {
@@ -418,7 +437,7 @@ export function EmailStepDialog({
     ? "Only managers, admins and owners can send test emails."
     : mailboxes.length === 0
       ? "Assign a sender to this campaign to send a test email."
-      : subjectEmpty
+      : subjectMissing
         ? "Add a subject to send a test email."
         : null;
 
@@ -453,6 +472,18 @@ export function EmailStepDialog({
                 className="h-9 w-16 rounded-md border border-slate-200 px-2 text-sm disabled:bg-slate-50"
               />
             </div>
+            {previousEmailDay !== null ? (
+              <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={draft.sameThread}
+                  disabled={readOnly}
+                  onChange={(event) => update({ sameThread: event.target.checked })}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                Send in same thread
+              </label>
+            ) : null}
             <p
               id="start-day-hint"
               className={dayError ? "text-xs text-red-600" : "text-xs text-slate-500"}
@@ -519,31 +550,39 @@ export function EmailStepDialog({
           ) : null}
 
           <div>
-            <label htmlFor="step-subject" className="sr-only">
-              Subject
-            </label>
-            <div className="flex items-center rounded-md border border-slate-200 bg-white focus-within:ring-2 focus-within:ring-brand-600">
-              <span className="border-r border-slate-200 px-3 text-sm font-semibold text-slate-700">
-                Subject
-              </span>
-              <input
-                id="step-subject"
-                ref={subjectRef}
-                value={draft.subject}
-                onChange={(event) => update({ subject: event.target.value })}
-                readOnly={readOnly}
-                maxLength={500}
-                placeholder="Enter a subject…"
-                aria-invalid={subjectEmpty}
-                className="h-11 min-w-0 flex-1 bg-transparent px-3 text-sm outline-none"
-              />
-              <VariablePicker
-                label="Insert variable in subject"
-                disabled={readOnly}
-                onInsert={(code) => insertIntoInput(subjectRef, "subject", code)}
-                className="mr-1"
-              />
-            </div>
+            {threaded ? (
+              <p className="flex h-11 items-center rounded-md border border-slate-200 bg-slate-50 px-3 text-sm text-slate-700">
+                {`Subject: ${replySubject}`}
+              </p>
+            ) : (
+              <>
+                <label htmlFor="step-subject" className="sr-only">
+                  Subject
+                </label>
+                <div className="flex items-center rounded-md border border-slate-200 bg-white focus-within:ring-2 focus-within:ring-brand-600">
+                  <span className="border-r border-slate-200 px-3 text-sm font-semibold text-slate-700">
+                    Subject
+                  </span>
+                  <input
+                    id="step-subject"
+                    ref={subjectRef}
+                    value={draft.subject}
+                    onChange={(event) => update({ subject: event.target.value })}
+                    readOnly={readOnly}
+                    maxLength={500}
+                    placeholder="Enter a subject…"
+                    aria-invalid={subjectEmpty}
+                    className="h-11 min-w-0 flex-1 bg-transparent px-3 text-sm outline-none"
+                  />
+                  <VariablePicker
+                    label="Insert variable in subject"
+                    disabled={readOnly}
+                    onInsert={(code) => insertIntoInput(subjectRef, "subject", code)}
+                    className="mr-1"
+                  />
+                </div>
+              </>
+            )}
             <div className="mt-1.5 flex justify-end">
               <button
                 type="button"
@@ -618,7 +657,7 @@ export function EmailStepDialog({
             removingId={removingId}
             onRemove={removeAttachment}
           />
-          {!subjectEmpty && bodyEmpty ? (
+          {!subjectMissing && bodyEmpty ? (
             <p className="text-xs text-amber-700">
               The body is empty. It needs content before the campaign can be activated.
             </p>
@@ -652,7 +691,7 @@ export function EmailStepDialog({
           <TabPanel idPrefix="step-side" id="preview" value={rightTab}>
             <EmailPreviewPane
               preview={preview}
-              subjectIsEmpty={subjectEmpty}
+              subjectIsEmpty={subjectMissing}
               bodyIsEmpty={bodyEmpty}
               fromOptions={fromOptions}
               fromId={fromId}
@@ -667,7 +706,13 @@ export function EmailStepDialog({
               mapBody={(html) => cidToPreviewHtml(html, imageUrls)}
             />
           </TabPanel>
-          <div className="flex justify-end border-t border-slate-200 p-3">
+          <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 p-3">
+            {!referenceMode && draft.sameThread !== baseline.sameThread ? (
+              <p className="text-xs text-slate-500">
+                Test sends use the saved &ldquo;Send in same thread&rdquo; setting. Save to test
+                your change.
+              </p>
+            ) : null}
             {referenceMode ? (
               <p className="text-xs text-slate-500">
                 Test sends are not available for a reference email: it is not what your leads

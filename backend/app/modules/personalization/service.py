@@ -66,6 +66,9 @@ class GenerationInputs:
     step_position: int
     previous: PreviousEmail | None = None
     retry_codes: tuple[str, ...] = ()
+    # A follow-up sent in the same thread (ADR-0021): its finished "Re: ..."
+    # subject, which replaces whatever the model or the reference has.
+    thread_subject: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,7 @@ class PersonalizationService:
             preheader=inputs.reference_preheader,
             frozen_variables=inputs.frozen_variables,
             renderer_version=STANDARD_RENDERER_VERSION,
+            thread_subject=inputs.thread_subject,
         )
         return rendered.subject, rendered.body_html, rendered.content_digest
 
@@ -186,6 +190,7 @@ class PersonalizationService:
                 facts=context.fact_by_id(),
                 previous=inputs.previous,
                 require_fact_use=True,
+                subject_fixed=inputs.thread_subject is not None,
             ),
         )
         output_digest = hashlib.sha256(
@@ -224,12 +229,13 @@ class PersonalizationService:
             render_for_config(inputs.objective, validation.body_html),
             render_preheader(inputs.reference_preheader, inputs.frozen_variables),
         )
+        subject = inputs.thread_subject or validation.subject
         return AttemptOutcome(
             kind="GENERATED",
-            subject=validation.subject,
+            subject=subject,
             body_html=body,
             content_digest=compute_content_digest(
-                validation.subject, body, GENERATED_RENDERER_VERSION
+                subject, body, GENERATED_RENDERER_VERSION
             ),
             renderer_version=GENERATED_RENDERER_VERSION,
             failure_codes=(),

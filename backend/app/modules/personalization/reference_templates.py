@@ -87,6 +87,8 @@ class _Plan:
     # STEP only: the user's requested changes and the email they apply to.
     instructions: str | None = None
     current_email: ContextEmail | None = None
+    # Email ordinals sent in the same thread (ADR-0021): their subject is ignored.
+    threaded_positions: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,15 @@ class DraftOutcome:
     theme: str
     model: str
     attempts: int
+
+
+def _threaded_positions(email_steps: list[Any]) -> frozenset[int]:
+    """Email ordinals (1-based) of the steps sent in the same thread."""
+    return frozenset(
+        i
+        for i, step in enumerate(email_steps, start=1)
+        if step.get("email_same_thread")
+    )
 
 
 def role_for(position: int) -> str:
@@ -258,6 +269,7 @@ class ReferenceTemplateService:
                     position=i,
                     subject=str(s["email_subject"] or ""),
                     body_text=html_to_text(str(s["email_body_html"] or "")),
+                    threaded=bool(s.get("email_same_thread")),
                 )
                 for i, s in enumerate(email_steps, start=1)
                 if i != index
@@ -283,6 +295,7 @@ class ReferenceTemplateService:
                 email_count=len(email_steps),
                 instructions=instructions or None,
                 current_email=current_email,
+                threaded_positions=_threaded_positions(email_steps),
             )
 
         if not email_steps:
@@ -326,6 +339,7 @@ class ReferenceTemplateService:
             },
             context_emails=(),
             email_count=count,
+            threaded_positions=_threaded_positions(email_steps),
         )
 
     # ------------------------------------------------------ phase B: model + check
@@ -376,6 +390,7 @@ class ReferenceTemplateService:
                         position=position,
                         subject=kept.subject,
                         body_text="\n\n".join(kept.paragraphs),
+                        threaded=position in plan.threaded_positions,
                     )
                     for position, kept in sorted(accepted.items())
                 )
@@ -385,6 +400,7 @@ class ReferenceTemplateService:
                     expected_positions=pending,
                     allowed_variables=frozenset(ALLOWED_VARIABLES),
                     context_emails=context_emails,
+                    threaded_positions=plan.threaded_positions & frozenset(pending),
                 )
                 request = SequenceDraftRequest(
                     workspace_ref=workspace_ref,
@@ -526,7 +542,12 @@ class ReferenceTemplateService:
                     step_id,
                     SequenceStepUpdateIn(
                         expected_version=version,
-                        email_subject=drafted.subject,
+                        # A same-thread step keeps what it has: its subject is unused.
+                        email_subject=(
+                            None
+                            if position in plan.threaded_positions
+                            else drafted.subject
+                        ),
                         email_body_html=render_for_config(
                             plan.config, drafted.fragment_html
                         ),

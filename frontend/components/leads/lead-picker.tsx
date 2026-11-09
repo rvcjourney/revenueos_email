@@ -1,13 +1,17 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { Loader2, Search } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { errorMessage } from "@/lib/errors";
-import { listLeads } from "@/lib/leads-api";
+import { listAllLeadIds, listLeads } from "@/lib/leads-api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useWorkspace } from "@/lib/workspace-context";
+
+const PAGE_SIZE = 100;
 
 type LeadPickerProps = {
   enabled: boolean;
@@ -34,16 +38,26 @@ export function LeadPicker({
 }: LeadPickerProps) {
   const { activeWorkspaceId } = useWorkspace();
   const debouncedSearch = useDebouncedValue(search, 350);
+  const [selectingAll, setSelectingAll] = useState(false);
+  const [selectAllError, setSelectAllError] = useState<string | null>(null);
 
-  const query = useQuery({
+  const query = useInfiniteQuery({
     queryKey: ["workspace", activeWorkspaceId, "leads", "list-picker", debouncedSearch],
-    queryFn: () =>
-      listLeads(activeWorkspaceId!, { limit: 25, q: debouncedSearch, status: "ACTIVE" }),
+    queryFn: ({ pageParam }) =>
+      listLeads(activeWorkspaceId!, {
+        limit: PAGE_SIZE,
+        cursor: pageParam,
+        q: debouncedSearch,
+        status: "ACTIVE",
+      }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: Boolean(activeWorkspaceId && enabled),
   });
 
-  const leads = query.data?.items ?? [];
+  const leads = useMemo(() => query.data?.pages.flatMap((page) => page.items) ?? [], [query.data]);
   const allShownSelected = leads.length > 0 && leads.every((lead) => selected.has(lead.id));
+  const hasMore = Boolean(query.hasNextPage);
 
   function setMany(ids: string[], checked: boolean) {
     const next = new Set(selected);
@@ -52,6 +66,24 @@ export function LeadPicker({
       else next.delete(id);
     }
     onSelectedChange(next);
+  }
+
+  // Only the first pages are on screen, so "everything matching" has to be fetched.
+  async function selectAllMatching() {
+    if (!activeWorkspaceId) return;
+    setSelectAllError(null);
+    setSelectingAll(true);
+    try {
+      const ids = await listAllLeadIds(activeWorkspaceId, {
+        q: debouncedSearch,
+        status: "ACTIVE",
+      });
+      setMany(ids, true);
+    } catch (err) {
+      setSelectAllError(errorMessage(err));
+    } finally {
+      setSelectingAll(false);
+    }
   }
 
   return (
@@ -83,46 +115,80 @@ export function LeadPicker({
           {debouncedSearch ? "No active leads match that search." : "No active leads yet."}
         </p>
       ) : (
-        <div className="max-h-80 divide-y divide-slate-100 overflow-y-auto rounded-md border border-slate-200">
-          <label className="flex items-center gap-3 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-            <input
-              type="checkbox"
-              checked={allShownSelected}
-              disabled={disabled}
-              onChange={(event) =>
-                setMany(
-                  leads.map((lead) => lead.id),
-                  event.target.checked,
-                )
-              }
-              className="h-4 w-4 rounded border-slate-300 text-brand-600"
-            />
-            Select all shown
-          </label>
-          {leads.map((lead) => (
-            <label
-              key={lead.id}
-              className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-slate-50"
-            >
+        <>
+          <div className="max-h-80 divide-y divide-slate-100 overflow-y-auto rounded-md border border-slate-200">
+            <label className="flex items-center gap-3 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
               <input
                 type="checkbox"
-                checked={selected.has(lead.id)}
+                checked={allShownSelected}
                 disabled={disabled}
-                onChange={(event) => setMany([lead.id], event.target.checked)}
+                onChange={(event) =>
+                  setMany(
+                    leads.map((lead) => lead.id),
+                    event.target.checked,
+                  )
+                }
                 className="h-4 w-4 rounded border-slate-300 text-brand-600"
               />
-              <span className="min-w-0 flex-1">
-                <span className="block font-medium text-slate-900">
-                  {fullName(lead.first_name, lead.last_name)}
-                </span>
-                <span className="block text-slate-500">
-                  {lead.email}
-                  {lead.company ? ` · ${lead.company}` : ""}
-                </span>
-              </span>
+              Select all shown
             </label>
-          ))}
-        </div>
+            {leads.map((lead) => (
+              <label
+                key={lead.id}
+                className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-slate-50"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(lead.id)}
+                  disabled={disabled}
+                  onChange={(event) => setMany([lead.id], event.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300 text-brand-600"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium text-slate-900">
+                    {fullName(lead.first_name, lead.last_name)}
+                  </span>
+                  <span className="block text-slate-500">
+                    {lead.email}
+                    {lead.company ? ` · ${lead.company}` : ""}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+          {hasMore ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-slate-500">
+              <span>Showing the first {leads.length} matching leads.</span>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={disabled || query.isFetchingNextPage || selectingAll}
+                  onClick={() => void query.fetchNextPage()}
+                >
+                  {query.isFetchingNextPage ? (
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  ) : null}
+                  Load more
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={disabled || selectingAll}
+                  onClick={() => void selectAllMatching()}
+                >
+                  {selectingAll ? (
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  ) : null}
+                  Select all matching
+                </Button>
+              </div>
+            </div>
+          ) : null}
+          {selectAllError ? <p className="text-sm text-red-600">{selectAllError}</p> : null}
+        </>
       )}
     </div>
   );

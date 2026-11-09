@@ -223,6 +223,81 @@ def test_scheduler_service_round_robin_fairness() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backpressure: never claim more than the send workers can take
+# ---------------------------------------------------------------------------
+
+
+def _candidates(count: int) -> list[DueMessageCandidate]:
+    now = datetime.now(UTC)
+    ws = uuid.uuid4()
+    return [
+        DueMessageCandidate(
+            id=uuid.uuid4(),
+            workspace_id=ws,
+            campaign_id=uuid.uuid4(),
+            mailbox_id=uuid.uuid4(),
+            due_at=now,
+            purpose="CAMPAIGN",
+            schedule_generation=1,
+            status="SCHEDULED",
+            dispatch_generation=0,
+        )
+        for _ in range(count)
+    ]
+
+
+def _backpressure_service(outstanding: int, max_outstanding: int):
+    from app.core.config import Settings
+
+    settings = Settings.current().model_copy(
+        update={"scheduler_max_outstanding_claims": max_outstanding}
+    )
+    service = SchedulerService(MagicMock(), settings=settings)
+    service.repository.count_outstanding_claims = MagicMock(return_value=outstanding)
+    service.repository.find_due_messages = MagicMock(return_value=_candidates(50))
+    service.repository.claim_due_message = MagicMock(
+        side_effect=lambda workspace_id, message_id, **_: ClaimResult(
+            claimed=True,
+            message_id=message_id,
+            workspace_id=workspace_id,
+            dispatch_generation=1,
+        )
+    )
+    return service
+
+
+def test_scheduler_claims_nothing_while_the_queue_is_full() -> None:
+    service = _backpressure_service(outstanding=200, max_outstanding=200)
+
+    assert service.discover_and_claim_due_work() == (0, 0)
+
+    service.repository.find_due_messages.assert_not_called()
+    service.repository.claim_due_message.assert_not_called()
+
+
+def test_scheduler_claims_only_what_there_is_room_for() -> None:
+    service = _backpressure_service(outstanding=190, max_outstanding=200)
+
+    _, claimed = service.discover_and_claim_due_work(batch_size=50)
+
+    assert claimed == 10
+
+
+def test_scheduler_claims_a_full_batch_when_there_is_room() -> None:
+    service = _backpressure_service(outstanding=0, max_outstanding=200)
+
+    _, claimed = service.discover_and_claim_due_work(batch_size=30)
+
+    assert claimed == 30
+
+
+def test_scheduler_holds_back_when_over_the_limit() -> None:
+    service = _backpressure_service(outstanding=500, max_outstanding=200)
+
+    assert service.discover_and_claim_due_work() == (0, 0)
+
+
+# ---------------------------------------------------------------------------
 # OutboxPublisherService: Publication & Failure Handling
 # ---------------------------------------------------------------------------
 

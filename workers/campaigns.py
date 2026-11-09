@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -15,8 +15,12 @@ from app.db.context import set_transaction_context
 from app.db.session import SessionLocal
 from app.modules.campaigns.mailbox_assignment import assign_mailbox_for_recipient
 from app.modules.campaigns.message_rendering import render_step_content
+from app.modules.campaigns.pacing import DuePlanner, MailboxPacing, pacing_from_policies
 from app.modules.campaigns.progression import ProgressionService
-from app.modules.campaigns.scheduling import project_into_window
+from app.modules.campaigns.reconcile import ReconcileService
+from app.modules.campaigns.reopen import ReopenService
+from app.modules.campaigns.retime import RetimeService
+from app.modules.campaigns.scheduling import WindowCalendar
 from app.modules.campaigns.worker_repository import CampaignWorkerRepository
 from app.modules.personalization.version import CAMPAIGN_TYPE_HYPER
 from app.modules.suppression.checks import is_address_suppressed
@@ -38,7 +42,50 @@ def _classify_member(lead: dict[str, Any]) -> tuple[str, str | None]:
         return "EXCLUDED", "invalid_address"
     if lead["is_suppressed"]:
         return "EXCLUDED", "suppressed"
+    if lead.get("is_enrolled"):
+        # Supplement capture only (ADR-0020): already in this campaign.
+        return "EXCLUDED", "already_enrolled"
     return "ACCEPTED", None
+
+
+def _build_due_planner(
+    repo: CampaignWorkerRepository,
+    ctx: Any,
+    workspace_id: UUID,
+    campaign_id: UUID,
+) -> DuePlanner:
+    """The planner that gives each first email its own time in the campaign's
+    sending windows, within its mailbox's daily cap."""
+    settings = Settings.current()
+    default = MailboxPacing(
+        daily_cap=settings.mailbox_default_daily_cap,
+        min_spacing_seconds=settings.mailbox_default_min_spacing_seconds,
+    )
+    mailbox_ids = [
+        UUID(str(r["mailbox_id"]))
+        for r in repo.list_eligible_campaign_mailboxes(
+            workspace_id=workspace_id, campaign_id=campaign_id
+        )
+    ]
+    policies = repo.list_mailbox_limit_policies(
+        workspace_id=workspace_id, mailbox_ids=mailbox_ids
+    )
+    return DuePlanner(
+        WindowCalendar(
+            ctx["start_at"],
+            timezone=ctx["timezone"],
+            weekday_set=ctx["weekday_set"],
+            window_start_local=ctx["window_start_local"],
+            window_end_local=ctx["window_end_local"],
+        ),
+        mailbox_count=len(mailbox_ids),
+        campaign_daily_limit=ctx["daily_limit"],
+        pacing_by_mailbox={
+            mailbox_id: pacing_from_policies(policies.get(mailbox_id, []), default)
+            for mailbox_id in mailbox_ids
+        },
+        default=default,
+    )
 
 
 @celery_app.task(
@@ -132,7 +179,13 @@ def capture_audience_chunk(
 
             if batch_ids:
                 lead_rows = repo.fetch_lead_capture_rows(
-                    workspace_id=UUID(workspace_id), lead_ids=batch_ids
+                    workspace_id=UUID(workspace_id),
+                    lead_ids=batch_ids,
+                    campaign_id=(
+                        UUID(campaign_id)
+                        if audience.get("kind") == "SUPPLEMENT"
+                        else None
+                    ),
                 )
                 lead_by_id = {str(row["lead_id"]): dict(row) for row in lead_rows}
                 members: list[dict[str, Any]] = []
@@ -256,16 +309,21 @@ def capture_audience_chunk(
 
 
 def _dispatch_render_task(
-    *, workspace_id: str, campaign_id: str, activation_id: str
+    *,
+    workspace_id: str,
+    campaign_id: str,
+    activation_id: str,
+    audience_id: str | None = None,
 ) -> None:
+    kwargs = {
+        "workspace_id": workspace_id,
+        "campaign_id": campaign_id,
+        "activation_id": activation_id,
+    }
+    if audience_id is not None:
+        kwargs["audience_id"] = audience_id
     celery_app.send_task(
-        "campaigns.render_messages_chunk",
-        kwargs={
-            "workspace_id": workspace_id,
-            "campaign_id": campaign_id,
-            "activation_id": activation_id,
-        },
-        queue="campaigns",
+        "campaigns.render_messages_chunk", kwargs=kwargs, queue="campaigns"
     )
 
 
@@ -276,9 +334,18 @@ def _dispatch_render_task(
     max_retries=None,
 )
 def enroll_activation_chunk(
-    self: Any, workspace_id: str, campaign_id: str, activation_id: str
+    self: Any,
+    workspace_id: str,
+    campaign_id: str,
+    activation_id: str,
+    audience_id: str | None = None,
 ) -> None:
     """One bounded chunk of enrollment creation for a campaign activation.
+
+    With `audience_id` it enrolls a SUPPLEMENT audience of an already-running
+    activation instead (ADR-0020): same chunking, suppression re-check and unique
+    keys, but the campaign's planning_status is left alone and mailbox assignment
+    continues after the leads already enrolled.
 
     Converts campaign_audience_members (accepted, not currently suppressed)
     into campaign_enrollments plus their first PLANNED message, using a
@@ -290,6 +357,7 @@ def enroll_activation_chunk(
     ws_uuid = UUID(workspace_id)
     campaign_uuid = UUID(campaign_id)
     activation_uuid = UUID(activation_id)
+    supplement_uuid = UUID(audience_id) if audience_id else None
 
     with SessionLocal() as session:
 
@@ -308,6 +376,7 @@ def enroll_activation_chunk(
                 phase="ENROLL",
                 lease_owner=lease_owner,
                 ttl_seconds=_LEASE_TTL_SECONDS,
+                audience_id=supplement_uuid,
             )
             if job is None:
                 logger.info(
@@ -332,7 +401,9 @@ def enroll_activation_chunk(
                 session.rollback()
                 return
 
-            audience_id = UUID(str(ctx["activated_audience_id"]))
+            member_audience_id = supplement_uuid or UUID(
+                str(ctx["activated_audience_id"])
+            )
             sequence_id = UUID(str(ctx["activated_sequence_id"]))
             first_step_id = UUID(str(ctx["first_step_id"]))
 
@@ -348,9 +419,16 @@ def enroll_activation_chunk(
                 if job["cursor_data"]
                 else {"after_ordinal": 0}
             )
+            if supplement_uuid is not None and "ordinal_offset" not in cursor:
+                # Continue the round-robin after the leads already enrolled, and
+                # remember it so a retried chunk assigns the same mailboxes.
+                cursor["ordinal_offset"] = repo.count_campaign_enrollments(
+                    workspace_id=ws_uuid, campaign_id=campaign_uuid
+                )
+            ordinal_offset = int(cursor.get("ordinal_offset", 0))
             members = repo.fetch_accepted_audience_members_chunk(
                 workspace_id=ws_uuid,
-                audience_id=audience_id,
+                audience_id=member_audience_id,
                 after_ordinal=cursor["after_ordinal"],
                 limit=BATCH_SIZE,
             )
@@ -366,7 +444,8 @@ def enroll_activation_chunk(
                     # regardless of what happens here.
                     continue
                 mailbox_id = assign_mailbox_for_recipient(
-                    eligible_mailbox_ids, int(member["capture_ordinal"])
+                    eligible_mailbox_ids,
+                    int(member["capture_ordinal"]) + ordinal_offset,
                 )
                 enrollable_rows.append(
                     {
@@ -382,7 +461,7 @@ def enroll_activation_chunk(
             repo.insert_enrollments(
                 workspace_id=ws_uuid,
                 campaign_id=campaign_uuid,
-                audience_id=audience_id,
+                audience_id=member_audience_id,
                 sequence_id=sequence_id,
                 first_step_id=first_step_id,
                 rows=enrollable_rows,
@@ -422,12 +501,22 @@ def enroll_activation_chunk(
                     campaign_id=campaign_uuid,
                     job_id=UUID(str(job["id"])),
                     processed_count=new_after_ordinal,
+                    mark_planning_ready=supplement_uuid is None,
                 )
             else:
                 repo.update_job_progress(
                     workspace_id=ws_uuid,
                     job_id=UUID(str(job["id"])),
-                    cursor_data=json.dumps({"after_ordinal": new_after_ordinal}),
+                    cursor_data=json.dumps(
+                        {
+                            "after_ordinal": new_after_ordinal,
+                            **(
+                                {"ordinal_offset": ordinal_offset}
+                                if supplement_uuid is not None
+                                else {}
+                            ),
+                        }
+                    ),
                     processed_count=new_after_ordinal,
                     lease_owner=lease_owner,
                     ttl_seconds=_LEASE_TTL_SECONDS,
@@ -449,6 +538,7 @@ def enroll_activation_chunk(
                     workspace_id=workspace_id,
                     campaign_id=campaign_id,
                     activation_id=activation_id,
+                    audience_id=audience_id,
                 )
 
         except Retry:
@@ -490,7 +580,11 @@ def enroll_activation_chunk(
     max_retries=None,
 )
 def render_messages_chunk(
-    self: Any, workspace_id: str, campaign_id: str, activation_id: str
+    self: Any,
+    workspace_id: str,
+    campaign_id: str,
+    activation_id: str,
+    audience_id: str | None = None,
 ) -> None:
     """One bounded chunk of first-message content rendering + schedule
     calculation for a campaign activation. Rows leave PLANNED as they are
@@ -502,6 +596,7 @@ def render_messages_chunk(
     ws_uuid = UUID(workspace_id)
     campaign_uuid = UUID(campaign_id)
     activation_uuid = UUID(activation_id)
+    supplement_uuid = UUID(audience_id) if audience_id else None
 
     with SessionLocal() as session:
 
@@ -513,6 +608,21 @@ def render_messages_chunk(
         job: dict[str, Any] | None = None
 
         try:
+            if not repo.enroll_job_is_ready(
+                workspace_id=ws_uuid,
+                campaign_id=campaign_uuid,
+                activation_id=activation_uuid,
+                audience_id=supplement_uuid,
+            ):
+                # RENDER renders every PLANNED message of the campaign: running it
+                # before ENROLL has created them all would finish early and strand the
+                # rest. ENROLL dispatches RENDER itself when it completes.
+                logger.info(
+                    f"RENDER for campaign {campaign_id} waits for its ENROLL job; "
+                    "not claiming."
+                )
+                session.rollback()
+                return
             job = repo.claim_planning_job(
                 workspace_id=ws_uuid,
                 campaign_id=campaign_uuid,
@@ -520,6 +630,7 @@ def render_messages_chunk(
                 phase="RENDER",
                 lease_owner=lease_owner,
                 ttl_seconds=_LEASE_TTL_SECONDS,
+                audience_id=supplement_uuid,
             )
             if job is None:
                 logger.info(
@@ -544,6 +655,10 @@ def render_messages_chunk(
                 session.rollback()
                 return
 
+            if supplement_uuid is not None:
+                # Late joiners are scheduled from now, not from a start in the
+                # past; the post-resume reconcile spreads whatever is overdue.
+                ctx = {**ctx, "start_at": max(ctx["start_at"], datetime.now(UTC))}
             hyper = ctx["campaign_type"] == CAMPAIGN_TYPE_HYPER
             rows = repo.fetch_planned_messages_chunk(
                 workspace_id=ws_uuid,
@@ -552,14 +667,15 @@ def render_messages_chunk(
                 hyper=hyper,
             )
             personalization = Settings.current() if hyper else None
+            planner = _build_due_planner(repo, ctx, ws_uuid, campaign_uuid)
 
             for row in rows:
-                due_at = project_into_window(
-                    lower_bound_utc=ctx["start_at"],
-                    timezone=ctx["timezone"],
-                    weekday_set=ctx["weekday_set"],
-                    window_start_local=ctx["window_start_local"],
-                    window_end_local=ctx["window_end_local"],
+                # Each message gets its own time, so a mailbox is never asked
+                # for more than its daily cap (see campaigns/pacing.py).
+                due_at = planner.due_at(
+                    mailbox_id=UUID(str(row["mailbox_id"])),
+                    capture_ordinal=int(row["capture_ordinal"]),
+                    message_id=UUID(str(row["id"])),
                 )
                 if personalization is not None:
                     # Hyper-personalized (ADR-0011): the message stays PLANNED
@@ -707,6 +823,13 @@ def advance_enrollments_chunk(
             ),
             personalization_lead_seconds=settings.personalization_lead_time_seconds,
             personalization_max_attempts=settings.personalization_max_attempts,
+            default_pacing=MailboxPacing(
+                daily_cap=settings.mailbox_default_daily_cap,
+                min_spacing_seconds=settings.mailbox_default_min_spacing_seconds,
+            ),
+            overdue_grace=timedelta(
+                seconds=2 * settings.sequence_progression_interval_seconds
+            ),
         )
         try:
             summary = service.advance_batch(
@@ -741,3 +864,341 @@ def advance_enrollments_chunk(
                 countdown=1,
                 max_retries=self.request.retries + 1,
             )
+
+
+@celery_app.task(
+    name="campaigns.reopen_completed_enrollments_chunk",
+    queue="campaigns",
+    bind=True,
+    max_retries=None,
+)
+def reopen_completed_enrollments_chunk(
+    self: Any,
+    workspace_id: str,
+    campaign_id: str,
+    generation: int,
+    after_enrollment_id: str | None = None,
+) -> None:
+    """One bounded chunk of the opt-in reopen of finished leads (ADR-0020).
+
+    Bound to the resume `generation` that asked for it; does nothing once the campaign
+    is no longer RUNNING at that generation. Safe to repeat. A full chunk re-queues
+    itself from the last enrollment it looked at; the progression sweep then plans the
+    appended email for each reopened lead."""
+    settings = Settings.current()
+    ws_uuid = UUID(workspace_id)
+    campaign_uuid = UUID(campaign_id)
+    limit = settings.sequence_progression_batch_size
+
+    with SessionLocal() as session:
+        set_transaction_context(session, workspace_id=ws_uuid)
+        repo = CampaignWorkerRepository(session)
+        service = ReopenService(
+            repo,
+            is_suppressed=lambda ws, address_id: is_address_suppressed(
+                session, ws, address_id
+            ),
+        )
+        try:
+            summary = service.reopen_batch(
+                workspace_id=ws_uuid,
+                campaign_id=campaign_uuid,
+                generation=generation,
+                limit=limit,
+                after_id=UUID(after_enrollment_id) if after_enrollment_id else None,
+            )
+            session.commit()
+        except Exception:
+            logger.exception(
+                f"Unexpected error reopening finished leads for campaign {campaign_id}"
+            )
+            session.rollback()
+            return
+
+        if summary.campaign_not_eligible:
+            logger.info(
+                f"Reopen for campaign {campaign_id} generation {generation} skipped: "
+                "campaign is not running at that generation."
+            )
+            return
+        # Counts only: never recipient data.
+        logger.info(
+            "CAMPAIGN_REOPEN_COMPLETED workspace=%s campaign=%s fetched=%d "
+            "reopened=%d suppressed=%d",
+            workspace_id,
+            campaign_id,
+            summary.fetched,
+            summary.reopened,
+            summary.skipped_suppressed,
+        )
+        if summary.fetched >= limit and summary.last_enrollment_id is not None:
+            self.retry(
+                kwargs={
+                    "workspace_id": workspace_id,
+                    "campaign_id": campaign_id,
+                    "generation": generation,
+                    "after_enrollment_id": str(summary.last_enrollment_id),
+                },
+                countdown=1,
+                max_retries=self.request.retries + 1,
+            )
+
+
+def _retime_phase(
+    task: Any,
+    *,
+    workspace_id: str,
+    campaign_id: str,
+    generation: int,
+    after_id: str | None,
+) -> None:
+    """Second phase of the post-resume pass (ADR-0020 amendment 2): move the
+    personalized follow-ups that are planned but not yet written to the time their
+    waits imply now. A no-op for a standard campaign and for a task that has been
+    superseded. A full batch re-queues itself from the last job it looked at."""
+    settings = Settings.current()
+    ws_uuid = UUID(workspace_id)
+    limit = BATCH_SIZE
+    with SessionLocal() as session:
+        set_transaction_context(session, workspace_id=ws_uuid)
+        service = RetimeService(
+            CampaignWorkerRepository(session),
+            lead_seconds=settings.personalization_lead_time_seconds,
+        )
+        try:
+            summary = service.retime_batch(
+                workspace_id=ws_uuid,
+                campaign_id=UUID(campaign_id),
+                generation=generation,
+                limit=limit,
+                after_id=UUID(after_id) if after_id else None,
+            )
+            session.commit()
+        except Exception:
+            logger.exception(
+                "CAMPAIGN_RETIME_FAILED workspace=%s campaign=%s generation=%s",
+                workspace_id,
+                campaign_id,
+                generation,
+            )
+            session.rollback()
+            return
+    if not summary.active or not summary.fetched:
+        return
+    # Counts only: never recipient data or content.
+    logger.info(
+        "CAMPAIGN_FOLLOWUPS_RETIMED workspace=%s campaign=%s generation=%s "
+        "fetched=%d retimed=%d unchanged=%d",
+        workspace_id,
+        campaign_id,
+        generation,
+        summary.fetched,
+        summary.retimed,
+        summary.unchanged,
+    )
+    if summary.fetched >= limit and summary.last_id is not None:
+        task.retry(
+            kwargs={
+                "workspace_id": workspace_id,
+                "campaign_id": campaign_id,
+                "generation": generation,
+                "phase": "RETIME",
+                "retime_after_id": str(summary.last_id),
+            },
+            countdown=1,
+            max_retries=task.request.retries + 1,
+        )
+
+
+@celery_app.task(
+    name="campaigns.reconcile_resume_chunk",
+    queue="campaigns",
+    bind=True,
+    max_retries=None,
+)
+def reconcile_resume_chunk(
+    self: Any,
+    workspace_id: str,
+    campaign_id: str,
+    generation: int,
+    after_due_at: str | None = None,
+    after_id: str | None = None,
+    offsets: dict[str, int] | None = None,
+    phase: str = "RECONCILE",
+    retime_after_id: str | None = None,
+) -> None:
+    """One bounded chunk of the post-resume reconcile pass (ADR-0020).
+
+    Re-times and re-stamps the campaign's unsent messages that carry an older
+    schedule generation, so the scheduler can claim them again. Safe to repeat
+    or run twice: a message at the current generation is never selected, and the
+    task does nothing once the campaign is no longer RUNNING at `generation`
+    (a later pause or resume supersedes it). A full chunk re-queues itself from
+    the last message it looked at, carrying the per-mailbox slot counters.
+
+    When the reconcile of scheduled messages is finished, a personalized campaign's
+    planned follow-ups are re-timed from the waits as they stand now (`phase="RETIME"`,
+    see `_retime_phase`); tasks queued before that phase existed default to RECONCILE.
+    """
+    if phase == "RETIME":
+        _retime_phase(
+            self,
+            workspace_id=workspace_id,
+            campaign_id=campaign_id,
+            generation=generation,
+            after_id=retime_after_id,
+        )
+        return
+    settings = Settings.current()
+    ws_uuid = UUID(workspace_id)
+    campaign_uuid = UUID(campaign_id)
+    limit = BATCH_SIZE
+    start_retime = False
+
+    with SessionLocal() as session:
+        set_transaction_context(session, workspace_id=ws_uuid)
+        repo = CampaignWorkerRepository(session)
+        service = ReconcileService(
+            repo,
+            default_pacing=MailboxPacing(
+                daily_cap=settings.mailbox_default_daily_cap,
+                min_spacing_seconds=settings.mailbox_default_min_spacing_seconds,
+            ),
+        )
+        try:
+            summary = service.reconcile_batch(
+                workspace_id=ws_uuid,
+                campaign_id=campaign_uuid,
+                generation=generation,
+                limit=limit,
+                after_due_at=(
+                    datetime.fromisoformat(after_due_at) if after_due_at else None
+                ),
+                after_id=UUID(after_id) if after_id else None,
+                offsets=offsets,
+            )
+            session.commit()
+        except Exception:
+            logger.exception(
+                "CAMPAIGN_RESUME_FAILED workspace=%s campaign=%s generation=%s "
+                "reason=reconcile_error",
+                workspace_id,
+                campaign_id,
+                generation,
+            )
+            session.rollback()
+            return
+
+        if not summary.active:
+            logger.info(
+                "Reconcile for campaign %s generation %s superseded; nothing to do",
+                campaign_id,
+                generation,
+            )
+            return
+        if summary.fetched:
+            # Counts and reason codes only: never recipient data or content.
+            logger.info(
+                "CAMPAIGN_STEP_RESUMED workspace=%s campaign=%s generation=%s "
+                "fetched=%d restamped=%d rerendered=%d spread=%d kept_future=%d "
+                "skipped=%d reasons=%s",
+                workspace_id,
+                campaign_id,
+                generation,
+                summary.fetched,
+                summary.restamped,
+                summary.rerendered,
+                summary.spread,
+                summary.kept_future,
+                summary.skipped,
+                summary.reasons,
+            )
+        if summary.fetched >= limit and summary.last_id is not None:
+            self.retry(
+                kwargs={
+                    "workspace_id": workspace_id,
+                    "campaign_id": campaign_id,
+                    "generation": generation,
+                    "after_due_at": (
+                        summary.last_due_at.isoformat() if summary.last_due_at else None
+                    ),
+                    "after_id": str(summary.last_id),
+                    "offsets": summary.offsets,
+                },
+                countdown=1,
+                max_retries=self.request.retries + 1,
+            )
+        else:
+            logger.info(
+                "CAMPAIGN_STEP_COMPLETED workspace=%s campaign=%s generation=%s",
+                workspace_id,
+                campaign_id,
+                generation,
+            )
+            start_retime = True
+    if start_retime:
+        _retime_phase(
+            self,
+            workspace_id=workspace_id,
+            campaign_id=campaign_id,
+            generation=generation,
+            after_id=None,
+        )
+
+
+@celery_app.task(name="campaigns.retry_planning_job", queue="campaigns")
+def retry_planning_job(
+    workspace_id: str,
+    campaign_id: str,
+    activation_id: str,
+    audience_id: str | None = None,
+) -> None:
+    """Put a FAILED ENROLL/RENDER pair back to PENDING (cursor kept) and run it again.
+
+    The API cannot do this itself (it has no UPDATE on the planning tables), so the
+    command dispatches this task, like abandon_audience does. Idempotent: a repeat
+    finds nothing FAILED and does nothing; the chunks it re-runs are idempotent.
+    """
+    ws_uuid = UUID(workspace_id)
+    campaign_uuid = UUID(campaign_id)
+    activation_uuid = UUID(activation_id)
+    supplement_uuid = UUID(audience_id) if audience_id else None
+
+    with SessionLocal() as session:
+        set_transaction_context(session, workspace_id=ws_uuid)
+        repo = CampaignWorkerRepository(session)
+        phases = repo.reset_failed_planning_jobs(
+            workspace_id=ws_uuid,
+            campaign_id=campaign_uuid,
+            activation_id=activation_uuid,
+            audience_id=supplement_uuid,
+        )
+        session.commit()
+        if not phases:
+            logger.info(
+                f"retry_planning_job: nothing FAILED for campaign {campaign_id}; no-op"
+            )
+            return
+
+    logger.info(
+        "CAMPAIGN_PLANNING_RETRY workspace=%s campaign=%s phases=%s",
+        workspace_id,
+        campaign_id,
+        ",".join(phases),
+    )
+    kwargs = {
+        "workspace_id": workspace_id,
+        "campaign_id": campaign_id,
+        "activation_id": activation_id,
+    }
+    if audience_id is not None:
+        kwargs["audience_id"] = audience_id
+    # ENROLL first; it dispatches RENDER when it completes. If only RENDER failed,
+    # its ENROLL is READY and RENDER can run now.
+    celery_app.send_task(
+        "campaigns.enroll_activation_chunk"
+        if "ENROLL" in phases
+        else "campaigns.render_messages_chunk",
+        kwargs=kwargs,
+        queue="campaigns",
+    )

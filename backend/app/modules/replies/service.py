@@ -44,6 +44,7 @@ from app.modules.replies.schemas import (
     NormalizedInboundMessage,
     SyncCheckpoint,
 )
+from app.modules.safety.evaluator import MailboxSafetyEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,25 @@ class ReplySyncService:
                 },
             )
         return len(candidates)
+
+    def _protect_mailbox(
+        self, workspace_id: UUID, mailbox_id: UUID, log_ctx: dict[str, Any]
+    ) -> None:
+        """Hold the mailbox if its bounce rate has become critical.
+
+        Bounces are found by this sync, so this is the moment to look. A failure
+        here must never fail or retry the reply sync it follows (the sync already
+        committed), but it is logged loudly: a mailbox that cannot be checked is
+        a mailbox that is not being protected.
+        """
+        try:
+            MailboxSafetyEvaluator(self.session).evaluate(
+                workspace_id=workspace_id, mailbox_id=mailbox_id
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            logger.exception("mailbox_safety_evaluation_failed", extra=log_ctx)
 
     def sync_mailbox(
         self,
@@ -247,6 +267,7 @@ class ReplySyncService:
                 sync_interval_seconds=sync_interval_seconds,
             )
             record_reply_sync_run(provider_name, result.status)
+            self._protect_mailbox(workspace_id, mailbox_id, log_ctx)
             return result
         except Exception as e:
             self.session.rollback()

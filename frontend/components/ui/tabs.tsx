@@ -44,7 +44,7 @@ export function Tabs({ tabs, value, onValueChange, idPrefix, label, className }:
       role="tablist"
       aria-label={label}
       onKeyDown={onKeyDown}
-      className={cn("flex gap-1 overflow-x-auto border-b border-slate-200", className)}
+      className={cn("scrollbar-none flex gap-1 overflow-x-auto border-b border-slate-200", className)}
     >
       {tabs.map((tab) => {
         const selected = tab.id === value;
@@ -59,7 +59,7 @@ export function Tabs({ tabs, value, onValueChange, idPrefix, label, className }:
             tabIndex={selected ? 0 : -1}
             onClick={() => onValueChange(tab.id)}
             className={cn(
-              "-mb-px inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
+              "-mb-px inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
               selected
                 ? "border-brand-600 text-brand-700"
                 : "border-transparent text-slate-500 hover:text-slate-900",

@@ -98,8 +98,8 @@ export default function NotificationSettingsPage() {
   return (
     <main className="space-y-6 max-w-2xl pb-16">
       <div>
-        <p className="text-sm font-medium text-brand-700">Account Preferences</p>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900 mt-1">
+        <p className="text-xs font-semibold uppercase tracking-[0.08em] text-brand-600">Account Preferences</p>
+        <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900 mt-1">
           Notification Preferences
         </h1>
         <p className="mt-1 text-sm text-slate-600">

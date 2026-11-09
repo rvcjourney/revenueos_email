@@ -90,6 +90,7 @@ class FakeStore:
             "email_subject": REF_SUBJECT,
             "email_body_html": REF_BODY,
             "email_preheader": None,
+            "email_same_thread": False,
         }
         self.config: dict[str, Any] | None = dict(CONFIG)
         self.enrollment: dict[str, Any] = {
@@ -103,6 +104,8 @@ class FakeStore:
             "due_at": clock.now + timedelta(minutes=30),
             "anchor_at": clock.now,
             "terminal_reason": None,
+            # content_subject of messages.reply_to_message_id (ADR-0021)
+            "parent_subject": None,
         }
         self.generation_id = uuid.uuid4()
         self.generation: dict[str, Any] = {
@@ -121,6 +124,7 @@ class FakeStore:
         self.usage: dict[str, int] = {}
         self.tokens: dict[str, int] = {"in": 0, "out": 0}
         self.previous: dict[str, Any] | None = None
+        self.audits: list[dict[str, Any]] = []
         self.fail_finalize_once = False
         self.suppressed = False
         self.previews: list[dict[str, Any]] = []
@@ -143,6 +147,7 @@ class FakeStore:
                 self.usage,
                 self.tokens,
                 self.previews,
+                self.audits,
             )
         )
         try:
@@ -155,6 +160,7 @@ class FakeStore:
                 self.usage,
                 self.tokens,
                 self.previews,
+                self.audits,
             ) = snapshot
             raise
 
@@ -290,6 +296,7 @@ class FakeRepo:
             "message_status": s.message["status"],
             "due_at": s.message["due_at"],
             "anchor_at": s.message["anchor_at"],
+            "message_created_at": s.message.get("created_at"),
             "campaign_type": s.campaign["campaign_type"],
             "campaign_status": s.campaign["status"],
             "planning_status": s.campaign["planning_status"],
@@ -300,7 +307,10 @@ class FakeRepo:
             "email_subject": s.step["email_subject"],
             "email_body_html": s.step["email_body_html"],
             "email_preheader": s.step["email_preheader"],
+            "email_same_thread": s.step.get("email_same_thread", False),
+            "parent_subject": s.message.get("parent_subject"),
             "step_position": s.step["position"],
+            "step_version": s.step.get("version", 1),
             "personalization_config": s.config,
             "timezone": "UTC",
             "weekday_set": ALL_DAYS,
@@ -310,6 +320,18 @@ class FakeRepo:
 
     def load_previous_email(self, **_: Any) -> dict[str, Any] | None:
         return self.s.previous
+
+    def record_same_thread_unavailable(
+        self, *, message_id: Any, reason: str, **_: Any
+    ) -> None:
+        self.s.audits.append({"message_id": message_id, "reason": reason})
+
+    def retime_planned_message(self, *, due_at: datetime, **_: Any) -> bool:
+        m = self.s.message
+        if m["status"] != "PLANNED":
+            return False
+        m["due_at"] = due_at
+        return True
 
     def lock_for_finalize(self, **_: Any) -> dict[str, Any]:
         s = self.s
@@ -326,6 +348,7 @@ class FakeRepo:
             "planning_status": s.campaign["planning_status"],
             "enrollment_state": s.enrollment["state"],
             "next_step_id": s.enrollment["next_step_id"],
+            "step_version": s.step.get("version", 1),
         }
 
     def finalize_message(

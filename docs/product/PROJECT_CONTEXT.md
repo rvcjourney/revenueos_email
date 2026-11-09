@@ -620,8 +620,7 @@ Email follow-up settings:
 
 - wait X minutes/hours/days
 - send only if no reply
-- send in same thread
-- use previous subject
+- send in same thread (one switch: the follow-up is a reply to the previous email and takes its subject as "Re: …" — [ADR-0021](../adr/0021-follow-up-same-thread.md))
 
 ---
 

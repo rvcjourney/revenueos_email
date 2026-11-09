@@ -60,7 +60,7 @@ export function ConnectPageClient() {
             Back to Mailboxes
           </Link>
         </Button>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+        <h1 className="text-[26px] font-bold leading-8 tracking-tight text-slate-900">
           Connect a Mailbox
         </h1>
         <p className="mt-1 text-sm text-slate-500">

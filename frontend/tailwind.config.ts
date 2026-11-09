@@ -9,27 +9,38 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // Outly brand: a single indigo-blue scale used for actions, active
-        // navigation, links and focus. Everything else stays neutral slate;
-        // semantic colors (emerald/amber/red) are reserved for status.
+        // Outly brand: one royal-indigo scale for actions, active navigation,
+        // links and focus. Semantic colors (emerald/amber/red) are reserved
+        // for status; everything else is neutral slate.
         brand: {
-          50: "#eef2ff",
-          100: "#e0e7ff",
-          200: "#c7d2fe",
-          300: "#a5b4fc",
-          400: "#818cf8",
-          500: "#6366f1",
-          600: "#4f46e5",
-          700: "#4338ca",
-          800: "#3730a3",
-          900: "#312e81",
+          50: "#eef0ff",
+          100: "#e1e4ff",
+          200: "#c8ccff",
+          300: "#a5a8fd",
+          400: "#807ef8",
+          500: "#625cf0",
+          600: "#4a40e2",
+          700: "#3d32c8",
+          800: "#332aa2",
+          900: "#2c2780",
+        },
+        // The dark navigation surface and anything that sits on it.
+        ink: {
+          300: "#aab3d1",
+          400: "#8791b5",
+          500: "#5c668c",
+          600: "#2a3560",
+          700: "#1b2447",
+          800: "#121934",
+          900: "#0b1024",
+          950: "#070b1a",
         },
       },
       fontFamily: {
-        // System stack: no webfont download, so offline Docker builds and
-        // first paint are unaffected.
+        // Plus Jakarta Sans is self-hosted (app/fonts, loaded in app/layout.tsx),
+        // so nothing is downloaded at build or run time. The rest is fallback.
         sans: [
-          "Inter",
+          "var(--font-sans)",
           "ui-sans-serif",
           "system-ui",
           "-apple-system",

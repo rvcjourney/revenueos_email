@@ -9,13 +9,11 @@ object.
 from __future__ import annotations
 
 import json
-import math
 from typing import Any
 
 from app.modules.personalization.email_style import SHAPE_GUIDANCE, step_brief
 from app.modules.personalization.ports import SequenceDraftRequest
-from app.modules.personalization.text_utils import extract_urls, significant_tokens
-from app.modules.personalization.validator import CTA_OVERLAP_MIN
+from app.modules.personalization.validator import cta_requirements
 
 # Bump when the drafting prompt or schema changes. Not part of the approval
 # digest: the drafted content itself is (it is stored in the steps).
@@ -198,7 +196,7 @@ def build_data(request: SequenceDraftRequest) -> dict[str, Any]:
         "emails_to_write": emails,
         "allowed_variables": list(request.allowed_variables),
     }
-    data.update(_cta_requirements(str(request.objective.get("cta", ""))))
+    data.update(cta_requirements(str(request.objective.get("cta", ""))))
     if request.company:
         data["company"] = dict(request.company)
     if request.context_emails:
@@ -220,22 +218,6 @@ def build_data(request: SequenceDraftRequest) -> dict[str, Any]:
 
 def _guidance(code: str) -> str:
     return CODE_GUIDANCE.get(code, "Fix the problem and try again.")
-
-
-def _cta_requirements(cta: str) -> dict[str, Any]:
-    """The words the validator looks for in every email (reference_validator: each
-    link, or at least half of the key words), so the model does not have to guess
-    how a call to action is checked."""
-    links = sorted(extract_urls(cta))
-    words = sorted(significant_tokens(cta))
-    if links:
-        return {"call_to_action_links": links}
-    if len(words) >= 2:
-        return {
-            "call_to_action_key_words": words,
-            "call_to_action_use_at_least": math.ceil(len(words) * CTA_OVERLAP_MIN),
-        }
-    return {}
 
 
 def build_chat_messages(request: SequenceDraftRequest) -> list[dict[str, str]]:

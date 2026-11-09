@@ -23,6 +23,18 @@ PostgreSQL stores versioned limit policies, effective dates, cooldowns and restr
 
 Track units explicitly: API quota units, messages, recipients and concurrent calls differ. Send, sync and refresh may consume different API costs. Published ceilings are not recommended outreach volume. No historical numeric quota is copied into defaults; provider/account policy and safety thresholds need release review.
 
+## Mailbox limits and pacing (go-live)
+
+Every mailbox has one MAILBOX-kind policy row: **50 messages per rolling 24 hours, at least 60 seconds apart** by default (`MAILBOX_DEFAULT_DAILY_CAP`, `MAILBOX_DEFAULT_MIN_SPACING_SECONDS`; 1-500 per day and 0-3600 s when a person with `mailboxes.manage` edits it). Migration 0038 backfills existing mailboxes and the connect flow creates the row in the same transaction as the mailbox. Only a MAILBOX policy with a window of at least an hour counts as a volume cap.
+
+**Absence is not unlimited for a mailbox.** The general rule above (no row, no cap from that scope) still holds for workspace, campaign and platform scopes, but a CAMPAIGN message whose mailbox has no such cap is deferred (`mailbox_limits_missing`) and never sent.
+
+**A denial reschedules the message.** On `RateLimitDenied`, and on a safety-hold rejection, the send worker returns the claimed message to `SCHEDULED`/`RETRY_SCHEDULED` with `due_at = now + clamp(retry_after, 30 s, 24 h)` plus up to 10% jitter (15 minutes for a held or limit-less mailbox) and clears the claim (`SendingRepository.defer_for_capacity`). It bumps the dispatch generation, so a late duplicate of the task that deferred it is recognised as stale instead of finding a `SCHEDULED` message and skipping it for good, and it never touches a message that has an attempt. Before this, a denied message stayed `QUEUED` until its claim lease expired and was then claimed again at once.
+
+**Planning spreads the load.** When a campaign is rendered, each first email gets its own `due_at` (`campaigns/pacing.py`): its place in its mailbox's queue, `(capture_ordinal - 1) // mailboxes`, gives a sending window (day) and a slot inside it, at least the mailbox spacing apart. A campaign's `daily_limit` is shared equally between its mailboxes and never exceeds a mailbox's own cap. The send-time limiter remains the authority; planning only keeps it from refusing most of a large campaign. Campaigns activated before this keep their old times and rely on the limiter and deferral.
+
+**Backpressure.** The scheduler does not claim more messages than `SCHEDULER_MAX_OUTSTANDING_CLAIMS` (default 200) minus those already `QUEUED`, so claims do not expire unused behind a busy send worker.
+
 ## Atomic reservation protocol
 
 Use a Redis token bucket for short-term pacing/concurrency and timestamped rolling-window debits for long-window quantities. Reserve all applicable scopes in one atomic operation: prune/refill against server time, evaluate every capacity/cooldown, then consume all or none and return reservation ID, policy versions, generation, expiry and next eligible time. Reserve once per invocation owner; duplicate reservation ID returns the same decision. Denial returns the maximum blocking time, not permanent failure.

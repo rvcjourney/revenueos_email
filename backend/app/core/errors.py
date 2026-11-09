@@ -11,6 +11,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.request_context import get_request_id
 
+# HTTP status for "a third-party mailbox credential was rejected" (bad SMTP/IMAP
+# login, revoked or under-scoped Gmail/Microsoft grant). It must NOT be 401: the
+# browser client treats every 401 as an invalid platform session and signs the
+# user out, but here the user's session is fine and only the mailbox needs fixing.
+PROVIDER_AUTH_REJECTED_STATUS = 422
+
 
 class AppError(Exception):
     def __init__(

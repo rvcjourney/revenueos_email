@@ -170,3 +170,39 @@ export type DeliverabilityOverview = {
   mailboxes: MailboxDeliverabilityItem[];
   failure_breakdown: SendFailureCategory[];
 };
+
+export type CampaignActivityType =
+  | "SENT"
+  | "OPENED"
+  | "BOUNCED"
+  | "REPLIED"
+  | "UNSUBSCRIBED"
+  | "COMPLAINED"
+  | "FAILED";
+
+export type CampaignActivityStatus = "SUCCESS" | "INFO" | "WARNING" | "ERROR";
+
+export interface CampaignActivityItem {
+  id: string;
+  type: CampaignActivityType;
+  status: CampaignActivityStatus;
+  occurred_at: string;
+  recipient_email: string | null;
+  lead_id: string | null;
+  message_id: string | null;
+  subject: string | null;
+  step_position: number | null;
+  detail: string | null;
+  open_count: number | null;
+}
+
+export interface CampaignActivityPage {
+  campaign_id: string;
+  items: CampaignActivityItem[];
+  next_cursor: string | null;
+  has_more: boolean;
+  // Present on the first page only; ignores the type filter.
+  counts_by_type: Record<CampaignActivityType, number> | null;
+  click_tracking_supported: boolean;
+  delivery_confirmation_supported: boolean;
+}

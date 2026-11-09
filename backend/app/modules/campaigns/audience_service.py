@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import WorkspaceContext
 from app.core.errors import AppError
+from app.core.permissions import has_permission
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import (
     AudienceExclusionBreakdown,
@@ -41,7 +42,20 @@ class AudienceService:
         self, context: WorkspaceContext, campaign_id: UUID, payload: AudienceSelectIn
     ) -> AudienceOut:
         self._require_draft_campaign(context, campaign_id)
+        return self.start_capture(context, campaign_id, payload, kind="ACTIVATION")
 
+    def start_capture(
+        self,
+        context: WorkspaceContext,
+        campaign_id: UUID,
+        payload: AudienceSelectIn,
+        *,
+        kind: str,
+    ) -> AudienceOut:
+        """Validate the selection, create the CAPTURING audience, hold the list
+        capture gates and queue the capture. The caller has already checked that
+        the campaign is in a state that allows this kind of audience (DRAFT for
+        ACTIVATION, PAUSED + activated for SUPPLEMENT)."""
         if not payload.list_ids and not payload.lead_ids:
             raise AppError(
                 "validation_error",
@@ -87,6 +101,7 @@ class AudienceService:
                 workspace_id=context.workspace_id,
                 campaign_id=campaign_id,
                 selection_manifest=selection_manifest,
+                kind=kind,
             )
         except IntegrityError as exc:
             # campaign_audiences_active_capture_idx: only one CAPTURING
@@ -119,6 +134,11 @@ class AudienceService:
             audience_id=audience_id,
             total_count=total_count,
         )
+
+        # The worker claims the job by reading it; if it ran before this request
+        # committed it would find nothing, drop the task, and leave the capture
+        # gate held on these lists forever (blocking edits and lead deletes).
+        self.session.commit()
 
         self._dispatch_capture_task(
             workspace_id=context.workspace_id,
@@ -222,6 +242,16 @@ class AudienceService:
         )
         if audience is None:
             raise AppError("not_found", "Audience revision not found", status_code=404)
+        if audience.get("kind") == "SUPPLEMENT" and not has_permission(
+            context.role_code, "campaigns.execute"
+        ):
+            # Adding leads to a paused campaign is a manager action (ADR-0020), so
+            # cancelling one is too: a member must not stop a manager's capture.
+            raise AppError(
+                "forbidden",
+                "Only a manager can cancel adding leads to a paused campaign",
+                status_code=403,
+            )
         if audience["status"] != "CAPTURING":
             raise AppError(
                 "state_conflict",
@@ -306,6 +336,7 @@ class AudienceService:
         job = self.repo.get_capture_job_for_audience(
             workspace_id=context.workspace_id, audience_id=UUID(str(audience["id"]))
         )
+        manifest = audience["selection_manifest"] or {}
         counts = None
         if audience["status"] in ("READY", "FAILED"):
             counts = self.repo.get_audience_member_counts(
@@ -327,4 +358,6 @@ class AudienceService:
             accepted_count=counts["accepted"] if counts else None,
             excluded_count=counts["excluded"] if counts else None,
             error_reason=job["error_reason"] if job else None,
+            selected_list_ids=manifest.get("lists", []),
+            selected_lead_ids=manifest.get("leads", []),
         )

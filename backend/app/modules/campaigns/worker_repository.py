@@ -134,7 +134,11 @@ class CampaignWorkerRepository:
         return [str(row["lead_id"]) for row in rows]
 
     def fetch_lead_capture_rows(
-        self, *, workspace_id: UUID, lead_ids: Sequence[str]
+        self,
+        *,
+        workspace_id: UUID,
+        lead_ids: Sequence[str],
+        campaign_id: UUID | None = None,
     ) -> list[RowMapping]:
         """One round trip for a whole chunk -- avoids N+1 lead/suppression
         lookups. LEFT JOINs recipient_addresses (by canonical address, since
@@ -160,7 +164,18 @@ class CampaignWorkerRepository:
                             WHERE s.workspace_id = l.workspace_id
                               AND s.address_id = ra.id
                               AND s.status = 'ACTIVE'
-                        ) AS is_suppressed
+                        ) AS is_suppressed,
+                        -- Supplement capture (ADR-0020): someone already enrolled in
+                        -- this campaign, by lead or by address, is never offered twice.
+                        (
+                            CAST(:campaign_id AS uuid) IS NOT NULL
+                            AND EXISTS (
+                                SELECT 1 FROM campaign_enrollments e
+                                WHERE e.workspace_id = l.workspace_id
+                                  AND e.campaign_id = CAST(:campaign_id AS uuid)
+                                  AND (e.lead_id = l.id OR e.address_id = ra.id)
+                            )
+                        ) AS is_enrolled
                     FROM leads l
                     LEFT JOIN recipient_addresses ra
                       ON ra.workspace_id = l.workspace_id
@@ -169,7 +184,11 @@ class CampaignWorkerRepository:
                     WHERE l.workspace_id = :workspace_id AND l.id = ANY(:lead_ids)
                     """
                 ),
-                {"workspace_id": str(workspace_id), "lead_ids": list(lead_ids)},
+                {
+                    "workspace_id": str(workspace_id),
+                    "lead_ids": list(lead_ids),
+                    "campaign_id": str(campaign_id) if campaign_id else None,
+                },
             )
             .mappings()
             .all()
@@ -393,7 +412,10 @@ class CampaignWorkerRepository:
         phase: str,
         lease_owner: str,
         ttl_seconds: int,
+        audience_id: UUID | None = None,
     ) -> RowMapping | None:
+        """Claim the activation's own job, or -- with `audience_id` -- the job of
+        one supplement audience (ADR-0020); the two never share a row."""
         _safe_set_role(self.session, "app_worker_general")
         row = (
             self.session.execute(
@@ -411,6 +433,7 @@ class CampaignWorkerRepository:
                       AND campaign_id = :campaign_id
                       AND activation_id = :activation_id
                       AND phase = :phase
+                      AND audience_id IS NOT DISTINCT FROM CAST(:audience_id AS uuid)
                       AND state IN ('PENDING', 'PROCESSING')
                       AND (
                           lease_owner IS NULL
@@ -425,6 +448,7 @@ class CampaignWorkerRepository:
                     "campaign_id": str(campaign_id),
                     "activation_id": str(activation_id),
                     "phase": phase,
+                    "audience_id": str(audience_id) if audience_id else None,
                     "lease_owner": lease_owner,
                     "ttl_seconds": ttl_seconds,
                 },
@@ -449,6 +473,7 @@ class CampaignWorkerRepository:
                     SELECT c.start_at, c.activated_audience_id, c.campaign_type,
                            c.activated_sequence_id, sv.timezone, sv.weekday_set,
                            sv.window_start_local, sv.window_end_local,
+                           sv.daily_limit,
                            ss.id AS first_step_id
                     FROM campaigns c
                     JOIN campaign_settings_versions sv
@@ -473,6 +498,21 @@ class CampaignWorkerRepository:
         )
         return row
 
+    def count_campaign_enrollments(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> int:
+        _safe_set_role(self.session, "app_worker_general")
+        value = self.session.execute(
+            text(
+                """
+                SELECT count(*) FROM campaign_enrollments
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                """
+            ),
+            {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+        ).scalar()
+        return int(value or 0)
+
     def list_eligible_campaign_mailboxes(
         self, *, workspace_id: UUID, campaign_id: UUID
     ) -> list[RowMapping]:
@@ -493,6 +533,43 @@ class CampaignWorkerRepository:
             .all()
         )
         return list(rows)
+
+    def list_mailbox_limit_policies(
+        self, *, workspace_id: UUID, mailbox_ids: list[UUID]
+    ) -> dict[UUID, list[dict[str, int]]]:
+        """Each mailbox's MAILBOX-kind limit rows, for spreading a campaign's
+        messages (see campaigns/pacing.py). A mailbox with none is absent."""
+        if not mailbox_ids:
+            return {}
+        _safe_set_role(self.session, "app_worker_general")
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT mailbox_id, window_seconds, limit_value, min_spacing_seconds
+                    FROM tenant_rate_policies
+                    WHERE workspace_id = :workspace_id AND kind = 'MAILBOX'
+                      AND unit = 'MESSAGE' AND mailbox_id = ANY(:mailbox_ids)
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "mailbox_ids": [str(m) for m in mailbox_ids],
+                },
+            )
+            .mappings()
+            .all()
+        )
+        result: dict[UUID, list[dict[str, int]]] = {}
+        for row in rows:
+            result.setdefault(UUID(str(row["mailbox_id"])), []).append(
+                {
+                    "window_seconds": int(row["window_seconds"]),
+                    "limit_value": int(row["limit_value"]),
+                    "min_spacing_seconds": int(row["min_spacing_seconds"] or 0),
+                }
+            )
+        return result
 
     def fetch_accepted_audience_members_chunk(
         self,
@@ -656,6 +733,7 @@ class CampaignWorkerRepository:
         campaign_id: UUID,
         job_id: UUID,
         processed_count: int,
+        mark_planning_ready: bool = True,
     ) -> None:
         _safe_set_role(self.session, "app_worker_general")
         self.session.execute(
@@ -673,6 +751,9 @@ class CampaignWorkerRepository:
                 "processed_count": processed_count,
             },
         )
+        if not mark_planning_ready:
+            # A supplement joins a campaign whose planning is already READY.
+            return
         self.session.execute(
             text(
                 """
@@ -716,10 +797,14 @@ class CampaignWorkerRepository:
                            m.step_id, e.frozen_variables, e.frozen_destination,
                            ss.email_subject, ss.email_body_html, ss.email_preheader,
                            mb.original_address AS sender_address,
-                           mb.sender_display_name AS sender_name
+                           mb.sender_display_name AS sender_name,
+                           am.capture_ordinal
                     FROM messages m
                     JOIN campaign_enrollments e
                       ON e.workspace_id = m.workspace_id AND e.id = m.enrollment_id
+                    JOIN campaign_audience_members am
+                      ON am.workspace_id = e.workspace_id
+                     AND am.id = e.audience_member_id
                     JOIN sequence_steps ss
                       ON ss.workspace_id = m.workspace_id AND ss.id = m.step_id
                     JOIN mailboxes mb
@@ -772,6 +857,14 @@ class CampaignWorkerRepository:
                     rendered_at = pg_catalog.transaction_timestamp(),
                     due_at = :due_at,
                     anchor_at = :anchor_at,
+                    -- ADR-0020: a message must carry the campaign's current
+                    -- generation, or the scheduler would never claim it after a
+                    -- resume bumped the campaign's.
+                    schedule_generation = (
+                        SELECT c.schedule_generation FROM campaigns c
+                        WHERE c.workspace_id = messages.workspace_id
+                          AND c.id = messages.campaign_id
+                    ),
                     status = 'SCHEDULED'
                 WHERE workspace_id = :workspace_id AND id = :message_id
                   AND status = 'PLANNED'
@@ -874,7 +967,8 @@ class CampaignWorkerRepository:
                     SELECT c.activated_sequence_id, c.schedule_generation,
                            c.campaign_type,
                            sv.timezone, sv.weekday_set,
-                           sv.window_start_local, sv.window_end_local
+                           sv.window_start_local, sv.window_end_local,
+                           sv.daily_limit
                     FROM campaigns c
                     JOIN campaign_settings_versions sv
                       ON sv.workspace_id = c.workspace_id
@@ -890,6 +984,469 @@ class CampaignWorkerRepository:
             .first()
         )
 
+    def lock_campaign_for_planning(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> None:
+        """Serialise work that reads the campaign's unsent schedule and then adds to
+        it (spreading overdue follow-ups, the post-resume reconcile): two of them
+        reading the same free slots would plan two messages into one. FOR NO KEY
+        UPDATE conflicts with itself and with FOR UPDATE (pause, send) but not with
+        the FOR KEY SHARE that inserting a message takes, so it never blocks the
+        inserts it protects. Taken only when a batch actually has overdue work."""
+        _safe_set_role(self.session, "app_worker_general")
+        self.session.execute(
+            text(
+                """
+                SELECT 1 FROM campaigns
+                WHERE workspace_id = :workspace_id AND id = :campaign_id
+                FOR NO KEY UPDATE
+                """
+            ),
+            {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+        )
+
+    def lock_campaign_for_reopen(
+        self, *, workspace_id: UUID, campaign_id: UUID
+    ) -> RowMapping | None:
+        """Lock the campaign row and return what the reopen is bound to. Pause takes
+        the same row, so a pause either finished before this read or waits for our
+        commit (a reopened lead of a paused campaign is harmless: progression only
+        runs for RUNNING campaigns)."""
+        _safe_set_role(self.session, "app_worker_general")
+        return (
+            self.session.execute(
+                text(
+                    """
+                    SELECT status, campaign_type, schedule_generation
+                    FROM campaigns
+                    WHERE workspace_id = :workspace_id AND id = :campaign_id
+                    FOR NO KEY UPDATE
+                    """
+                ),
+                {"workspace_id": str(workspace_id), "campaign_id": str(campaign_id)},
+            )
+            .mappings()
+            .first()
+        )
+
+    def fetch_reopen_candidates(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        limit: int,
+        after_id: UUID | None = None,
+    ) -> list[RowMapping]:
+        """COMPLETED enrollments that can take an email appended after their last one:
+        the last email they were sent (highest step position) is SENT, a later EMAIL
+        step exists, no message exists for any later step, a mailbox is still assigned
+        and there is no recipient outcome (reply, unsubscribe, bounce, complaint).
+        FOR UPDATE OF e SKIP LOCKED, like fetch_progressable_enrollments."""
+        _safe_set_role(self.session, "app_worker_general")
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT e.id AS enrollment_id, e.address_id,
+                           last.step_id, last.position
+                    FROM campaign_enrollments e
+                    JOIN LATERAL (
+                        SELECT m.step_id, m.status, m.sequence_id, ss.position
+                        FROM messages m
+                        JOIN sequence_steps ss
+                          ON ss.workspace_id = m.workspace_id AND ss.id = m.step_id
+                        WHERE m.workspace_id = e.workspace_id
+                          AND m.enrollment_id = e.id
+                          AND m.purpose = 'CAMPAIGN'
+                        ORDER BY ss.position DESC
+                        LIMIT 1
+                    ) last ON true
+                    WHERE e.workspace_id = :workspace_id
+                      AND e.campaign_id = :campaign_id
+                      AND e.state = 'COMPLETED'
+                      AND e.assigned_mailbox_id IS NOT NULL
+                      AND last.status = 'SENT'
+                      AND EXISTS (
+                          SELECT 1 FROM sequence_steps s2
+                          WHERE s2.workspace_id = e.workspace_id
+                            AND s2.sequence_id = last.sequence_id
+                            AND s2.position > last.position
+                            AND s2.kind = 'EMAIL'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM recipient_outcomes r
+                          WHERE r.workspace_id = e.workspace_id
+                            AND r.enrollment_id = e.id
+                      )
+                      AND (CAST(:after_id AS uuid) IS NULL
+                           OR e.id > CAST(:after_id AS uuid))
+                    ORDER BY e.id
+                    LIMIT :limit
+                    FOR UPDATE OF e SKIP LOCKED
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "limit": limit,
+                    "after_id": str(after_id) if after_id else None,
+                },
+            )
+            .mappings()
+            .all()
+        )
+        return list(rows)
+
+    def reopen_enrollment(
+        self,
+        *,
+        workspace_id: UUID,
+        enrollment_id: UUID,
+        step_id: UUID,
+        position: int,
+    ) -> bool:
+        """COMPLETED -> ACTIVE, pointing at the last (SENT) email. Guarded on
+        state = COMPLETED, so a replay or a lead that already moved changes nothing."""
+        _safe_set_role(self.session, "app_worker_general")
+        row = self.session.execute(
+            text(
+                """
+                UPDATE campaign_enrollments
+                SET state = 'ACTIVE',
+                    next_step_id = :step_id,
+                    next_sequence_position = :position
+                WHERE workspace_id = :workspace_id AND id = :enrollment_id
+                  AND state = 'COMPLETED' AND next_step_id IS NULL
+                RETURNING id
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "enrollment_id": str(enrollment_id),
+                "step_id": str(step_id),
+                "position": position,
+            },
+        ).first()
+        return row is not None
+
+    def list_mailbox_unsent_hourly(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        from_at: Any,
+        horizon_days: int = 90,
+    ) -> dict[UUID, list[tuple[Any, int]]]:
+        """Per mailbox, how many unsent campaign messages are due in each future
+        hour -- compact however large the campaign is (see MailboxOccupancy)."""
+        _safe_set_role(self.session, "app_worker_general")
+        rows = self.session.execute(
+            text(
+                """
+                SELECT mailbox_id, pg_catalog.date_trunc('hour', due_at) AS hour,
+                       count(*) AS n
+                FROM messages
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                  AND purpose = 'CAMPAIGN'
+                  AND status IN ('PLANNED', 'SCHEDULED', 'RETRY_SCHEDULED')
+                  AND due_at >= :from_at
+                  AND due_at < CAST(:from_at AS timestamptz)
+                                + make_interval(days => :horizon_days)
+                GROUP BY mailbox_id, 2
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "campaign_id": str(campaign_id),
+                "from_at": from_at,
+                "horizon_days": horizon_days,
+            },
+        ).all()
+        by_mailbox: dict[UUID, list[tuple[Any, int]]] = {}
+        for mailbox_id, hour, count in rows:
+            by_mailbox.setdefault(UUID(str(mailbox_id)), []).append((hour, int(count)))
+        return by_mailbox
+
+    # -------------------------------------------------------------------
+    # Post-resume reconcile (reconcile.py / docs/adr/0020). Runs as
+    # app_worker_general, which already holds UPDATE on messages.due_at and
+    # messages.schedule_generation (0004) -- no new privileges.
+    # -------------------------------------------------------------------
+
+    def get_reconcile_context(
+        self, *, workspace_id: UUID, campaign_id: UUID, generation: int
+    ) -> RowMapping | None:
+        """None unless the campaign is RUNNING/READY *at exactly this
+        generation*: a later pause or resume supersedes the task, which then does
+        nothing (the newer resume dispatched its own)."""
+        _safe_set_role(self.session, "app_worker_general")
+        return (
+            self.session.execute(
+                text(
+                    """
+                    SELECT c.activated_sequence_id, c.schedule_generation,
+                           c.campaign_type, sv.timezone, sv.weekday_set,
+                           sv.window_start_local, sv.window_end_local,
+                           sv.daily_limit
+                    FROM campaigns c
+                    JOIN campaign_settings_versions sv
+                      ON sv.workspace_id = c.workspace_id
+                     AND sv.id = c.current_settings_id
+                    WHERE c.workspace_id = :workspace_id AND c.id = :campaign_id
+                      AND c.status = 'RUNNING' AND c.planning_status = 'READY'
+                      AND c.schedule_generation = :generation
+                      AND c.activated_sequence_id IS NOT NULL
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "generation": generation,
+                },
+            )
+            .mappings()
+            .first()
+        )
+
+    def fetch_stale_messages_chunk(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        generation: int,
+        limit: int,
+        after_due_at: Any = None,
+        after_id: UUID | None = None,
+    ) -> list[RowMapping]:
+        """Unsent messages stamped with an older generation, oldest due first.
+        QUEUED/SENDING/UNKNOWN_OUTCOME are deliberately absent: they are already
+        past the send gate and are never touched here. FOR UPDATE ... SKIP
+        LOCKED so concurrent passes split the work; the (due_at, id) keyset
+        guarantees progress past rows that are skipped."""
+        _safe_set_role(self.session, "app_worker_general")
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT m.id, m.status, m.due_at, m.anchor_at, m.next_retry_at,
+                           m.mailbox_id, m.step_id, m.schedule_generation,
+                           m.content_digest, m.renderer_version, m.rfc_message_id,
+                           m.dispatch_origin, m.content_subject,
+                           e.frozen_variables,
+                           ss.email_subject, ss.email_body_html, ss.email_preheader,
+                           ss.email_same_thread,
+                           EXISTS (
+                               SELECT 1 FROM message_attempts a
+                               WHERE a.workspace_id = m.workspace_id
+                                 AND a.message_id = m.id
+                                 AND a.evidence_state IN
+                                     ('PREPARED', 'ACCEPTED', 'UNKNOWN')
+                           ) AS has_live_attempt
+                    FROM messages m
+                    JOIN campaign_enrollments e
+                      ON e.workspace_id = m.workspace_id AND e.id = m.enrollment_id
+                    JOIN sequence_steps ss
+                      ON ss.workspace_id = m.workspace_id AND ss.id = m.step_id
+                    WHERE m.workspace_id = :workspace_id
+                      AND m.campaign_id = :campaign_id
+                      AND m.purpose = 'CAMPAIGN'
+                      AND m.status IN ('SCHEDULED', 'RETRY_SCHEDULED')
+                      AND m.schedule_generation < :generation
+                      AND (CAST(:after_id AS uuid) IS NULL
+                           OR (m.due_at, m.id) >
+                              (CAST(:after_due_at AS timestamptz),
+                               CAST(:after_id AS uuid)))
+                    ORDER BY m.due_at, m.id
+                    LIMIT :limit
+                    FOR UPDATE OF m SKIP LOCKED
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "generation": generation,
+                    "limit": limit,
+                    "after_due_at": after_due_at,
+                    "after_id": str(after_id) if after_id else None,
+                },
+            )
+            .mappings()
+            .all()
+        )
+        return list(rows)
+
+    def reschedule_message(
+        self,
+        *,
+        workspace_id: UUID,
+        message_id: UUID,
+        expected_status: str,
+        due_at: Any,
+        generation: int,
+        content: tuple[str, str, str] | None = None,
+    ) -> bool:
+        """Set the new time and stamp the generation. Guarded on the status the
+        row was read in and on an *older* generation, so a replay, a concurrent
+        claim or a newer resume changes nothing. RETRY_SCHEDULED keeps
+        due_at >= next_retry_at (caller guarantees it; the CHECK enforces it).
+
+        `content` = (subject, body_html, digest) rewrites the rendered snapshot
+        in the same statement. That is only legal through the narrow exemption in
+        app_guard_message_snapshot (migration 0042), which this switches on for
+        the transaction and which the database re-checks row by row."""
+        _safe_set_role(self.session, "app_worker_general")
+        params: dict[str, Any] = {
+            "workspace_id": str(workspace_id),
+            "message_id": str(message_id),
+            "expected_status": expected_status,
+            "due_at": due_at,
+            "generation": generation,
+        }
+        content_sql = ""
+        if content is not None:
+            self.session.execute(
+                text("SELECT pg_catalog.set_config('app.reconcile', 'on', true)")
+            )
+            content_sql = (
+                ", content_subject = :content_subject"
+                ", content_body_html = :content_body_html"
+                ", content_digest = :content_digest"
+            )
+            params.update(
+                content_subject=content[0],
+                content_body_html=content[1],
+                content_digest=content[2],
+            )
+        row = self.session.execute(
+            text(
+                f"""
+                UPDATE messages
+                SET due_at = :due_at, schedule_generation = :generation{content_sql}
+                WHERE workspace_id = :workspace_id AND id = :message_id
+                  AND status = :expected_status
+                  AND schedule_generation < :generation
+                RETURNING id
+                """  # noqa: S608 -- content_sql is a fixed constant above
+            ),
+            params,
+        ).first()
+        if content is not None:
+            self.session.execute(
+                text("SELECT pg_catalog.set_config('app.reconcile', 'off', true)")
+            )
+        return row is not None
+
+    def fetch_unretimed_planned(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        limit: int,
+        after_id: UUID | None = None,
+    ) -> list[RowMapping]:
+        """Personalized follow-ups that are planned but not yet written, whose wait
+        was edited after they were planned (ADR-0020 amendment 2): a PENDING job
+        nobody has touched (no attempt, no live lease) for a PLANNED, unrendered
+        message that has an anchor, with a WAIT step before its step updated after the
+        job was last updated. The job's `updated_at` is bumped by `apply_retime`, which
+        is what makes a processed row stop matching.
+
+        Locks the generation first and the message second, the order the writer's
+        `lock_for_finalize` uses, so the two can never deadlock. SKIP LOCKED leaves
+        whatever the writer is working on to the writer."""
+        _safe_set_role(self.session, "app_worker_general")
+        rows = (
+            self.session.execute(
+                text(
+                    """
+                    SELECT g.id AS generation_id, g.step_id, m.id AS message_id,
+                           m.due_at, m.anchor_at
+                    FROM message_generations g
+                    JOIN messages m
+                      ON m.workspace_id = g.workspace_id AND m.id = g.message_id
+                    JOIN sequence_steps ss
+                      ON ss.workspace_id = g.workspace_id AND ss.id = g.step_id
+                    WHERE g.workspace_id = :workspace_id
+                      AND g.campaign_id = :campaign_id
+                      AND g.state = 'PENDING' AND g.attempt_count = 0
+                      AND (g.lease_owner IS NULL
+                           OR g.lease_expires_at < pg_catalog.transaction_timestamp())
+                      AND m.status = 'PLANNED' AND m.rendered_at IS NULL
+                      AND m.anchor_at IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM sequence_steps w
+                          WHERE w.workspace_id = g.workspace_id
+                            AND w.sequence_id = g.sequence_id
+                            AND w.kind = 'WAIT' AND w.position < ss.position
+                            AND w.updated_at > g.updated_at
+                      )
+                      AND (CAST(:after_id AS uuid) IS NULL
+                           OR g.id > CAST(:after_id AS uuid))
+                    ORDER BY g.id
+                    LIMIT :limit
+                    FOR UPDATE OF g, m SKIP LOCKED
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "limit": limit,
+                    "after_id": str(after_id) if after_id else None,
+                },
+            )
+            .mappings()
+            .all()
+        )
+        return list(rows)
+
+    def apply_retime(
+        self,
+        *,
+        workspace_id: UUID,
+        message_id: UUID,
+        generation_id: UUID,
+        due_at: Any,
+        next_attempt_at: Any,
+    ) -> bool:
+        """Move a planned follow-up and its job. Both statements are guarded on the
+        state the row was read in, so a message the writer finished meanwhile is left
+        alone. The job's `updated_at` is always bumped (the "done" marker), even when
+        the time did not change. Columns already granted to this role (0004, 0028)."""
+        _safe_set_role(self.session, "app_worker_general")
+        self.session.execute(
+            text(
+                """
+                UPDATE messages
+                SET due_at = :due_at
+                WHERE workspace_id = :workspace_id AND id = :message_id
+                  AND status = 'PLANNED' AND rendered_at IS NULL
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "message_id": str(message_id),
+                "due_at": due_at,
+            },
+        )
+        row = self.session.execute(
+            text(
+                """
+                UPDATE message_generations
+                SET next_attempt_at = :next_attempt_at,
+                    updated_at = pg_catalog.transaction_timestamp()
+                WHERE workspace_id = :workspace_id AND id = :generation_id
+                  AND state = 'PENDING' AND attempt_count = 0
+                RETURNING id
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "generation_id": str(generation_id),
+                "next_attempt_at": next_attempt_at,
+            },
+        ).first()
+        return row is not None
+
     def list_sequence_steps(
         self, *, workspace_id: UUID, sequence_id: UUID
     ) -> list[RowMapping]:
@@ -899,7 +1456,8 @@ class CampaignWorkerRepository:
                 text(
                     """
                     SELECT id, position, kind, wait_duration_minutes,
-                           email_subject, email_body_html, email_preheader
+                           email_subject, email_body_html, email_preheader,
+                           email_same_thread
                     FROM sequence_steps
                     WHERE workspace_id = :workspace_id AND sequence_id = :sequence_id
                     ORDER BY position ASC
@@ -935,6 +1493,8 @@ class CampaignWorkerRepository:
                            e.assigned_mailbox_id, e.frozen_variables,
                            e.frozen_destination, e.next_step_id,
                            m.status AS message_status, m.accepted_at,
+                           m.id AS message_id, m.content_subject AS message_subject,
+                           m.mailbox_id AS message_mailbox_id,
                            mb.original_address AS sender_address,
                            mb.sender_display_name AS sender_name
                     FROM campaign_enrollments e
@@ -981,12 +1541,15 @@ class CampaignWorkerRepository:
         mailbox_id: UUID,
         address_id: UUID,
         schedule_generation: int,
+        reply_to_message_id: UUID | None = None,
     ) -> UUID | None:
         """PLANNED message for a later step. None when a message for this
         (enrollment, step) already exists -- the unique key makes a retried or
         raced insert converge instead of duplicating. The campaign's current
         schedule_generation is stamped so the scheduler (which only claims
-        messages matching it) will pick this one up."""
+        messages matching it) will pick this one up. `reply_to_message_id` is the
+        message a same-thread follow-up replies to (ADR-0021); the database
+        requires it to be of the same mailbox."""
         _safe_set_role(self.session, "app_worker_general")
         new_id = uuid.uuid4()
         inserted = self.session.execute(
@@ -995,11 +1558,11 @@ class CampaignWorkerRepository:
                 INSERT INTO messages
                     (id, workspace_id, purpose, campaign_id, enrollment_id,
                      sequence_id, step_id, mailbox_id, address_id,
-                     schedule_generation, status)
+                     schedule_generation, status, reply_to_message_id)
                 VALUES
                     (:id, :workspace_id, 'CAMPAIGN', :campaign_id, :enrollment_id,
                      :sequence_id, :step_id, :mailbox_id, :address_id,
-                     :schedule_generation, 'PLANNED')
+                     :schedule_generation, 'PLANNED', :reply_to_message_id)
                 ON CONFLICT DO NOTHING
                 RETURNING id
                 """
@@ -1014,6 +1577,9 @@ class CampaignWorkerRepository:
                 "mailbox_id": str(mailbox_id),
                 "address_id": str(address_id),
                 "schedule_generation": schedule_generation,
+                "reply_to_message_id": (
+                    str(reply_to_message_id) if reply_to_message_id else None
+                ),
             },
         ).first()
         return new_id if inserted is not None else None
@@ -1138,6 +1704,78 @@ class CampaignWorkerRepository:
                 "job_id": str(job_id),
                 "processed_count": processed_count,
             },
+        )
+
+    def reset_failed_planning_jobs(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        activation_id: UUID,
+        audience_id: UUID | None,
+    ) -> list[str]:
+        """FAILED -> PENDING for the ENROLL/RENDER jobs of one activation (or of one
+        supplement audience), keeping each job's cursor and counters so work resumes
+        where it stopped; chunks are idempotent (ON CONFLICT DO NOTHING, unique message
+        key), so replaying the failed chunk is safe. Returns the phases reset; a repeat
+        finds nothing FAILED and returns []."""
+        _safe_set_role(self.session, "app_worker_general")
+        rows = self.session.execute(
+            text(
+                """
+                UPDATE campaign_planning_jobs
+                SET state = 'PENDING', error_reason = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    next_due_at = pg_catalog.transaction_timestamp()
+                WHERE workspace_id = :workspace_id AND campaign_id = :campaign_id
+                  AND activation_id = :activation_id
+                  AND audience_id IS NOT DISTINCT FROM CAST(:audience_id AS uuid)
+                  AND phase IN ('ENROLL', 'RENDER') AND state = 'FAILED'
+                RETURNING phase
+                """
+            ),
+            {
+                "workspace_id": str(workspace_id),
+                "campaign_id": str(campaign_id),
+                "activation_id": str(activation_id),
+                "audience_id": str(audience_id) if audience_id else None,
+            },
+        ).all()
+        return sorted(row[0] for row in rows)
+
+    def enroll_job_is_ready(
+        self,
+        *,
+        workspace_id: UUID,
+        campaign_id: UUID,
+        activation_id: UUID,
+        audience_id: UUID | None,
+    ) -> bool:
+        """RENDER renders every PLANNED message of the campaign, so it must not run
+        (and finish) before ENROLL has created them all, or it would strand the rest."""
+        _safe_set_role(self.session, "app_worker_general")
+        return bool(
+            self.session.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM campaign_planning_jobs
+                        WHERE workspace_id = :workspace_id
+                          AND campaign_id = :campaign_id
+                          AND activation_id = :activation_id
+                          AND audience_id IS NOT DISTINCT FROM
+                              CAST(:audience_id AS uuid)
+                          AND phase = 'ENROLL' AND state = 'READY'
+                    )
+                    """
+                ),
+                {
+                    "workspace_id": str(workspace_id),
+                    "campaign_id": str(campaign_id),
+                    "activation_id": str(activation_id),
+                    "audience_id": str(audience_id) if audience_id else None,
+                },
+            ).scalar()
         )
 
     def fail_planning_job(

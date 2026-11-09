@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -246,3 +247,52 @@ class DeliverabilityOverview(BaseModel):
     warnings: list[DeliverabilityWarning] = Field(default_factory=list)
     mailboxes: list[MailboxDeliverabilityItem] = Field(default_factory=list)
     failure_breakdown: list[SendFailureCategory] = Field(default_factory=list)
+
+
+class CampaignActivityType(StrEnum):
+    SENT = "SENT"
+    OPENED = "OPENED"
+    BOUNCED = "BOUNCED"
+    REPLIED = "REPLIED"
+    UNSUBSCRIBED = "UNSUBSCRIBED"
+    COMPLAINED = "COMPLAINED"
+    FAILED = "FAILED"
+
+
+class CampaignActivityStatus(StrEnum):
+    SUCCESS = "SUCCESS"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+
+
+class CampaignActivityItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(description="Stable identifier: <type>:<source row id>")
+    type: CampaignActivityType
+    status: CampaignActivityStatus
+    occurred_at: datetime
+    recipient_email: str | None = None
+    lead_id: UUID | None = None
+    message_id: UUID | None = None
+    subject: str | None = None
+    step_position: int | None = None
+    detail: str | None = None
+    open_count: int | None = Field(default=None, ge=0)
+
+
+class CampaignActivityPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: UUID
+    items: list[CampaignActivityItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
+    counts_by_type: dict[str, int] | None = Field(
+        default=None,
+        description="Per-type totals for the current search, status and date "
+        "filters (ignores the type filter). Only present on the first page.",
+    )
+    click_tracking_supported: bool = False
+    delivery_confirmation_supported: bool = False

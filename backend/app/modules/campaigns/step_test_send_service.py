@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import WorkspaceContext
 from app.core.errors import AppError
 from app.modules.campaigns.attachment_service import default_storage_client
-from app.modules.campaigns.message_rendering import render_step_content
+from app.modules.campaigns.message_rendering import render_step_content, reply_subject
 from app.modules.campaigns.repository import CampaignRepository
 from app.modules.campaigns.schemas import StepTestSendIn
 from app.modules.imports.storage import (
@@ -105,6 +105,21 @@ class StepTestSendService:
             )
         return tuple(loaded)
 
+    def _previous_subject(self, context: WorkspaceContext, step: Any) -> str | None:
+        """The subject of the nearest earlier email that has its own (the one a
+        chain of same-thread replies starts from), unrendered."""
+        steps = self.repo.list_steps_ordered(
+            workspace_id=context.workspace_id, sequence_id=step["sequence_id"]
+        )
+        earlier = [
+            s
+            for s in steps
+            if s["kind"] == "EMAIL"
+            and s["position"] < step["position"]
+            and not s.get("email_same_thread")
+        ]
+        return earlier[-1]["email_subject"] if earlier else None
+
     def send(
         self,
         context: WorkspaceContext,
@@ -181,6 +196,10 @@ class StepTestSendService:
             else step["email_preheader"]
         )
         preheader = (preheader or "").strip() or None
+        if step.get("email_same_thread"):
+            # Sent as a reply in a real campaign (ADR-0021): show the subject it will
+            # carry. A test is a one-off, so it gets no threading headers.
+            subject = self._previous_subject(context, step)
         if not subject or not subject.strip():
             raise AppError(
                 "validation_error",
@@ -199,7 +218,12 @@ class StepTestSendService:
             frozen_variables=variables,
             renderer_version=1,
         )
-        test_subject = f"{TEST_SUBJECT_PREFIX}{rendered.subject}"[:_MAX_SUBJECT_LENGTH]
+        shown_subject = (
+            reply_subject(rendered.subject)
+            if step.get("email_same_thread")
+            else rendered.subject
+        )
+        test_subject = f"{TEST_SUBJECT_PREFIX}{shown_subject}"[:_MAX_SUBJECT_LENGTH]
 
         # Binds the idempotency receipt to this step and this exact content, so
         # the same key is never reused for a different message.

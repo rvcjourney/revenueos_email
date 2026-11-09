@@ -13,6 +13,7 @@ from app.modules.scheduler.schemas import SendTaskPayload
 from app.modules.sending.retry_policy import classify_and_decide
 from app.modules.sending.schemas import LoadedSendContext
 from app.modules.sending.service import SendingService
+from tests.support.rate_policies import mailbox_daily_cap
 
 
 def _payload(
@@ -184,7 +185,9 @@ def _make_service(ctx: LoadedSendContext | None = None) -> SendingService:
     service.rate_limiter = MagicMock()
 
     service.repository.load_message_for_send.return_value = ctx
-    service.rate_policy_repository.resolve_applicable_policies.return_value = []
+    service.rate_policy_repository.resolve_applicable_policies.return_value = [
+        mailbox_daily_cap()
+    ]
     service.rate_limiter.current_generation.return_value = 1
     now = datetime.now(UTC)
     service.rate_limiter.reserve.return_value = RateReservation(

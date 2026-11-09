@@ -59,6 +59,13 @@ class CampaignStateRejected(SendGateRejected):
     pass
 
 
+class StaleScheduleGeneration(SendGateRejected):
+    """The message was scheduled under an older campaign schedule generation
+    (ADR-0020: a resume bumps the campaign's). It was claimed before the pause,
+    so its timing and content have not been re-validated by the reconcile pass.
+    Temporary: the message is handed back, re-stamped, and sent later."""
+
+
 class EnrollmentStateRejected(SendGateRejected):
     pass
 
@@ -128,6 +135,24 @@ def check_campaign_state(ctx: LoadedSendContext) -> None:
             f"campaign status={ctx.campaign_status} planning_status="
             f"{ctx.campaign_planning_status} is not RUNNING/READY",
             terminal_reason="campaign_not_running",
+        )
+
+
+def check_schedule_generation(ctx: LoadedSendContext) -> None:
+    """Scheduler discovery already requires the match; this closes the window
+    for a message claimed (QUEUED) before a pause/resume bumped the campaign's
+    generation, whose content/time the reconcile pass has not yet verified."""
+    if ctx.purpose != "CAMPAIGN":
+        return
+    message_generation = ctx.message_schedule_generation
+    campaign_generation = ctx.campaign_schedule_generation
+    if message_generation is None or campaign_generation is None:
+        return
+    if message_generation != campaign_generation:
+        raise StaleScheduleGeneration(
+            f"message schedule_generation={message_generation} does not match "
+            f"campaign schedule_generation={campaign_generation}",
+            terminal_reason="stale_schedule_generation",
         )
 
 
@@ -319,6 +344,7 @@ def run_pre_authorization_gates(
     check_dispatch_generation(ctx, expected_dispatch_generation)
     check_message_state(ctx)
     check_campaign_state(ctx)
+    check_schedule_generation(ctx)
     check_enrollment_state(ctx)
     check_suppression(session, ctx)
     check_reply_outcome(session, ctx)

@@ -282,7 +282,7 @@ export function InboxPageClient() {
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Unified Inbox</h1>
+              <h1 className="text-lg font-bold tracking-tight text-slate-900">Unified Inbox</h1>
               {unreadCount > 0 && (
                 <span className="inline-flex items-center rounded-full bg-brand-100 px-2 py-0.5 text-xs font-semibold text-brand-700">
                   {unreadCount} unread
