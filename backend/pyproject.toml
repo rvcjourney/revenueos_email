@@ -8,12 +8,15 @@ version = "0.1.0"
 description = "Phase 0 backend foundation for the email outreach platform."
 requires-python = ">=3.12"
 dependencies = [
-  "celery>=5.4,<6",
+  # Celery/kombu 5.7 require redis-py >= 6.1 when a worker opens its broker
+  # connection (VersionMismatch), which conflicts with the redis<6 pin below, so
+  # every Celery worker crash-looped. Stay below 5.7 until redis is upgraded.
+  "celery>=5.4,<5.7",
+  "kombu>=5.4,<5.7",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
-  # kombu 5.7 moved `packaging` into its "redis" extra while its Redis transport
-  # still imports it, so every Celery worker crashed at start without it.
-  # celery[redis] would also fix that but forces redis>=6.4; this keeps redis 5.
+  # kombu's Redis transport imports `packaging`; kombu 5.7 stopped installing it
+  # by default. Kept so the runtime does not depend on that detail.
   "packaging>=23",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.6,<3",
